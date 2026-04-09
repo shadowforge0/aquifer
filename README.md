@@ -6,7 +6,7 @@
 
 *Turn-level embedding, hybrid RRF ranking, optional knowledge graph — all on PostgreSQL + pgvector.*
 
-[![npm version](https://img.shields.io/npm/v/aquifer-memory)](https://www.npmjs.com/package/aquifer-memory)
+[![npm version](https://img.shields.io/npm/v/@shadowforge0/aquifer-memory)](https://www.npmjs.com/package/@shadowforge0/aquifer-memory)
 [![PostgreSQL 15+](https://img.shields.io/badge/PostgreSQL-15%2B-336791)](https://www.postgresql.org/)
 [![pgvector](https://img.shields.io/badge/pgvector-0.7%2B-blue)](https://github.com/pgvector/pgvector)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -59,13 +59,13 @@ Sessions, summaries, turn-level embeddings, entity graph — all live in one dat
 ### Install
 
 ```bash
-npm install aquifer-memory
+npm install @shadowforge0/aquifer-memory
 ```
 
 ### Initialize
 
 ```javascript
-const { createAquifer } = require('aquifer-memory');
+const { createAquifer } = require('@shadowforge0/aquifer-memory');
 
 const aquifer = createAquifer({
   schema: 'memory',                    // PG schema name (default: 'aquifer')

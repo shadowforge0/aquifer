@@ -6,7 +6,7 @@
 
 *Turn 級 embedding、三路 RRF 混合排序、內建知識圖譜——全部跑在 PostgreSQL + pgvector 上。*
 
-[![npm version](https://img.shields.io/npm/v/aquifer-memory)](https://www.npmjs.com/package/aquifer-memory)
+[![npm version](https://img.shields.io/npm/v/@shadowforge0/aquifer-memory)](https://www.npmjs.com/package/@shadowforge0/aquifer-memory)
 [![PostgreSQL 15+](https://img.shields.io/badge/PostgreSQL-15%2B-336791)](https://www.postgresql.org/)
 [![pgvector](https://img.shields.io/badge/pgvector-0.7%2B-blue)](https://github.com/pgvector/pgvector)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -59,13 +59,13 @@ Session、摘要、turn 級 embedding、實體圖譜——全部住在同一個�
 ### 安裝
 
 ```bash
-npm install aquifer-memory
+npm install @shadowforge0/aquifer-memory
 ```
 
 ### 初始化
 
 ```javascript
-const { createAquifer } = require('aquifer-memory');
+const { createAquifer } = require('@shadowforge0/aquifer-memory');
 
 const aquifer = createAquifer({
   schema: 'memory',                    // PG schema 名稱（預設 'aquifer'）
