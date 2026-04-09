@@ -15,6 +15,8 @@
   },
   "exports": {
     ".": "./index.js",
+    "./core/*": "./core/*.js",
+    "./pipeline/*": "./pipeline/*.js",
     "./consumers/mcp": "./consumers/mcp.js",
     "./consumers/openclaw-plugin": "./consumers/openclaw-plugin.js",
     "./consumers/shared/config": "./consumers/shared/config.js",
