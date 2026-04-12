@@ -361,7 +361,7 @@ function createAquifer(config) {
             schema, tenantId, agentId, sessionId,
             summaryText: summaryResult.summaryText,
             structuredSummary: summaryResult.structuredSummary,
-            model: null, sourceHash: null,
+            model: session.model || null, sourceHash: null,
             msgCount: normalized.length,
             userCount: turns.length,
             assistantCount: normalized.filter(m => m.role === 'assistant').length,
