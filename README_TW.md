@@ -4,7 +4,7 @@
 
 **基於 PostgreSQL 的 AI Agent 長期記憶系統**
 
-*Turn 級 embedding、三路 RRF 混合排序、內建知識圖譜——全部跑在 PostgreSQL + pgvector 上。*
+*Turn 級 embedding、三路 RRF 混合排序、信任評分、實體交叉查詢、知識圖譜——全部跑在 PostgreSQL + pgvector 上。*
 
 [![npm version](https://img.shields.io/npm/v/@shadowforge0/aquifer-memory)](https://www.npmjs.com/package/@shadowforge0/aquifer-memory)
 [![PostgreSQL 15+](https://img.shields.io/badge/PostgreSQL-15%2B-336791)](https://www.postgresql.org/)
@@ -132,12 +132,13 @@ const results = await aquifer.recall('auth middleware 決定', {
     │  + pgvector     │    │ API  │
     └────────────────┘    └──────┘
 
-    ┌─────────────────────────────┐
-    │         schema/             │
-    │  001-base.sql（sessions、   │
-    │    summaries、turns、FTS）   │
-    │  002-entities.sql（KG）      │
-    └─────────────────────────────┘
+    ┌───────────────────────────────────┐
+    │         schema/                   │
+    │  001-base.sql（sessions、          │
+    │    summaries、turns、FTS）          │
+    │  002-entities.sql（KG）             │
+    │  003-trust-feedback.sql（信任評分） │
+    └───────────────────────────────────┘
 ```
 
 ### 檔案說明
@@ -148,12 +149,13 @@ const results = await aquifer.recall('auth middleware 決定', {
 | `core/aquifer.js` | 主 facade：`migrate()`、`ingest()`、`recall()`、`enrich()` |
 | `core/storage.js` | Session/摘要/turn 的 CRUD、FTS 搜尋、embedding 搜尋 |
 | `core/entity.js` | 實體 upsert、mention 追蹤、關係圖譜、名稱正規化 |
-| `core/hybrid-rank.js` | 三路 RRF 融合、時間衰減、實體加分 |
+| `core/hybrid-rank.js` | 三路 RRF 融合、時間衰減、信任乘數、實體加分、open-loop 加分 |
 | `pipeline/summarize.js` | LLM 驅動的 session 摘要（結構化輸出） |
 | `pipeline/embed.js` | Embedding 客戶端（任何 OpenAI 相容 API） |
 | `pipeline/extract-entities.js` | LLM 驅動的實體擷取（12 種類型） |
 | `schema/001-base.sql` | DDL：sessions、summaries、turn_embeddings、FTS 索引 |
 | `schema/002-entities.sql` | DDL：entities、mentions、relations、entity_sessions |
+| `schema/003-trust-feedback.sql` | DDL：trust_score 欄位、session_feedback 稽核表 |
 
 ---
 
@@ -173,6 +175,38 @@ const results = await aquifer.recall('auth middleware 決定', {
 - **Reciprocal Rank Fusion** — 合併三份排名清單（K=60）
 - **時間衰減** — sigmoid 衰減，可設定中點與斜率
 - **實體加分** — 包含查詢相關實體的 session 會獲得分數提升
+- **信任評分** — 根據明確回饋（helpful/unhelpful）的乘法信任係數
+- **Open-loop 加分** — 有未解決項目的 session 獲得輕微提升
+
+### 實體交叉查詢
+
+明確指定要搜尋的實體時，可以做 AND 語意篩選：
+
+```javascript
+const results = await aquifer.recall('auth 決定', {
+  entities: ['auth-middleware', 'legal-compliance'],
+  entityMode: 'all',  // 只回傳同時包含兩個實體的 session
+});
+```
+
+- `entityMode: 'any'`（預設）— 提升匹配任一實體的 session
+- `entityMode: 'all'` — 硬篩：只回傳包含所有指定實體的 session
+
+### 信任評分與回饋
+
+Session 透過明確回饋累積信任分數。低信任的記憶在排序中會被壓制，無論相關性多高。
+
+```javascript
+// 回傳結果有用
+await aquifer.feedback('session-id', { verdict: 'helpful' });
+
+// 回傳結果無關
+await aquifer.feedback('session-id', { verdict: 'unhelpful' });
+```
+
+- 非對稱：helpful +0.05，unhelpful −0.10（低品質記憶下沉更快）
+- 排序中用乘法：trust=0.5 中性、trust=0 分數減半、trust=1.0 提升 50%
+- 完整稽核記錄在 `session_feedback` 表
 
 ### Turn 級 Embedding
 
@@ -253,15 +287,31 @@ await aquifer.ingest({
 ```javascript
 const results = await aquifer.recall('搜尋關鍵字', {
   agentId: 'main',
-  tenantId: 'default',
   limit: 10,                    // 最大回傳數
-  ftsLimit: 20,                 // FTS 候選池大小
-  embLimit: 20,                 // embedding 候選池大小
-  turnLimit: 20,                // turn embedding 候選池大小
-  midpointDays: 45,             // 時間衰減中點
-  entityBoostWeight: 0.18,      // 實體加分係數
+  entities: ['postgres', 'migration'],  // 選填：明確指定實體
+  entityMode: 'all',            // 'any'（預設）或 'all'
+  weights: {                    // 選填：覆寫排序權重
+    rrf: 0.65,
+    timeDecay: 0.25,
+    access: 0.10,
+    entityBoost: 0.18,
+    openLoop: 0.08,
+  },
 });
-// 回傳：[{ session_id, score, title, overview, started_at, ... }]
+// 回傳：[{ sessionId, score, trustScore, summaryText, matchedTurnText, _debug, ... }]
+```
+
+#### `aquifer.feedback(sessionId, options)`
+
+記錄對 session 的明確信任回饋。
+
+```javascript
+await aquifer.feedback('session-id', {
+  verdict: 'helpful',   // 或 'unhelpful'
+  agentId: 'main',      // 選填
+  note: '原因',         // 選填
+});
+// 回傳：{ trustBefore, trustAfter, verdict }
 ```
 
 #### `aquifer.enrich(sessionId, options)`
@@ -334,6 +384,14 @@ createAquifer({
 | `entity_sessions` | 實體-session 關聯，用於加分計算 |
 
 重要索引：實體名稱 trigram、embedding GiST、tenant/agent 複合索引。
+
+### 003-trust-feedback.sql
+
+| 表 | 用途 |
+|----|------|
+| `session_feedback` | 明確回饋稽核記錄（helpful/unhelpful 判決、信任分數變動） |
+
+另在 `session_summaries` 新增 `trust_score` 欄位（預設 0.5，範圍 0–1）。
 
 ---
 

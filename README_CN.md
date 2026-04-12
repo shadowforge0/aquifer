@@ -4,7 +4,7 @@
 
 **基于 PostgreSQL 的 AI Agent 长期记忆系统**
 
-*Turn 级 embedding、三路 RRF 混合排序、内建知识图谱——全部运行在 PostgreSQL + pgvector 上。*
+*Turn 级 embedding、三路 RRF 混合排序、信任评分、实体交叉查询、知识图谱——全部运行在 PostgreSQL + pgvector 上。*
 
 [![npm version](https://img.shields.io/npm/v/@shadowforge0/aquifer-memory)](https://www.npmjs.com/package/@shadowforge0/aquifer-memory)
 [![PostgreSQL 15+](https://img.shields.io/badge/PostgreSQL-15%2B-336791)](https://www.postgresql.org/)
@@ -136,8 +136,9 @@ const results = await aquifer.recall('auth middleware 决定', {
     │         schema/             │
     │  001-base.sql（sessions、   │
     │    summaries、turns、FTS）   │
-    │  002-entities.sql（KG）      │
-    └─────────────────────────────┘
+    │  002-entities.sql（KG）             │
+    │  003-trust-feedback.sql（信任评分） │
+    └───────────────────────────────────┘
 ```
 
 ### 文件说明
@@ -148,12 +149,13 @@ const results = await aquifer.recall('auth middleware 决定', {
 | `core/aquifer.js` | 主 facade：`migrate()`、`ingest()`、`recall()`、`enrich()` |
 | `core/storage.js` | Session/摘要/turn 的 CRUD、FTS 搜索、embedding 搜索 |
 | `core/entity.js` | 实体 upsert、mention 追踪、关系图谱、名称规范化 |
-| `core/hybrid-rank.js` | 三路 RRF 融合、时间衰减、实体加分 |
+| `core/hybrid-rank.js` | 三路 RRF 融合、时间衰减、信任乘数、实体加分、open-loop 加分 |
 | `pipeline/summarize.js` | LLM 驱动的 session 摘要（结构化输出） |
 | `pipeline/embed.js` | Embedding 客户端（任何 OpenAI 兼容 API） |
 | `pipeline/extract-entities.js` | LLM 驱动的实体提取（12 种类型） |
 | `schema/001-base.sql` | DDL：sessions、summaries、turn_embeddings、FTS 索引 |
 | `schema/002-entities.sql` | DDL：entities、mentions、relations、entity_sessions |
+| `schema/003-trust-feedback.sql` | DDL：trust_score 列、session_feedback 审计表 |
 
 ---
 
@@ -173,6 +175,38 @@ const results = await aquifer.recall('auth middleware 决定', {
 - **Reciprocal Rank Fusion** — 合并三份排名列表（K=60）
 - **时间衰减** — sigmoid 衰减，可配置中点与斜率
 - **实体加分** — 包含查询相关实体的 session 会获得分数提升
+- **信任评分** — 根据明确反馈（helpful/unhelpful）的乘法信任系数
+- **Open-loop 加分** — 有未解决项的 session 获得轻微提升
+
+### 实体交叉查询
+
+明确指定要搜索的实体时，可以做 AND 语义筛选：
+
+```javascript
+const results = await aquifer.recall('auth 决定', {
+  entities: ['auth-middleware', 'legal-compliance'],
+  entityMode: 'all',  // 只返回同时包含两个实体的 session
+});
+```
+
+- `entityMode: 'any'`（默认）— 提升匹配任一实体的 session
+- `entityMode: 'all'` — 硬筛：只返回包含所有指定实体的 session
+
+### 信任评分与反馈
+
+Session 通过明确反馈累积信任分数。低信任的记忆在排序中会被压制，无论相关性多高。
+
+```javascript
+// 返回结果有用
+await aquifer.feedback('session-id', { verdict: 'helpful' });
+
+// 返回结果无关
+await aquifer.feedback('session-id', { verdict: 'unhelpful' });
+```
+
+- 不对称：helpful +0.05，unhelpful −0.10（低质量记忆下沉更快）
+- 排序中用乘法：trust=0.5 中性、trust=0 分数减半、trust=1.0 提升 50%
+- 完整审计记录在 `session_feedback` 表
 
 ### Turn 级 Embedding
 
@@ -253,15 +287,31 @@ await aquifer.ingest({
 ```javascript
 const results = await aquifer.recall('搜索关键字', {
   agentId: 'main',
-  tenantId: 'default',
   limit: 10,                    // 最大返回数
-  ftsLimit: 20,                 // FTS 候选池大小
-  embLimit: 20,                 // embedding 候选池大小
-  turnLimit: 20,                // turn embedding 候选池大小
-  midpointDays: 45,             // 时间衰减中点
-  entityBoostWeight: 0.18,      // 实体加分系数
+  entities: ['postgres', 'migration'],  // 可选：明确指定实体
+  entityMode: 'all',            // 'any'（默认）或 'all'
+  weights: {                    // 可选：覆盖排序权重
+    rrf: 0.65,
+    timeDecay: 0.25,
+    access: 0.10,
+    entityBoost: 0.18,
+    openLoop: 0.08,
+  },
 });
-// 返回：[{ session_id, score, title, overview, started_at, ... }]
+// 返回：[{ sessionId, score, trustScore, summaryText, matchedTurnText, _debug, ... }]
+```
+
+#### `aquifer.feedback(sessionId, options)`
+
+记录对 session 的明确信任反馈。
+
+```javascript
+await aquifer.feedback('session-id', {
+  verdict: 'helpful',   // 或 'unhelpful'
+  agentId: 'main',      // 可选
+  note: '原因',         // 可选
+});
+// 返回：{ trustBefore, trustAfter, verdict }
 ```
 
 #### `aquifer.enrich(sessionId, options)`
@@ -334,6 +384,14 @@ createAquifer({
 | `entity_sessions` | 实体-session 关联，用于加分计算 |
 
 关键索引：实体名称 trigram、embedding GiST、tenant/agent 复合索引。
+
+### 003-trust-feedback.sql
+
+| 表 | 用途 |
+|----|------|
+| `session_feedback` | 明确反馈审计记录（helpful/unhelpful 判定、信任分数变动） |
+
+另在 `session_summaries` 新增 `trust_score` 列（默认 0.5，范围 0–1）。
 
 ---
 

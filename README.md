@@ -4,7 +4,7 @@
 
 **PG-native long-term memory for AI agents**
 
-*Turn-level embedding, hybrid RRF ranking, optional knowledge graph — all on PostgreSQL + pgvector.*
+*Turn-level embedding, hybrid RRF ranking, trust scoring, entity intersection, knowledge graph — all on PostgreSQL + pgvector.*
 
 [![npm version](https://img.shields.io/npm/v/@shadowforge0/aquifer-memory)](https://www.npmjs.com/package/@shadowforge0/aquifer-memory)
 [![PostgreSQL 15+](https://img.shields.io/badge/PostgreSQL-15%2B-336791)](https://www.postgresql.org/)
@@ -132,12 +132,13 @@ const results = await aquifer.recall('auth middleware decision', {
     │  + pgvector     │    │ API  │
     └────────────────┘    └──────┘
 
-    ┌─────────────────────────────┐
-    │         schema/             │
-    │  001-base.sql (sessions,    │
-    │    summaries, turns, FTS)   │
-    │  002-entities.sql (KG)      │
-    └─────────────────────────────┘
+    ┌──────────────────────────────────┐
+    │         schema/                  │
+    │  001-base.sql (sessions,         │
+    │    summaries, turns, FTS)        │
+    │  002-entities.sql (KG)           │
+    │  003-trust-feedback.sql (trust)  │
+    └──────────────────────────────────┘
 ```
 
 ### File Reference
@@ -148,12 +149,13 @@ const results = await aquifer.recall('auth middleware decision', {
 | `core/aquifer.js` | Main facade: `migrate()`, `ingest()`, `recall()`, `enrich()` |
 | `core/storage.js` | Session/summary/turn CRUD, FTS search, embedding search |
 | `core/entity.js` | Entity upsert, mention tracking, relation graph, normalization |
-| `core/hybrid-rank.js` | 3-way RRF fusion, time decay, entity boost scoring |
+| `core/hybrid-rank.js` | 3-way RRF fusion, time decay, trust multiplier, entity boost, open-loop boost |
 | `pipeline/summarize.js` | LLM-powered session summarization with structured output |
 | `pipeline/embed.js` | Embedding client (any OpenAI-compatible API) |
 | `pipeline/extract-entities.js` | LLM-powered entity extraction (12 types) |
 | `schema/001-base.sql` | DDL: sessions, summaries, turn_embeddings, FTS indexes |
 | `schema/002-entities.sql` | DDL: entities, mentions, relations, entity_sessions |
+| `schema/003-trust-feedback.sql` | DDL: trust_score column, session_feedback audit trail |
 
 ---
 
@@ -173,6 +175,38 @@ Query ──┬── FTS (BM25)              ──┐
 - **Reciprocal Rank Fusion** — merges all three ranked lists (K=60)
 - **Time decay** — sigmoid decay with configurable midpoint and steepness
 - **Entity boost** — sessions mentioning query-relevant entities get a score boost
+- **Trust scoring** — multiplicative trust multiplier from explicit feedback (helpful/unhelpful)
+- **Open-loop boost** — sessions with unresolved items get a mild recency boost
+
+### Entity Intersection
+
+When you know which entities you're looking for, pass them explicitly:
+
+```javascript
+const results = await aquifer.recall('auth decision', {
+  entities: ['auth-middleware', 'legal-compliance'],
+  entityMode: 'all',  // only sessions containing BOTH entities
+});
+```
+
+- `entityMode: 'any'` (default) — boost sessions matching any queried entity
+- `entityMode: 'all'` — hard filter: only return sessions containing every specified entity
+
+### Trust Scoring & Feedback
+
+Sessions accumulate trust through explicit feedback. Low-trust memories are suppressed in rankings regardless of relevance.
+
+```javascript
+// After a recall result was useful
+await aquifer.feedback('session-id', { verdict: 'helpful' });
+
+// After a recall result was irrelevant
+await aquifer.feedback('session-id', { verdict: 'unhelpful' });
+```
+
+- Asymmetric: helpful +0.05, unhelpful −0.10 (bad memories sink faster)
+- Multiplicative in ranking: trust=0.5 is neutral, trust=0 halves the score, trust=1.0 gives 50% boost
+- Full audit trail in `session_feedback` table
 
 ### Turn-Level Embeddings
 
@@ -253,15 +287,31 @@ Hybrid search across sessions.
 ```javascript
 const results = await aquifer.recall('search query', {
   agentId: 'main',
-  tenantId: 'default',
   limit: 10,                    // max results
-  ftsLimit: 20,                 // FTS candidate pool
-  embLimit: 20,                 // embedding candidate pool
-  turnLimit: 20,                // turn embedding candidate pool
-  midpointDays: 45,             // time decay midpoint
-  entityBoostWeight: 0.18,      // entity boost factor
+  entities: ['postgres', 'migration'],  // optional: explicit entity names
+  entityMode: 'all',            // 'any' (default) or 'all'
+  weights: {                    // optional: override ranking weights
+    rrf: 0.65,
+    timeDecay: 0.25,
+    access: 0.10,
+    entityBoost: 0.18,
+    openLoop: 0.08,
+  },
 });
-// Returns: [{ session_id, score, title, overview, started_at, ... }]
+// Returns: [{ sessionId, score, trustScore, summaryText, matchedTurnText, _debug, ... }]
+```
+
+#### `aquifer.feedback(sessionId, options)`
+
+Records explicit trust feedback on a session.
+
+```javascript
+await aquifer.feedback('session-id', {
+  verdict: 'helpful',   // or 'unhelpful'
+  agentId: 'main',      // optional
+  note: 'reason',       // optional
+});
+// Returns: { trustBefore, trustAfter, verdict }
 ```
 
 #### `aquifer.enrich(sessionId, options)`
@@ -334,6 +384,14 @@ Key indexes: GIN on messages, GiST on `tsvector`, ivfflat on embeddings, B-tree 
 | `entity_sessions` | Entity-session association for boost scoring |
 
 Key indexes: trigram on entity names, GiST on embeddings, composite on tenant/agent.
+
+### 003-trust-feedback.sql
+
+| Table | Purpose |
+|-------|---------|
+| `session_feedback` | Explicit feedback audit trail (helpful/unhelpful verdicts, trust deltas) |
+
+Also adds `trust_score` column to `session_summaries` (default 0.5, range 0–1).
 
 ---
 
