@@ -259,6 +259,10 @@ function createAquifer(config) {
       const customSummaryFn = opts.summaryFn || null;      // async (messages) => { summaryText, structuredSummary, entityRaw?, extra? }
       const customEntityParseFn = opts.entityParseFn || null; // (text) => [{ name, normalizedName, aliases, type }]
 
+      // Post-commit hook: runs after tx commit + client release. Best-effort, at-most-once.
+      const postProcess = opts.postProcess || null;  // async (ctx) => void
+      const optModel = 'model' in opts ? opts.model : undefined; // undefined = no override
+
       // 1. Optimistic lock: claim session for processing
       const claimResult = await pool.query(
         `UPDATE ${qi(schema)}.sessions
@@ -361,7 +365,7 @@ function createAquifer(config) {
             schema, tenantId, agentId, sessionId,
             summaryText: summaryResult.summaryText,
             structuredSummary: summaryResult.structuredSummary,
-            model: session.model || null, sourceHash: null,
+            model: (optModel !== undefined ? optModel : session.model) || null, sourceHash: null,
             msgCount: normalized.length,
             userCount: turns.length,
             assistantCount: normalized.filter(m => m.role === 'assistant').length,
@@ -453,6 +457,41 @@ function createAquifer(config) {
         client.release();
       }
 
+      // Post-commit hook: best-effort, at-most-once, no retry.
+      // Runs after tx commit + client release. Failure does not affect session status.
+      const effectiveModel = (optModel !== undefined ? optModel : session.model) || null;
+      let postProcessError = null;
+      if (postProcess) {
+        try {
+          await postProcess({
+            session: {
+              id: session.id,
+              sessionId,
+              agentId,
+              model: session.model || null,
+              source: session.source || null,
+              startedAt: session.started_at || null,
+              endedAt: session.ended_at || null,
+            },
+            effectiveModel,
+            summary: summaryResult
+              ? { summaryText: summaryResult.summaryText, structuredSummary: summaryResult.structuredSummary }
+              : null,
+            embedding: summaryEmbedding,
+            turnVectors,
+            extra,
+            normalized,
+            parsedEntities,
+            skipped: { summary: skipSummary, entities: skipEntities, turns: skipTurnEmbed },
+            turnsEmbedded,
+            entitiesFound,
+            warnings: [...warnings],  // defensive copy — caller cannot mutate enrich warnings
+          });
+        } catch (e) {
+          postProcessError = e;
+        }
+      }
+
       return {
         summary: summaryResult ? summaryResult.summaryText : null,
         structuredSummary: summaryResult ? summaryResult.structuredSummary : null,
@@ -460,6 +499,15 @@ function createAquifer(config) {
         entitiesFound,
         warnings,
         extra,
+        session: {
+          id: session.id,
+          sessionId,
+          agentId,
+          model: session.model || null,
+          source: session.source || null,
+        },
+        effectiveModel,
+        postProcessError,
       };
     },
 
