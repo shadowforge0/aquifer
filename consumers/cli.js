@@ -23,7 +23,7 @@ const { loadConfig } = require('./shared/config');
 function parseArgs(argv) {
   const args = { _: [], flags: {} };
   // Flags that take a value (not boolean)
-  const VALUE_FLAGS = new Set(['limit', 'agent-id', 'source', 'date-from', 'date-to', 'output', 'format', 'config', 'status', 'concurrency']);
+  const VALUE_FLAGS = new Set(['limit', 'agent-id', 'source', 'date-from', 'date-to', 'output', 'format', 'config', 'status', 'concurrency', 'entities', 'entity-mode', 'session-id', 'verdict', 'note']);
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--') { args._.push(...argv.slice(i + 1)); break; }
     if (argv[i].startsWith('--')) {
@@ -56,13 +56,18 @@ async function cmdRecall(aquifer, args) {
     process.exit(1);
   }
 
-  const results = await aquifer.recall(query, {
+  const recallOpts = {
     limit: parseInt(args.flags.limit || '5', 10),
     agentId: args.flags['agent-id'] || undefined,
     source: args.flags.source || undefined,
     dateFrom: args.flags['date-from'] || undefined,
     dateTo: args.flags['date-to'] || undefined,
-  });
+  };
+  if (args.flags.entities) {
+    recallOpts.entities = args.flags.entities.split(',').map(s => s.trim()).filter(Boolean);
+    recallOpts.entityMode = args.flags['entity-mode'] || 'any';
+  }
+  const results = await aquifer.recall(query, recallOpts);
 
   if (args.flags.json) {
     console.log(JSON.stringify(results, null, 2));
@@ -83,6 +88,28 @@ async function cmdRecall(aquifer, args) {
     if (ss.overview) console.log(`   ${ss.overview.slice(0, 200)}`);
     if (r.matchedTurnText) console.log(`   > ${r.matchedTurnText.slice(0, 150)}`);
     console.log();
+  }
+}
+
+async function cmdFeedback(aquifer, args) {
+  const sessionId = args.flags['session-id'] || args._[1];
+  const verdict = args.flags.verdict;
+
+  if (!sessionId || !verdict) {
+    console.error('Usage: aquifer feedback --session-id ID --verdict helpful|unhelpful [--note TEXT] [--agent-id ID]');
+    process.exit(1);
+  }
+
+  const result = await aquifer.feedback(sessionId, {
+    verdict,
+    agentId: args.flags['agent-id'] || undefined,
+    note: args.flags.note || undefined,
+  });
+
+  if (args.flags.json) {
+    console.log(JSON.stringify(result, null, 2));
+  } else {
+    console.log(`Feedback: ${result.verdict} (trust ${result.trustBefore.toFixed(2)} → ${result.trustAfter.toFixed(2)})`);
   }
 }
 
@@ -243,6 +270,7 @@ async function main() {
 Commands:
   migrate                     Run database migrations
   recall <query>              Search sessions (requires embed config)
+  feedback                    Record trust feedback on a session
   backfill                    Enrich pending sessions
   stats                       Show database statistics
   export                      Export sessions as JSONL
@@ -254,6 +282,11 @@ Options:
   --source NAME               Filter by source
   --date-from YYYY-MM-DD      Start date
   --date-to YYYY-MM-DD        End date
+  --entities A,B,C            Entity names (comma-separated, recall)
+  --entity-mode any|all       Entity match mode (recall, default: any)
+  --session-id ID             Session ID (feedback)
+  --verdict helpful|unhelpful Feedback verdict (feedback)
+  --note TEXT                 Feedback note (feedback)
   --json                      JSON output
   --dry-run                   Preview only (backfill)
   --output PATH               Output file (export)
@@ -289,6 +322,9 @@ Options:
         break;
       case 'recall':
         await cmdRecall(aquifer, args);
+        break;
+      case 'feedback':
+        await cmdFeedback(aquifer, args);
         break;
       case 'backfill':
         await cmdBackfill(aquifer, args);

@@ -69,12 +69,12 @@ async function main() {
 
   const server = new McpServer({
     name: 'aquifer-memory',
-    version: '0.2.0',
+    version: '0.3.1',
   });
 
   server.tool(
     'session_recall',
-    'Search stored sessions by keyword, returning ranked summaries and matched conversation turns.',
+    'Search stored sessions by keyword. Supports entity intersection for precise multi-entity queries.',
     {
       query: z.string().min(1).describe('Search query (keyword or natural language)'),
       limit: z.number().int().min(1).max(20).optional().describe('Max results (default 5)'),
@@ -82,25 +82,58 @@ async function main() {
       source: z.string().optional().describe('Filter by source (e.g., gateway, cc)'),
       dateFrom: z.string().optional().describe('Start date YYYY-MM-DD'),
       dateTo: z.string().optional().describe('End date YYYY-MM-DD'),
+      entities: z.array(z.string()).optional().describe('Entity names to match'),
+      entityMode: z.enum(['any', 'all']).optional().describe('"any" (default, boost) or "all" (only sessions with every entity)'),
     },
     async (params) => {
       try {
         const aquifer = getAquifer();
         const limit = params.limit || 5;
-
-        const results = await aquifer.recall(params.query, {
+        const recallOpts = {
           limit,
           agentId: params.agentId || undefined,
           source: params.source || undefined,
           dateFrom: params.dateFrom || undefined,
           dateTo: params.dateTo || undefined,
-        });
+        };
+        if (params.entities && params.entities.length > 0) {
+          recallOpts.entities = params.entities;
+          recallOpts.entityMode = params.entityMode || 'any';
+        }
 
+        const results = await aquifer.recall(params.query, recallOpts);
         const text = formatResults(results, params.query);
         return { content: [{ type: 'text', text }] };
       } catch (err) {
         return {
           content: [{ type: 'text', text: `session_recall error: ${err.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    'session_feedback',
+    'Record trust feedback on a recalled session. Helpful sessions rank higher in future recalls.',
+    {
+      sessionId: z.string().min(1).describe('Session ID to give feedback on'),
+      verdict: z.enum(['helpful', 'unhelpful']).describe('Was the recalled session useful?'),
+      note: z.string().optional().describe('Optional reason'),
+    },
+    async (params) => {
+      try {
+        const aquifer = getAquifer();
+        const result = await aquifer.feedback(params.sessionId, {
+          verdict: params.verdict,
+          note: params.note || undefined,
+        });
+        return {
+          content: [{ type: 'text', text: `Feedback: ${result.verdict} (trust ${result.trustBefore.toFixed(2)} → ${result.trustAfter.toFixed(2)})` }],
+        };
+      } catch (err) {
+        return {
+          content: [{ type: 'text', text: `session_feedback error: ${err.message}` }],
           isError: true,
         };
       }

@@ -189,12 +189,14 @@ module.exports = {
 
     // --- session_recall tool ---
 
+    // --- session_recall tool ---
+
     api.registerTool((ctx) => {
       if ((ctx?.sessionKey || '').includes('subagent')) return null;
 
       return {
         name: 'session_recall',
-        description: 'Search stored sessions by keyword, returning ranked summaries and matched conversation turns.',
+        description: 'Search stored sessions by keyword. Supports entity intersection for precise multi-entity queries.',
         parameters: {
           type: 'object',
           properties: {
@@ -204,20 +206,27 @@ module.exports = {
             source: { type: 'string', description: 'Filter by source' },
             dateFrom: { type: 'string', description: 'Start date YYYY-MM-DD' },
             dateTo: { type: 'string', description: 'End date YYYY-MM-DD' },
+            entities: { type: 'array', items: { type: 'string' }, description: 'Entity names to match' },
+            entityMode: { type: 'string', enum: ['any', 'all'], description: '"any" (default, boost) or "all" (only sessions with every entity)' },
           },
           required: ['query'],
         },
         async execute(_toolCallId, params) {
           try {
             const limit = Math.max(1, Math.min(20, parseInt(params?.limit ?? 5, 10) || 5));
-            const results = await aquifer.recall(params.query, {
+            const recallOpts = {
               limit,
               agentId: params.agentId || undefined,
               source: params.source || undefined,
               dateFrom: params.dateFrom || undefined,
               dateTo: params.dateTo || undefined,
-            });
+            };
+            if (Array.isArray(params.entities) && params.entities.length > 0) {
+              recallOpts.entities = params.entities;
+              recallOpts.entityMode = params.entityMode || 'any';
+            }
 
+            const results = await aquifer.recall(params.query, recallOpts);
             const text = formatRecallResults(results);
             return { content: [{ type: 'text', text }] };
           } catch (err) {
@@ -230,6 +239,42 @@ module.exports = {
       };
     }, { name: 'session_recall' });
 
-    api.logger.info('[aquifer-memory] registered (before_reset + session_recall)');
+    // --- session_feedback tool ---
+
+    api.registerTool((ctx) => {
+      if ((ctx?.sessionKey || '').includes('subagent')) return null;
+
+      return {
+        name: 'session_feedback',
+        description: 'Record trust feedback on a recalled session. Helpful sessions rank higher in future recalls.',
+        parameters: {
+          type: 'object',
+          properties: {
+            sessionId: { type: 'string', description: 'Session ID to give feedback on' },
+            verdict: { type: 'string', enum: ['helpful', 'unhelpful'], description: 'Was the recalled session useful?' },
+            note: { type: 'string', description: 'Optional reason' },
+          },
+          required: ['sessionId', 'verdict'],
+        },
+        async execute(_toolCallId, params) {
+          try {
+            const result = await aquifer.feedback(params.sessionId, {
+              verdict: params.verdict,
+              note: params.note || undefined,
+            });
+            return {
+              content: [{ type: 'text', text: `Feedback: ${result.verdict} (trust ${result.trustBefore.toFixed(2)} → ${result.trustAfter.toFixed(2)})` }],
+            };
+          } catch (err) {
+            return {
+              content: [{ type: 'text', text: `session_feedback error: ${err.message}` }],
+              isError: true,
+            };
+          }
+        },
+      };
+    }, { name: 'session_feedback' });
+
+    api.logger.info('[aquifer-memory] registered (before_reset + session_recall + session_feedback)');
   },
 };
