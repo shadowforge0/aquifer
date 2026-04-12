@@ -17,6 +17,9 @@ const {
   upsertEntityRelations,
   searchEntities,
   getEntityRelations,
+  resolveEntities,
+  normalizeEntityName,
+  getSessionsByEntityIntersection,
 } = require('../core/entity');
 const {
   rrfFusion,
@@ -24,12 +27,14 @@ const {
   accessScore,
   hybridRank,
 } = require('../core/hybrid-rank');
+const storage = require('../core/storage');
 const {
   markStatus,
   extractUserTurns,
   upsertTurnEmbeddings,
   getMessages,
-} = require('../core/storage');
+  recordFeedback,
+} = storage;
 const indexExports = require('../index');
 const { createEmbedder } = require('../pipeline/embed');
 const {
@@ -882,8 +887,6 @@ describe('core/hybrid-rank.js', () => {
     const result = hybridRank(
       [],
       [],
-      5,
-      {},
       [{
         id: 7,
         matched_turn_text: 'edge case turn',
@@ -902,10 +905,12 @@ describe('core/hybrid-rank.js', () => {
     const [row] = hybridRank(
       [{ session_id: 's1', started_at: new Date().toISOString() }],
       [],
-      1,
-      { rrf: 10, timeDecay: 10, access: 10, entityBoost: 10 },
       [],
-      new Map([['s1', 1]])
+      {
+        limit: 1,
+        weights: { rrf: 10, timeDecay: 10, access: 10, entityBoost: 10 },
+        entityScoreBySession: new Map([['s1', 1]]),
+      }
     );
 
     assert.equal(row._score, 1);
@@ -915,10 +920,188 @@ describe('core/hybrid-rank.js', () => {
     const rows = hybridRank(
       [{ session_id: 's1', started_at: new Date().toISOString() }],
       [],
-      0
+      [],
+      { limit: 0 }
     );
 
     assert.deepEqual(rows, []);
+  });
+
+  it('hybridRank trust multiplier is neutral at 0.5', () => {
+    const now = new Date().toISOString();
+    const fts = [{ session_id: 's1', started_at: now, trust_score: 0.5 }];
+    const [r] = hybridRank(fts, [], []);
+    assert.equal(r._trustMultiplier, 1.0);
+  });
+
+  it('hybridRank trust=0 halves the base score', () => {
+    const now = new Date().toISOString();
+    const ftsNeutral = [{ session_id: 's1', started_at: now, trust_score: 0.5 }];
+    const ftsZero = [{ session_id: 's1', started_at: now, trust_score: 0.0 }];
+    const [neutral] = hybridRank(ftsNeutral, [], []);
+    const [zero] = hybridRank(ftsZero, [], []);
+    assert.equal(zero._trustMultiplier, 0.5);
+    assert.ok(zero._score < neutral._score);
+  });
+
+  it('hybridRank trust=1 gives 1.5x multiplier', () => {
+    const now = new Date().toISOString();
+    const fts = [{ session_id: 's1', started_at: now, trust_score: 1.0 }];
+    const [r] = hybridRank(fts, [], []);
+    assert.equal(r._trustMultiplier, 1.5);
+  });
+
+  it('hybridRank open-loop boost from Set works correctly', () => {
+    const now = new Date().toISOString();
+    const fts = [
+      { session_id: 'a', started_at: now },
+      { session_id: 'b', started_at: now },
+    ];
+    const olSet = new Set(['a']);
+    const result = hybridRank(fts, [], [], { openLoopSet: olSet });
+    const a = result.find(r => r.session_id === 'a');
+    const b = result.find(r => r.session_id === 'b');
+    assert.ok(a._openLoopBoost > 0);
+    assert.equal(b._openLoopBoost, 0);
+    assert.ok(a._score > b._score);
+  });
+
+  it('hybridRank missing trust_score defaults to 0.5', () => {
+    const fts = [{ session_id: 's1', started_at: new Date().toISOString() }];
+    const [r] = hybridRank(fts, [], []);
+    assert.equal(r._trustScore, 0.5);
+    assert.equal(r._trustMultiplier, 1.0);
+  });
+
+  it('hybridRank entity boost still works with new API', () => {
+    const now = new Date().toISOString();
+    const fts = [
+      { session_id: 'boosted', started_at: now },
+      { session_id: 'plain', started_at: now },
+    ];
+    const entityMap = new Map([['boosted', 1.0]]);
+    const result = hybridRank(fts, [], [], { entityScoreBySession: entityMap });
+    assert.equal(result[0].session_id, 'boosted');
+    assert.ok(result[0]._entityScore > result[1]._entityScore);
+  });
+});
+
+describe('core/entity.js — resolveEntities', () => {
+  it('returns empty for null/empty names', async () => {
+    const mockPool = { async query() { return { rows: [] }; } };
+    assert.deepEqual(await resolveEntities(mockPool, { schema: 'aq', tenantId: 'x', names: [] }), []);
+    assert.deepEqual(await resolveEntities(mockPool, { schema: 'aq', tenantId: 'x', names: null }), []);
+  });
+
+  it('deduplicates normalized names', async () => {
+    let queryCount = 0;
+    const mockPool = {
+      async query() { queryCount++; return { rows: [{ id: 1, name: 'Pg', normalized_name: 'pg' }] }; },
+    };
+    const result = await resolveEntities(mockPool, {
+      schema: 'aq', tenantId: 'x', names: ['PostgreSQL', 'postgresql', ' POSTGRESQL '],
+    });
+    assert.equal(result.length, 1);
+    assert.equal(queryCount, 1);
+  });
+
+  it('skips unresolvable names', async () => {
+    const mockPool = {
+      async query(sql, params) {
+        if (params[1] === 'known') return { rows: [{ id: 1, name: 'Known', normalized_name: 'known' }] };
+        return { rows: [] };
+      },
+    };
+    const result = await resolveEntities(mockPool, {
+      schema: 'aq', tenantId: 'x', names: ['known', 'unknown'],
+    });
+    assert.equal(result.length, 1);
+    assert.equal(result[0].inputName, 'known');
+  });
+
+  it('deduplicates by entityId across different input names', async () => {
+    const mockPool = {
+      async query() { return { rows: [{ id: 42, name: 'Pg', normalized_name: 'pg' }] }; },
+    };
+    const result = await resolveEntities(mockPool, {
+      schema: 'aq', tenantId: 'x', names: ['postgres', 'pg'],
+    });
+    assert.equal(result.length, 1);
+    assert.equal(result[0].entityId, 42);
+  });
+});
+
+describe('core/entity.js — getSessionsByEntityIntersection', () => {
+  it('returns empty for empty entityIds', async () => {
+    const mockPool = { async query() { assert.fail('should not query'); } };
+    const result = await getSessionsByEntityIntersection(mockPool, {
+      schema: 'aq', entityIds: [], tenantId: 'x',
+    });
+    assert.deepEqual(result, []);
+  });
+
+  it('returns empty for null entityIds', async () => {
+    const mockPool = { async query() { assert.fail('should not query'); } };
+    const result = await getSessionsByEntityIntersection(mockPool, {
+      schema: 'aq', entityIds: null, tenantId: 'x',
+    });
+    assert.deepEqual(result, []);
+  });
+
+  it('clamps limit to [1, 500]', async () => {
+    let capturedLimit;
+    const mockPool = {
+      async query(sql, params) { capturedLimit = params[params.length - 1]; return { rows: [] }; },
+    };
+    await getSessionsByEntityIntersection(mockPool, { schema: 'aq', entityIds: [1], tenantId: 'x', limit: 9999 });
+    assert.equal(capturedLimit, 500);
+    await getSessionsByEntityIntersection(mockPool, { schema: 'aq', entityIds: [1], tenantId: 'x', limit: -5 });
+    assert.equal(capturedLimit, 1);
+  });
+});
+
+describe('core/storage.js — recordFeedback', () => {
+  it('rejects invalid verdict', async () => {
+    const mockPool = {};
+    await assert.rejects(
+      () => storage.recordFeedback(mockPool, {
+        schema: 'aq', tenantId: 'x', sessionRowId: 1, sessionId: 's1', agentId: 'a', verdict: 'bad',
+      }),
+      /Invalid verdict/
+    );
+  });
+
+  it('rejects empty string verdict', async () => {
+    const mockPool = {};
+    await assert.rejects(
+      () => storage.recordFeedback(mockPool, {
+        schema: 'aq', tenantId: 'x', sessionRowId: 1, sessionId: 's1', agentId: 'a', verdict: '',
+      }),
+      /Invalid verdict/
+    );
+  });
+});
+
+describe('core/aquifer.js — feedback', () => {
+  it('requires verdict', async () => {
+    const aq = createAquifer({ db: 'postgres://fake', entities: { enabled: true } });
+    await assert.rejects(
+      () => aq.feedback('sess1', {}),
+      /verdict is required/
+    );
+    await aq.close();
+  });
+
+  it('rejects entities opt when entities not enabled', async () => {
+    const aq = createAquifer({
+      db: 'postgres://fake',
+      embed: { fn: async () => [[0.1]], dim: 1 },
+    });
+    await assert.rejects(
+      () => aq.recall('test', { entities: ['foo'], entityMode: 'all' }),
+      /Entities are not enabled/
+    );
+    await aq.close();
   });
 });
 

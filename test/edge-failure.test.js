@@ -485,18 +485,18 @@ describe('hybrid-rank.js — accessScore', () => {
 
 describe('hybrid-rank.js — hybridRank', () => {
   it('all empty lists returns []', () => {
-    const r = hybridRank([], [], 5, {});
+    const r = hybridRank([], [], []);
     assert.deepStrictEqual(r, []);
   });
 
   it('all null/undefined lists returns []', () => {
-    const r = hybridRank(null, undefined, 5, {}, null);
+    const r = hybridRank(null, undefined, null);
     assert.deepStrictEqual(r, []);
   });
 
   it('single result with null fields gets default scores', () => {
     const fts = [{ session_id: 's1', started_at: null, access_count: null, last_accessed_at: null }];
-    const r = hybridRank(fts, [], 5, {});
+    const r = hybridRank(fts, [], []);
     assert.strictEqual(r.length, 1);
     assert.ok(r[0]._score >= 0 && r[0]._score <= 1);
     assert.strictEqual(r[0]._timeDecay, 0.5);
@@ -504,25 +504,25 @@ describe('hybrid-rank.js — hybridRank', () => {
 
   it('null within result array is skipped', () => {
     const fts = [null, { session_id: 's1', started_at: null }];
-    const r = hybridRank(fts, [], 5, {});
+    const r = hybridRank(fts, [], []);
     assert.strictEqual(r.length, 1);
   });
 
   it('result with only .id (no session_id) is included', () => {
     const emb = [{ id: 99, started_at: null }];
-    const r = hybridRank([], emb, 5, {});
+    const r = hybridRank([], emb, []);
     assert.strictEqual(r.length, 1);
   });
 
   it('limit=0 returns empty array', () => {
     const fts = [{ session_id: 's1', started_at: null }];
-    const r = hybridRank(fts, [], 0, {});
+    const r = hybridRank(fts, [], [], { limit: 0 });
     assert.deepStrictEqual(r, []);
   });
 
   it('negative limit returns empty array', () => {
     const fts = [{ session_id: 's1', started_at: null }];
-    const r = hybridRank(fts, [], -1, {});
+    const r = hybridRank(fts, [], [], { limit: -1 });
     assert.deepStrictEqual(r, []);
   });
 
@@ -533,14 +533,14 @@ describe('hybrid-rank.js — hybridRank', () => {
       { session_id: 'old', started_at: recent, access_count: 1, last_accessed_at: recent },
       { session_id: 'new', started_at: now, access_count: 10, last_accessed_at: now },
     ];
-    const r = hybridRank(fts, [], 5, {});
+    const r = hybridRank(fts, [], []);
     assert.ok(r[0]._score >= r[1]._score);
   });
 
   it('turn results add matched_turn fields to existing result', () => {
     const emb = [{ session_id: 's1', started_at: null, matched_turn_text: null }];
     const turn = [{ session_id: 's1', matched_turn_text: 'hello' }];
-    const r = hybridRank([], emb, 5, {}, turn);
+    const r = hybridRank([], emb, turn);
     assert.strictEqual(r[0].matched_turn_text, 'hello');
   });
 
@@ -549,14 +549,14 @@ describe('hybrid-rank.js — hybridRank', () => {
     const fts = [
       { session_id: 's1', started_at: now, access_count: 1000, last_accessed_at: now },
     ];
-    const r = hybridRank(fts, [], 5, { entityBoost: 1 });
+    const r = hybridRank(fts, [], [], { weights: { entityBoost: 1 } });
     assert.ok(r[0]._score <= 1);
   });
 
   it('weights with all-zero scores produce zero score', () => {
     const now = new Date().toISOString();
     const fts = [{ session_id: 's1', started_at: now, access_count: 0, last_accessed_at: null }];
-    const r = hybridRank(fts, [], 5, { rrf: 0.65, timeDecay: 0, access: 0, entityBoost: 0 });
+    const r = hybridRank(fts, [], [], { weights: { rrf: 0.65, timeDecay: 0, access: 0, entityBoost: 0 } });
     assert.ok(r[0]._score >= 0);
   });
 });

@@ -62,6 +62,14 @@ function accessScore(accessCount, lastAccessedAt) {
 
 // ---------------------------------------------------------------------------
 // hybridRank — combine all signals into final ranked list
+//
+// Scoring order:
+//   1. rawBase = rrf * normRrf + timeDecay * td + access * as
+//   2. base = min(1, rawBase)
+//   3. trustMultiplier = 0.5 + (trust_score ?? 0.5)        [0.5–1.5]
+//   4. trustedBase = base * trustMultiplier
+//   5. withOpenLoop = min(1, trustedBase + openLoop boost)
+//   6. finalScore = min(1, withOpenLoop + entityBoost * entitySc * (1 - withOpenLoop))
 // ---------------------------------------------------------------------------
 
 const DEFAULT_WEIGHTS = {
@@ -69,16 +77,17 @@ const DEFAULT_WEIGHTS = {
   timeDecay: 0.25,
   access: 0.10,
   entityBoost: 0.18,
+  openLoop: 0.08,
 };
 
-function hybridRank(
-  ftsResults,
-  embResults,
-  limit = 5,
-  weights = {},
-  turnResults = [],
-  entityScoreBySession = new Map(),
-) {
+function hybridRank(ftsResults, embResults, turnResults, opts = {}) {
+  const {
+    limit = 5,
+    weights = {},
+    entityScoreBySession = new Map(),
+    openLoopSet = new Set(),
+  } = opts;
+
   const w = { ...DEFAULT_WEIGHTS, ...weights };
 
   // Build allResults map: session_id → result object
@@ -139,11 +148,22 @@ function hybridRank(
     );
     const as = 1 - Math.exp(-accessEff / 5);
 
+    // Step 1–2: base score
     const rawBase = w.rrf * normRrf + w.timeDecay * td + w.access * as;
-    const base = Math.min(1, rawBase); // m7: clamp to prevent negative entity boost
+    const base = Math.min(1, rawBase);
 
+    // Step 3–4: trust multiplier (read from result row)
+    const trustSc = result.trust_score ?? 0.5;
+    const trustMultiplier = 0.5 + trustSc;
+    const trustedBase = Math.min(1, base * trustMultiplier);
+
+    // Step 5: open-loop boost
+    const olBoost = openLoopSet.has(sessionId) ? w.openLoop : 0;
+    const withOpenLoop = Math.min(1, trustedBase + olBoost);
+
+    // Step 6: entity boost
     const entitySc = entityScoreBySession.get(sessionId) || 0;
-    const finalScore = Math.min(1, base + w.entityBoost * entitySc * (1 - base));
+    const finalScore = Math.min(1, withOpenLoop + w.entityBoost * entitySc * (1 - withOpenLoop));
 
     scored.push({
       ...result,
@@ -152,6 +172,9 @@ function hybridRank(
       _timeDecay: td,
       _access: as,
       _entityScore: entitySc,
+      _trustScore: trustSc,
+      _trustMultiplier: trustMultiplier,
+      _openLoopBoost: olBoost,
     });
   }
 

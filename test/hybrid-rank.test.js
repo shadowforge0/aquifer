@@ -101,7 +101,7 @@ describe('accessScore', () => {
 
 describe('hybridRank', () => {
   it('returns empty for empty inputs', () => {
-    const result = hybridRank([], [], 5, {}, [], new Map());
+    const result = hybridRank([], [], []);
     assert.equal(result.length, 0);
   });
 
@@ -110,7 +110,7 @@ describe('hybridRank', () => {
       session_id: `s${i}`, started_at: new Date().toISOString(),
       summary_text: 'test', structured_summary: { title: `t${i}` },
     }));
-    const result = hybridRank(fts, [], 3);
+    const result = hybridRank(fts, [], [], { limit: 3 });
     assert.equal(result.length, 3);
   });
 
@@ -120,25 +120,71 @@ describe('hybridRank', () => {
       { session_id: 'b', started_at: new Date().toISOString() },
     ];
     const entityMap = new Map([['a', 1.0]]);
-    const result = hybridRank(fts, [], 2, {}, [], entityMap);
+    const result = hybridRank(fts, [], [], { limit: 2, entityScoreBySession: entityMap });
     assert.equal(result[0].session_id, 'a'); // boosted
   });
 
-  it('attaches _score, _rrf, _timeDecay, _access, _entityScore', () => {
+  it('attaches _score, _rrf, _timeDecay, _access, _entityScore, _trustScore, _openLoopBoost', () => {
     const fts = [{ session_id: 'x', started_at: new Date().toISOString() }];
-    const [r] = hybridRank(fts, [], 1);
+    const [r] = hybridRank(fts, [], [], { limit: 1 });
     assert.ok('_score' in r);
     assert.ok('_rrf' in r);
     assert.ok('_timeDecay' in r);
     assert.ok('_access' in r);
     assert.ok('_entityScore' in r);
+    assert.ok('_trustScore' in r);
+    assert.ok('_trustMultiplier' in r);
+    assert.ok('_openLoopBoost' in r);
   });
 
   it('propagates matched_turn_text from turn results', () => {
     const fts = [{ session_id: 'a', started_at: new Date().toISOString() }];
     const turns = [{ session_id: 'a', matched_turn_text: 'hello world', matched_turn_index: 3 }];
-    const [r] = hybridRank(fts, [], 1, {}, turns);
+    const [r] = hybridRank(fts, [], turns, { limit: 1 });
     assert.equal(r.matched_turn_text, 'hello world');
     assert.equal(r.matched_turn_index, 3);
+  });
+
+  it('trust multiplier: high trust ranks above low trust', () => {
+    const fts = [
+      { session_id: 'high', started_at: new Date().toISOString(), trust_score: 0.9 },
+      { session_id: 'low', started_at: new Date().toISOString(), trust_score: 0.1 },
+    ];
+    const result = hybridRank(fts, [], [], { limit: 2 });
+    assert.equal(result[0].session_id, 'high');
+    assert.equal(result[1].session_id, 'low');
+    assert.ok(result[0]._trustMultiplier > result[1]._trustMultiplier);
+  });
+
+  it('trust default 0.5 is neutral (multiplier = 1.0)', () => {
+    const fts = [{ session_id: 'x', started_at: new Date().toISOString() }];
+    const [r] = hybridRank(fts, [], [], { limit: 1 });
+    assert.equal(r._trustScore, 0.5);
+    assert.equal(r._trustMultiplier, 1.0);
+  });
+
+  it('open-loop boost: session with open loops scores higher', () => {
+    const now = new Date().toISOString();
+    const fts = [
+      { session_id: 'with_ol', started_at: now },
+      { session_id: 'no_ol', started_at: now },
+    ];
+    const olSet = new Set(['with_ol']);
+    const result = hybridRank(fts, [], [], { limit: 2, openLoopSet: olSet });
+    assert.equal(result[0].session_id, 'with_ol');
+    assert.ok(result[0]._openLoopBoost > 0);
+    assert.equal(result[1]._openLoopBoost, 0);
+  });
+
+  it('open-loop weight=0 has no effect', () => {
+    const now = new Date().toISOString();
+    const fts = [{ session_id: 'a', started_at: now }];
+    const olSet = new Set(['a']);
+    const [r] = hybridRank(fts, [], [], {
+      limit: 1,
+      openLoopSet: olSet,
+      weights: { openLoop: 0 },
+    });
+    assert.equal(r._openLoopBoost, 0);
   });
 });

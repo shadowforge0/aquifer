@@ -127,6 +127,7 @@ function createAquifer(config) {
       `SELECT
         s.id, s.session_id, s.agent_id, s.source, s.started_at, s.last_message_at,
         ss.summary_text, ss.structured_summary, ss.access_count, ss.last_accessed_at,
+        ss.trust_score,
         (ss.embedding <=> $${vecPos}::vector) AS distance
       FROM ${qi(schema)}.session_summaries ss
       JOIN ${qi(schema)}.sessions s ON s.id = ss.session_row_id
@@ -157,6 +158,10 @@ function createAquifer(config) {
         const entitySql = loadSql('002-entities.sql', schema);
         await pool.query(entitySql);
       }
+
+      // 3. Trust + feedback (always, not gated by entities)
+      const trustSql = loadSql('003-trust-feedback.sql', schema);
+      await pool.query(trustSql);
 
       migrated = true;
     },
@@ -461,6 +466,8 @@ function createAquifer(config) {
         dateTo,
         limit = 5,
         weights: overrideWeights,
+        entities: explicitEntities,
+        entityMode = 'any',
       } = opts;
 
       const fetchLimit = limit * 4;
@@ -470,35 +477,63 @@ function createAquifer(config) {
       const queryVec = queryVecResult[0];
       if (!queryVec || !queryVec.length) return []; // m3: guard empty array too
 
-      // 2. Run 3 search paths in parallel
-      const [ftsRows, embRows, turnResult] = await Promise.all([
-        storage.searchSessions(pool, query, {
-          schema, tenantId, agentId, source, dateFrom, dateTo, limit: fetchLimit,
-        }).catch(() => []),
-        embeddingSearchSummaries(queryVec, {
-          agentId, source, dateFrom, dateTo, limit: fetchLimit,
-        }).catch(() => []),
-        storage.searchTurnEmbeddings(pool, {
-          schema, tenantId, queryVec, dateFrom, dateTo, agentId, source, limit: fetchLimit,
-        }).catch(() => ({ rows: [] })),
-      ]);
-
-      const turnRows = turnResult.rows || [];
-
-      if (ftsRows.length === 0 && embRows.length === 0 && turnRows.length === 0) {
-        return [];
-      }
-
-      // 3. Entity boost (if enabled)
+      // 2. Entity intersection pre-filter (when entityMode === 'all')
+      let candidateSessionIds = null; // null = no filter
       let entityScoreBySession = new Map();
-      if (entitiesEnabled) {
+
+      if (explicitEntities && explicitEntities.length > 0) {
+        if (!entitiesEnabled) throw new Error('Entities are not enabled');
+
+        const resolved = await entity.resolveEntities(pool, {
+          schema, tenantId, names: explicitEntities, agentId,
+        });
+
+        if (resolved.length === 0) return [];
+
+        // Guard: if 'all' mode but fewer entities resolved than requested,
+        // return [] — partial resolution would silently weaken the AND constraint
+        if (entityMode === 'all' && resolved.length < new Set(explicitEntities.map(n => entity.normalizeEntityName(n))).size) {
+          return [];
+        }
+
+        const entityIds = resolved.map(r => r.entityId);
+
+        if (entityMode === 'all') {
+          // Hard filter: only sessions with ALL entities
+          const intersectionRows = await entity.getSessionsByEntityIntersection(pool, {
+            schema, entityIds, tenantId, agentId, source, dateFrom, dateTo, limit: fetchLimit,
+          });
+
+          if (intersectionRows.length === 0) return [];
+
+          candidateSessionIds = new Set(intersectionRows.map(r => r.session_id));
+          for (const row of intersectionRows) {
+            entityScoreBySession.set(row.session_id, 1.0);
+          }
+        } else {
+          // 'any' mode with explicit entities: use resolved IDs for boost
+          const esResult = await pool.query(
+            `SELECT es.session_row_id, s.session_id, COUNT(*) AS entity_count
+            FROM ${qi(schema)}.entity_sessions es
+            JOIN ${qi(schema)}.sessions s ON s.id = es.session_row_id
+            WHERE es.entity_id = ANY($1)
+            GROUP BY es.session_row_id, s.session_id`,
+            [entityIds]
+          );
+
+          const maxCount = Math.max(1, ...esResult.rows.map(r => parseInt(r.entity_count)));
+          for (const row of esResult.rows) {
+            entityScoreBySession.set(row.session_id, parseInt(row.entity_count) / maxCount);
+          }
+        }
+      } else if (entitiesEnabled) {
+        // No explicit entities: existing query-text-based entity boost
         try {
           const matchedEntities = await entity.searchEntities(pool, {
             schema, tenantId, query, agentId, limit: 10,
           });
 
           if (matchedEntities.length > 0) {
-            // M1 fix: single JOIN instead of N+1
             const entityIds = matchedEntities.map(e => e.id);
             const esResult = await pool.query(
               `SELECT es.session_row_id, s.session_id, COUNT(*) AS entity_count
@@ -517,7 +552,47 @@ function createAquifer(config) {
         } catch (_) { /* entity search failure non-fatal */ }
       }
 
-      // 4. Run external source searches (parallel + timeout)
+      // 3. Run 3 search paths in parallel
+      const [ftsRows, embRows, turnResult] = await Promise.all([
+        storage.searchSessions(pool, query, {
+          schema, tenantId, agentId, source, dateFrom, dateTo, limit: fetchLimit,
+        }).catch(() => []),
+        embeddingSearchSummaries(queryVec, {
+          agentId, source, dateFrom, dateTo, limit: fetchLimit,
+        }).catch(() => []),
+        storage.searchTurnEmbeddings(pool, {
+          schema, tenantId, queryVec, dateFrom, dateTo, agentId, source, limit: fetchLimit,
+        }).catch(() => ({ rows: [] })),
+      ]);
+
+      const turnRows = turnResult.rows || [];
+
+      // 3b. Apply candidate filter (entityMode 'all')
+      const filterFn = candidateSessionIds
+        ? (rows) => rows.filter(r => candidateSessionIds.has(r.session_id || String(r.id)))
+        : (rows) => rows;
+
+      const filteredFts = filterFn(ftsRows);
+      const filteredEmb = filterFn(embRows);
+      const filteredTurn = filterFn(turnRows);
+
+      if (filteredFts.length === 0 && filteredEmb.length === 0 && filteredTurn.length === 0) {
+        return [];
+      }
+
+      // 4. Open-loop set extraction
+      const openLoopSet = new Set();
+      for (const r of [...filteredFts, ...filteredEmb, ...filteredTurn]) {
+        const sid = r.session_id || String(r.id);
+        const ss = typeof r.structured_summary === 'string'
+          ? (() => { try { return JSON.parse(r.structured_summary); } catch (_) { return null; } })()
+          : r.structured_summary;
+        if (ss && Array.isArray(ss.open_loops) && ss.open_loops.length > 0) {
+          openLoopSet.add(sid);
+        }
+      }
+
+      // 5. Run external source searches (parallel + timeout)
       const EXTERNAL_TIMEOUT = 10000;
       const externalRows = [];
       const externalPromises = [];
@@ -540,18 +615,21 @@ function createAquifer(config) {
       }
       if (externalPromises.length > 0) await Promise.all(externalPromises);
 
-      // 5. Hybrid rank — external results as separate embedding-like signal
+      // 6. Hybrid rank
       const mergedWeights = { ...rankWeights, ...overrideWeights };
       const ranked = hybridRank(
-        ftsRows,
-        [...embRows, ...externalRows],
-        limit,
-        mergedWeights,
-        turnRows,
-        entityScoreBySession,
+        filteredFts,
+        [...filteredEmb, ...filterFn(externalRows)],
+        filteredTurn,
+        {
+          limit,
+          weights: mergedWeights,
+          entityScoreBySession,
+          openLoopSet,
+        },
       );
 
-      // 6. Record access
+      // 7. Record access
       const sessionRowIds = ranked
         .map(r => r.id || r.session_row_id)
         .filter(Boolean);
@@ -562,7 +640,7 @@ function createAquifer(config) {
         } catch (_) { /* access recording non-fatal */ }
       }
 
-      // 7. Format results
+      // 8. Format results
       return ranked.map(r => ({
         sessionId: r.session_id,
         agentId: r.agent_id,
@@ -574,13 +652,38 @@ function createAquifer(config) {
         matchedTurnText: r.matched_turn_text || null,
         matchedTurnIndex: r.matched_turn_index || null,
         score: r._score,
+        trustScore: r._trustScore ?? 0.5,
         _debug: {
           rrf: r._rrf,
           timeDecay: r._timeDecay,
           access: r._access,
           entityScore: r._entityScore,
+          trustScore: r._trustScore,
+          trustMultiplier: r._trustMultiplier,
+          openLoopBoost: r._openLoopBoost,
         },
       }));
+    },
+
+    // --- feedback ---
+
+    async feedback(sessionId, opts = {}) {
+      const agentId = opts.agentId || 'agent';
+      const verdict = opts.verdict;
+      if (!verdict) throw new Error('opts.verdict is required ("helpful" or "unhelpful")');
+
+      const session = await storage.getSession(pool, sessionId, agentId, {}, { schema, tenantId });
+      if (!session) throw new Error(`Session not found: ${sessionId} (agentId=${agentId})`);
+
+      return storage.recordFeedback(pool, {
+        schema,
+        tenantId,
+        sessionRowId: session.id,
+        sessionId,
+        agentId,
+        verdict,
+        note: opts.note || null,
+      });
     },
 
     // --- admin ---

@@ -350,6 +350,7 @@ async function searchSessions(pool, query, {
       ss.structured_summary,
       ss.access_count,
       ss.last_accessed_at,
+      ss.trust_score,
       ts_headline('simple', COALESCE(ss.summary_text, ''), plainto_tsquery('simple', $1)) AS summary_snippet,
       ts_rank(ss.search_tsv, plainto_tsquery('simple', $1)) AS fts_rank
     FROM ${qi(schema)}.sessions s
@@ -513,6 +514,7 @@ async function searchTurnEmbeddings(pool, {
       SELECT DISTINCT ON (t.session_row_id)
         s.session_id, s.id AS session_row_id, s.agent_id, s.source, s.started_at,
         ss.summary_text, ss.structured_summary, ss.access_count, ss.last_accessed_at,
+        COALESCE(ss.trust_score, 0.5) AS trust_score,
         t.content_text AS matched_turn_text, t.turn_index AS matched_turn_index,
         (t.embedding <=> $${vecPos}::vector) AS turn_distance
       FROM ${qi(schema)}.turn_embeddings t
@@ -527,6 +529,68 @@ async function searchTurnEmbeddings(pool, {
   );
 
   return { rows: result.rows.slice(0, limit) };
+}
+
+// ---------------------------------------------------------------------------
+// recordFeedback — explicit trust feedback with audit trail
+// ---------------------------------------------------------------------------
+
+const TRUST_UP = 0.05;
+const TRUST_DOWN = 0.10;
+
+async function recordFeedback(pool, {
+  schema,
+  tenantId,
+  sessionRowId,
+  sessionId,
+  agentId,
+  verdict,
+  note,
+}) {
+  if (verdict !== 'helpful' && verdict !== 'unhelpful') {
+    throw new Error(`Invalid verdict: "${verdict}". Must be "helpful" or "unhelpful".`);
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const current = await client.query(
+      `SELECT trust_score FROM ${qi(schema)}.session_summaries
+      WHERE session_row_id = $1 FOR UPDATE`,
+      [sessionRowId]
+    );
+    if (!current.rows[0]) {
+      throw new Error(`Session not enriched: no summary for session_row_id=${sessionRowId}`);
+    }
+
+    const trustBefore = parseFloat(current.rows[0].trust_score);
+    const trustAfter = verdict === 'helpful'
+      ? Math.min(1.0, trustBefore + TRUST_UP)
+      : Math.max(0.0, trustBefore - TRUST_DOWN);
+
+    await client.query(
+      `UPDATE ${qi(schema)}.session_summaries
+      SET trust_score = $1, updated_at = now()
+      WHERE session_row_id = $2`,
+      [trustAfter, sessionRowId]
+    );
+
+    await client.query(
+      `INSERT INTO ${qi(schema)}.session_feedback
+        (session_row_id, tenant_id, agent_id, session_id, verdict, note, trust_before, trust_after)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [sessionRowId, tenantId, agentId, sessionId, verdict, note || null, trustBefore, trustAfter]
+    );
+
+    await client.query('COMMIT');
+    return { trustBefore, trustAfter, verdict };
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -547,4 +611,5 @@ module.exports = {
   extractUserTurns,
   upsertTurnEmbeddings,
   searchTurnEmbeddings,
+  recordFeedback,
 };

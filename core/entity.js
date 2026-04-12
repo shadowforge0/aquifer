@@ -345,6 +345,120 @@ async function getEntityRelations(pool, {
 }
 
 // ---------------------------------------------------------------------------
+// resolveEntities — map raw names to entity IDs with dedup
+// ---------------------------------------------------------------------------
+
+async function resolveEntities(pool, {
+  schema,
+  tenantId,
+  names,
+  agentId = null,
+  threshold = 0.1,
+}) {
+  if (!names || names.length === 0) return [];
+
+  const seen = new Map();
+  const results = [];
+
+  for (const rawName of names) {
+    const normQ = normalizeEntityName(rawName);
+    if (!normQ || seen.has(normQ)) continue;
+    seen.set(normQ, true);
+
+    const escaped = _escapeIlike(normQ);
+    const result = await pool.query(
+      `SELECT id, name, normalized_name
+      FROM ${qi(schema)}.entities
+      WHERE status = 'active'
+        AND tenant_id = $1
+        AND (
+          similarity(normalized_name, $2) >= $3
+          OR normalized_name = $2
+          OR $2 = ANY(aliases)
+        )
+        AND ($4::text IS NULL OR agent_id = $4)
+      ORDER BY similarity(normalized_name, $2) DESC, frequency DESC
+      LIMIT 1`,
+      [tenantId, normQ, threshold, agentId || null]
+    );
+
+    if (result.rows[0]) {
+      const row = result.rows[0];
+      if (!results.some(r => r.entityId === row.id)) {
+        results.push({
+          entityId: row.id,
+          name: row.name,
+          normalizedName: row.normalized_name,
+          inputName: rawName,
+        });
+      }
+    }
+  }
+
+  return results;
+}
+
+// ---------------------------------------------------------------------------
+// getSessionsByEntityIntersection — sessions containing ALL specified entities
+// ---------------------------------------------------------------------------
+
+async function getSessionsByEntityIntersection(pool, {
+  schema,
+  entityIds,
+  tenantId,
+  agentId = null,
+  source = null,
+  dateFrom = null,
+  dateTo = null,
+  limit = 100,
+}) {
+  if (!entityIds || entityIds.length === 0) return [];
+
+  const where = ['s.tenant_id = $2'];
+  const params = [entityIds, tenantId];
+
+  if (agentId) {
+    params.push(agentId);
+    where.push(`s.agent_id = $${params.length}`);
+  }
+  if (source) {
+    params.push(source);
+    where.push(`s.source = $${params.length}`);
+  }
+  if (dateFrom) {
+    params.push(dateFrom);
+    where.push(`s.started_at::date >= $${params.length}::date`);
+  }
+  if (dateTo) {
+    params.push(dateTo);
+    where.push(`s.started_at::date <= $${params.length}::date`);
+  }
+
+  params.push(entityIds.length);
+  const havingPos = params.length;
+
+  params.push(Math.max(1, Math.min(500, limit)));
+  const limitPos = params.length;
+
+  const result = await pool.query(
+    `SELECT es.session_row_id, s.session_id,
+            COUNT(DISTINCT es.entity_id) AS matched_count,
+            SUM(es.mention_count) AS mention_weight
+    FROM ${qi(schema)}.entity_sessions es
+    JOIN ${qi(schema)}.sessions s ON s.id = es.session_row_id
+    WHERE es.entity_id = ANY($1)
+      AND ${where.join(' AND ')}
+    GROUP BY es.session_row_id, s.session_id
+    HAVING COUNT(DISTINCT es.entity_id) >= $${havingPos}
+    ORDER BY matched_count DESC, mention_weight DESC
+    LIMIT $${limitPos}`,
+    params
+  );
+
+  return result.rows;
+}
+
+// ---------------------------------------------------------------------------
 // Exports
 // ---------------------------------------------------------------------------
 
@@ -357,4 +471,6 @@ module.exports = {
   upsertEntitySession,
   searchEntities,
   getEntityRelations,
+  resolveEntities,
+  getSessionsByEntityIntersection,
 };
