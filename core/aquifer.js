@@ -94,6 +94,14 @@ function createAquifer(config) {
 
   // Track if migrate was called
   let migrated = false;
+  let migratePromise = null;
+
+  async function ensureMigrated() {
+    if (migrated) return;
+    if (migratePromise) return migratePromise;
+    migratePromise = aquifer.migrate().finally(() => { migratePromise = null; });
+    return migratePromise;
+  }
 
   // --- Helper: embed search on summaries ---
   async function embeddingSearchSummaries(queryVec, opts) {
@@ -196,6 +204,7 @@ function createAquifer(config) {
     async commit(sessionId, messages, opts = {}) {
       if (!sessionId) throw new Error('sessionId is required');
       if (!messages || !Array.isArray(messages)) throw new Error('messages must be an array');
+      await ensureMigrated();
 
       const agentId = opts.agentId || 'agent';
       const source = opts.source || 'api';
@@ -240,6 +249,7 @@ function createAquifer(config) {
     // --- enrichment ---
 
     async enrich(sessionId, opts = {}) {
+      await ensureMigrated();
       const agentId = opts.agentId || 'agent';
       const skipSummary = opts.skipSummary || false;
       const skipTurnEmbed = opts.skipTurnEmbed || false;
@@ -470,6 +480,13 @@ function createAquifer(config) {
         entityMode = 'any',
       } = opts;
 
+      // Validate before touching DB
+      if (explicitEntities && explicitEntities.length > 0 && !entitiesEnabled) {
+        throw new Error('Entities are not enabled');
+      }
+
+      await ensureMigrated();
+
       const fetchLimit = limit * 4;
 
       // 1. Embed query
@@ -482,7 +499,6 @@ function createAquifer(config) {
       let entityScoreBySession = new Map();
 
       if (explicitEntities && explicitEntities.length > 0) {
-        if (!entitiesEnabled) throw new Error('Entities are not enabled');
 
         const resolved = await entity.resolveEntities(pool, {
           schema, tenantId, names: explicitEntities, agentId,
@@ -671,6 +687,7 @@ function createAquifer(config) {
       const agentId = opts.agentId || 'agent';
       const verdict = opts.verdict;
       if (!verdict) throw new Error('opts.verdict is required ("helpful" or "unhelpful")');
+      await ensureMigrated();
 
       const session = await storage.getSession(pool, sessionId, agentId, {}, { schema, tenantId });
       if (!session) throw new Error(`Session not found: ${sessionId} (agentId=${agentId})`);

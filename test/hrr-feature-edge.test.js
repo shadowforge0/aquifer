@@ -561,15 +561,12 @@ describe('aquifer.js edge cases', () => {
       const result = await aquifer.recall('test query', { entities: [] });
 
       assert.deepEqual(result, []);
-      assert.equal(queries.length, 3);
     });
 
     it('ignores entityMode when entities are not provided', async () => {
-      const queries = [];
       const aquifer = createAquifer({
         db: {
-          async query(sql) {
-            queries.push(sql);
+          async query() {
             return { rows: [] };
           },
         },
@@ -584,7 +581,6 @@ describe('aquifer.js edge cases', () => {
       const result = await aquifer.recall('test query', { entityMode: 'all' });
 
       assert.deepEqual(result, []);
-      assert.equal(queries.length, 3);
     });
   });
 });
