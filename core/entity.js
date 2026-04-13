@@ -141,21 +141,23 @@ async function upsertEntity(pool, {
   type = 'other',
   status = 'active',
   agentId = 'main',
+  entityScope,
   createdBy,
   metadata = {},
   embedding,
   occurredAt,
 }) {
+  const scope = entityScope || agentId || 'default';
   const normalizedAliases = aliases.map(a => normalizeEntityName(a)).filter(Boolean);
   const embStr = embedding ? vecToStr(embedding) : null;
   const ts = occurredAt || new Date().toISOString();
 
   const result = await pool.query(
     `INSERT INTO ${qi(schema)}.entities
-      (tenant_id, name, normalized_name, aliases, type, status, agent_id,
+      (tenant_id, name, normalized_name, aliases, type, status, agent_id, entity_scope,
        created_by, metadata, embedding, first_seen_at, last_seen_at, frequency)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::vector, $11, $11, 1)
-    ON CONFLICT (tenant_id, normalized_name, agent_id) DO UPDATE SET
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::vector, $12, $12, 1)
+    ON CONFLICT (tenant_id, normalized_name, entity_scope) DO UPDATE SET
       frequency    = ${qi(schema)}.entities.frequency + 1,
       aliases      = ARRAY(SELECT DISTINCT unnest(${qi(schema)}.entities.aliases || EXCLUDED.aliases)),
       last_seen_at = GREATEST(${qi(schema)}.entities.last_seen_at, EXCLUDED.last_seen_at),
@@ -164,7 +166,7 @@ async function upsertEntity(pool, {
     RETURNING id, (xmax = 0) AS is_new`,
     [
       tenantId, name, normalizedName, normalizedAliases,
-      type, status, agentId,
+      type, status, agentId, scope,
       createdBy || null,
       JSON.stringify(metadata),
       embStr,
@@ -276,6 +278,7 @@ async function searchEntities(pool, {
   tenantId,
   query,
   agentId,
+  entityScope,
   limit = 10,
   similarityThreshold = 0.1,
 }) {
@@ -284,11 +287,13 @@ async function searchEntities(pool, {
   if (!normQ) return [];
 
   const escaped = _escapeIlike(normQ);
+  // Use entityScope if provided, fall back to agentId for backward compat
+  const scopeFilter = entityScope || agentId || null;
 
   const result = await pool.query(
     `SELECT
       id, name, normalized_name, aliases, type, status, frequency, agent_id,
-      last_seen_at, metadata,
+      entity_scope, last_seen_at, metadata,
       similarity(normalized_name, $1) AS name_sim
     FROM ${qi(schema)}.entities
     WHERE status = 'active'
@@ -298,10 +303,10 @@ async function searchEntities(pool, {
         OR normalized_name ILIKE '%' || $4 || '%' ESCAPE '\\'
         OR $5 = ANY(aliases)
       )
-      AND ($6::text IS NULL OR agent_id = $6)
+      AND ($6::text IS NULL OR entity_scope = $6)
     ORDER BY name_sim DESC, frequency DESC
     LIMIT $7`,
-    [normQ, tenantId, similarityThreshold, escaped, normQ, agentId || null, clampedLimit]
+    [normQ, tenantId, similarityThreshold, escaped, normQ, scopeFilter, clampedLimit]
   );
 
   return result.rows;
@@ -353,9 +358,12 @@ async function resolveEntities(pool, {
   tenantId,
   names,
   agentId = null,
+  entityScope,
   threshold = 0.1,
 }) {
   if (!names || names.length === 0) return [];
+  // Use entityScope if provided, fall back to agentId for backward compat
+  const scopeFilter = entityScope || agentId || null;
 
   const seen = new Map();
   const results = [];
@@ -376,10 +384,10 @@ async function resolveEntities(pool, {
           OR normalized_name = $2
           OR $2 = ANY(aliases)
         )
-        AND ($4::text IS NULL OR agent_id = $4)
+        AND ($4::text IS NULL OR entity_scope = $4)
       ORDER BY similarity(normalized_name, $2) DESC, frequency DESC
       LIMIT 1`,
-      [tenantId, normQ, threshold, agentId || null]
+      [tenantId, normQ, threshold, scopeFilter]
     );
 
     if (result.rows[0]) {

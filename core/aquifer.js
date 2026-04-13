@@ -79,6 +79,7 @@ function createAquifer(config) {
   let entitiesEnabled = config.entities && config.entities.enabled === true;
   const mergeCall = config.entities && config.entities.mergeCall !== undefined ? config.entities.mergeCall : true;
   const entityPromptFn = config.entities && config.entities.prompt ? config.entities.prompt : null;
+  const entityScope = (config.entities && config.entities.scope) || 'default';
 
   // Rank weights
   const rankWeights = {
@@ -264,11 +265,14 @@ function createAquifer(config) {
       const optModel = 'model' in opts ? opts.model : undefined; // undefined = no override
 
       // 1. Optimistic lock: claim session for processing
+      //    Also reclaim stale 'processing' sessions (stuck > 10 min = likely killed process)
+      const STALE_MINUTES = 10;
       const claimResult = await pool.query(
         `UPDATE ${qi(schema)}.sessions
-        SET processing_status = 'processing'
+        SET processing_status = 'processing', processing_started_at = NOW()
         WHERE session_id = $1 AND agent_id = $2 AND tenant_id = $3
-          AND processing_status IN ('pending', 'failed')
+          AND (processing_status IN ('pending', 'failed')
+               OR (processing_status = 'processing' AND (processing_started_at IS NULL OR processing_started_at < NOW() - INTERVAL '${STALE_MINUTES} minutes')))
         RETURNING *`,
         [sessionId, agentId, tenantId]
       );
@@ -398,6 +402,7 @@ function createAquifer(config) {
                 aliases: ent.aliases,
                 type: ent.type,
                 agentId,
+                entityScope,
                 createdBy: 'aquifer',
                 occurredAt: session.started_at ? new Date(session.started_at).toISOString() : null,
               });
@@ -549,7 +554,7 @@ function createAquifer(config) {
       if (explicitEntities && explicitEntities.length > 0) {
 
         const resolved = await entity.resolveEntities(pool, {
-          schema, tenantId, names: explicitEntities, agentId,
+          schema, tenantId, names: explicitEntities, entityScope,
         });
 
         if (resolved.length === 0) return [];
@@ -594,7 +599,7 @@ function createAquifer(config) {
         // No explicit entities: existing query-text-based entity boost
         try {
           const matchedEntities = await entity.searchEntities(pool, {
-            schema, tenantId, query, agentId, limit: 10,
+            schema, tenantId, query, entityScope, limit: 10,
           });
 
           if (matchedEntities.length > 0) {

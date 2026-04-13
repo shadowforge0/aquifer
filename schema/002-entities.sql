@@ -20,16 +20,28 @@ CREATE TABLE IF NOT EXISTS ${schema}.entities (
                     CHECK (status IN ('active','merged','deleted')),
   frequency       INT          NOT NULL DEFAULT 1,
   agent_id        TEXT         NOT NULL DEFAULT 'main',
+  entity_scope    TEXT         NOT NULL DEFAULT 'default',
   created_by      TEXT,
   metadata        JSONB        NOT NULL DEFAULT '{}',
   embedding       vector,
   first_seen_at   TIMESTAMPTZ  NOT NULL DEFAULT now(),
-  last_seen_at    TIMESTAMPTZ  NOT NULL DEFAULT now(),
-  UNIQUE (tenant_id, normalized_name, agent_id)
+  last_seen_at    TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS idx_entities_tenant_agent
-  ON ${schema}.entities (tenant_id, agent_id);
+-- Migration: add entity_scope if missing (idempotent)
+-- For upgrades: backfill from agent_id so existing data keeps its scope
+ALTER TABLE ${schema}.entities ADD COLUMN IF NOT EXISTS entity_scope TEXT DEFAULT 'default';
+UPDATE ${schema}.entities SET entity_scope = agent_id WHERE entity_scope IS NULL OR entity_scope = 'default';
+ALTER TABLE ${schema}.entities ALTER COLUMN entity_scope SET NOT NULL;
+
+-- Unique constraint: entity identity is (tenant, name, scope)
+-- Drop legacy agent-based constraint if it exists
+DROP INDEX IF EXISTS ${schema}.idx_entities_tenant_name_agent;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_tenant_name_scope
+  ON ${schema}.entities (tenant_id, normalized_name, entity_scope);
+
+CREATE INDEX IF NOT EXISTS idx_entities_tenant_scope
+  ON ${schema}.entities (tenant_id, entity_scope);
 
 CREATE INDEX IF NOT EXISTS idx_entities_type
   ON ${schema}.entities (type);
@@ -44,7 +56,7 @@ CREATE INDEX IF NOT EXISTS idx_entities_aliases
   ON ${schema}.entities USING GIN (aliases);
 
 CREATE INDEX IF NOT EXISTS idx_entities_active
-  ON ${schema}.entities (tenant_id, agent_id, frequency DESC)
+  ON ${schema}.entities (tenant_id, entity_scope, frequency DESC)
   WHERE status = 'active';
 
 -- =========================================================================
