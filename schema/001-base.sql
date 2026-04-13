@@ -24,10 +24,11 @@ CREATE TABLE IF NOT EXISTS ${schema}.sessions (
   started_at         TIMESTAMPTZ,
   ended_at           TIMESTAMPTZ,
   last_message_at    TIMESTAMPTZ,
-  processing_status  TEXT         NOT NULL DEFAULT 'pending',
-  processed_at       TIMESTAMPTZ,
-  processing_error   TEXT,
-  created_at         TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  processing_status    TEXT         NOT NULL DEFAULT 'pending',
+  processing_started_at TIMESTAMPTZ,
+  processed_at         TIMESTAMPTZ,
+  processing_error     TEXT,
+  created_at           TIMESTAMPTZ  NOT NULL DEFAULT now(),
   UNIQUE (tenant_id, agent_id, session_id)
 );
 
