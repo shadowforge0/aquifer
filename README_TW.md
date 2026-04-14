@@ -4,7 +4,7 @@
 
 **基於 PostgreSQL 的 AI Agent 長期記憶系統**
 
-*Turn 級 embedding、三路 RRF 混合排序、信任評分、實體交叉查詢、知識圖譜——全部跑在 PostgreSQL + pgvector 上。*
+*Turn 級 embedding、三路 RRF 混合排序、信任評分、實體交叉查詢、知識圖譜、實體作用域——全部跑在 PostgreSQL + pgvector 上。*
 
 [![npm version](https://img.shields.io/npm/v/@shadowforge0/aquifer-memory)](https://www.npmjs.com/package/@shadowforge0/aquifer-memory)
 [![PostgreSQL 15+](https://img.shields.io/badge/PostgreSQL-15%2B-336791)](https://www.postgresql.org/)
@@ -68,19 +68,19 @@ npm install @shadowforge0/aquifer-memory
 const { createAquifer } = require('@shadowforge0/aquifer-memory');
 
 const aquifer = createAquifer({
+  db: 'postgresql://user:pass@localhost:5432/mydb',  // 連線字串或 pg.Pool
   schema: 'memory',                    // PG schema 名稱（預設 'aquifer'）
-  pg: {
-    connectionString: 'postgresql://user:pass@localhost:5432/mydb',
-  },
-  embedder: {
-    baseURL: 'http://localhost:11434/v1',   // Ollama
-    model: 'bge-m3',
-    apiKey: 'ollama',
+  tenantId: 'default',                 // 多租戶隔離
+  embed: {
+    fn: async (texts) => embeddings,   // 你的 embedding 函式
+    dim: 1024,                         // 選填，維度提示
   },
   llm: {
-    baseURL: 'https://api.openai.com/v1',
-    model: 'gpt-4o-mini',
-    apiKey: process.env.OPENAI_API_KEY,
+    fn: async (prompt) => text,        // 你的 LLM 函式（內建摘要用）
+  },
+  entities: {
+    enabled: true,
+    scope: 'my-app',                   // 實體命名空間（預設 'default'）
   },
 });
 
@@ -88,26 +88,32 @@ const aquifer = createAquifer({
 await aquifer.migrate();
 ```
 
-### 寫入 session
+### 寫入路徑：commit + enrich
 
 ```javascript
-await aquifer.ingest({
-  sessionId: 'conv-001',
+// 1. 儲存 session
+await aquifer.commit('conv-001', [
+  { role: 'user', content: '我來說說新的 auth 做法...' },
+  { role: 'assistant', content: '了解，所以計畫是...' },
+], { agentId: 'main' });
+
+// 2. 豐富化：摘要 + turn embedding + 實體擷取
+const result = await aquifer.enrich('conv-001', {
   agentId: 'main',
-  messages: [
-    { role: 'user', content: '我來說說新的 auth 做法...' },
-    { role: 'assistant', content: '了解，所以計畫是...' },
-  ],
+  summaryFn: async (msgs) => ({ summaryText, structuredSummary, entityRaw }),
+  entityParseFn: (text) => [{ name, normalizedName, type, aliases }],
+  postProcess: async (ctx) => { /* 後處理 hook */ },
 });
-// 儲存 session → 生成摘要 → 建立 turn embedding → 擷取實體
 ```
 
-### 查詢
+### 查詢路徑：recall
 
 ```javascript
 const results = await aquifer.recall('auth middleware 決定', {
   agentId: 'main',
   limit: 5,
+  entities: ['auth-middleware'],       // 選填：實體感知搜尋
+  entityMode: 'all',                   // 'any'（加分）或 'all'（硬篩）
 });
 // 回傳排序後的 session，使用三路 RRF 融合
 ```
@@ -257,108 +263,88 @@ await aquifer.feedback('session-id', { verdict: 'unhelpful' });
 
 ### `createAquifer(config)`
 
-回傳一個 Aquifer 實例，包含以下方法：
+回傳一個 Aquifer 實例。設定：
+
+```javascript
+{
+  db,          // PG 連線字串或 Pool 實例（必填）
+  schema,      // PG schema 名稱（預設 'aquifer'）
+  tenantId,    // 多租戶 key（預設 'default'）
+  embed: { fn, dim },      // embedding 函式（recall 必需）
+  llm: { fn },             // LLM 函式（內建摘要必需）
+  entities: {
+    enabled,               // 啟用知識圖譜（預設 false）
+    scope,                 // 實體命名空間（預設 'default'）
+    mergeCall,             // 合併實體擷取到摘要 LLM 呼叫（預設 true）
+  },
+  rank: { rrf, timeDecay, access, entityBoost },  // 權重覆寫
+}
+```
 
 #### `aquifer.migrate()`
 
-執行 SQL migration（冪等）。建立表、索引和擴充套件。
+執行 SQL migration（冪等）。建立表、索引、trigger 和擴充套件。
 
-#### `aquifer.ingest(options)`
+#### `aquifer.commit(sessionId, messages, opts)`
 
-寫入 session：儲存訊息、生成摘要、建立 turn embedding、擷取實體。
+儲存 session。回傳 `{ id, sessionId, isNew }`。
 
-```javascript
-await aquifer.ingest({
-  sessionId: 'unique-id',
-  agentId: 'main',
-  source: 'api',                // 選填，預設 'api'
-  messages: [{ role, content }],
-  tenantId: 'default',          // 選填
-  model: 'gpt-4o',             // 選填，metadata
-  tokensIn: 1500,              // 選填
-  tokensOut: 800,              // 選填
-});
-```
+#### `aquifer.enrich(sessionId, opts)`
 
-#### `aquifer.recall(query, options)`
+豐富化已 commit 的 session：摘要、turn embedding、實體擷取。支援自訂 pipeline（`summaryFn`、`entityParseFn`）和 `postProcess` 後處理 hook。使用 optimistic locking，卡住超過 10 分鐘的 processing session 可被回收。
 
-跨 session 混合搜尋。
+#### `aquifer.recall(query, opts)`
+
+三路混合搜尋。支援 `entities` + `entityMode` 做實體感知查詢。
 
 ```javascript
 const results = await aquifer.recall('搜尋關鍵字', {
   agentId: 'main',
-  limit: 10,                    // 最大回傳數
-  entities: ['postgres', 'migration'],  // 選填：明確指定實體
-  entityMode: 'all',            // 'any'（預設）或 'all'
-  weights: {                    // 選填：覆寫排序權重
-    rrf: 0.65,
-    timeDecay: 0.25,
-    access: 0.10,
-    entityBoost: 0.18,
-    openLoop: 0.08,
-  },
+  limit: 10,
+  entities: ['postgres', 'migration'],
+  entityMode: 'all',
+  weights: { rrf, timeDecay, access, entityBoost },
 });
-// 回傳：[{ sessionId, score, trustScore, summaryText, matchedTurnText, _debug, ... }]
 ```
 
-#### `aquifer.feedback(sessionId, options)`
+#### `aquifer.feedback(sessionId, opts)`
 
-記錄對 session 的明確信任回饋。
-
-```javascript
-await aquifer.feedback('session-id', {
-  verdict: 'helpful',   // 或 'unhelpful'
-  agentId: 'main',      // 選填
-  note: '原因',         // 選填
-});
-// 回傳：{ trustBefore, trustAfter, verdict }
-```
-
-#### `aquifer.enrich(sessionId, options)`
-
-重新處理既有 session：重新生成摘要、embedding 和實體。
+記錄信任回饋。回傳 `{ trustBefore, trustAfter, verdict }`。
 
 #### `aquifer.close()`
 
-關閉 PostgreSQL 連線池。
+關閉 PostgreSQL 連線池（僅限 Aquifer 自行建立的 pool）。
 
 ---
 
 ## 設定
 
+Aquifer 接受 `db` 連線（字串或 `pg.Pool`），加上選填的 `embed` 和 `llm` 函式：
+
 ```javascript
 createAquifer({
-  // PostgreSQL schema 名稱（所有表建在此 schema 下）
+  db: 'postgresql://user:pass@localhost/mydb',  // 或既有 pg.Pool
   schema: 'aquifer',
-
-  // PostgreSQL 連線
-  pg: {
-    connectionString: 'postgresql://...',
-    // 或分開設定：host, port, database, user, password
-    max: 10,  // 連線池大小
-  },
-
-  // Embedding 供應商（任何 OpenAI 相容 API）
-  embedder: {
-    baseURL: 'http://localhost:11434/v1',
-    model: 'bge-m3',
-    apiKey: 'ollama',
-    dimensions: 1024,           // 選填
-    timeout: 30000,             // 毫秒，預設 30 秒
-  },
-
-  // LLM（用於摘要與實體擷取）
-  llm: {
-    baseURL: 'https://api.openai.com/v1',
-    model: 'gpt-4o-mini',
-    apiKey: process.env.OPENAI_API_KEY,
-    timeout: 60000,             // 毫秒，預設 60 秒
-  },
-
-  // 租戶隔離
   tenantId: 'default',
+  embed: {
+    fn: myEmbedFn,             // async (texts: string[]) => number[][]
+    dim: 1024,
+  },
+  llm: {
+    fn: myLlmFn,               // async (prompt: string) => string
+  },
+  entities: {
+    enabled: true,
+    scope: 'my-app',           // 實體命名空間——與 agentId 解耦
+    mergeCall: true,
+  },
+  rank: { rrf: 0.65, timeDecay: 0.25, access: 0.10, entityBoost: 0.18 },
 });
 ```
+
+### 實體作用域（Entity Scope）
+
+`entities.scope` 定義實體身份的命名空間。唯一約束是 `(tenant_id, normalized_name, entity_scope)`——不同 scope 中的同名實體會建立獨立的實體。這讓實體身份與 `agentId` 解耦，允許多個 agent 共享同一個實體命名空間。
 
 ---
 
@@ -378,12 +364,12 @@ createAquifer({
 
 | 表 | 用途 |
 |----|------|
-| `entities` | 正規化命名實體，含類型、別名、頻率、選填 embedding |
+| `entities` | 正規化命名實體，含類型、別名、頻率、entity_scope、選填 embedding |
 | `entity_mentions` | 實體 × session 關聯，含 mention 次數與上下文 |
 | `entity_relations` | 共現邊（無向，`CHECK src < dst`） |
 | `entity_sessions` | 實體-session 關聯，用於加分計算 |
 
-重要索引：實體名稱 trigram、embedding GiST、tenant/agent 複合索引。
+重要索引：實體名稱 trigram、embedding GiST、`(tenant_id, normalized_name, entity_scope)` 唯一索引。
 
 ### 003-trust-feedback.sql
 

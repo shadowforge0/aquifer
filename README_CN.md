@@ -4,7 +4,7 @@
 
 **基于 PostgreSQL 的 AI Agent 长期记忆系统**
 
-*Turn 级 embedding、三路 RRF 混合排序、信任评分、实体交叉查询、知识图谱——全部运行在 PostgreSQL + pgvector 上。*
+*Turn 级 embedding、三路 RRF 混合排序、信任评分、实体交叉查询、知识图谱、实体作用域——全部运行在 PostgreSQL + pgvector 上。*
 
 [![npm version](https://img.shields.io/npm/v/@shadowforge0/aquifer-memory)](https://www.npmjs.com/package/@shadowforge0/aquifer-memory)
 [![PostgreSQL 15+](https://img.shields.io/badge/PostgreSQL-15%2B-336791)](https://www.postgresql.org/)
@@ -68,19 +68,19 @@ npm install @shadowforge0/aquifer-memory
 const { createAquifer } = require('@shadowforge0/aquifer-memory');
 
 const aquifer = createAquifer({
+  db: 'postgresql://user:pass@localhost:5432/mydb',  // 连接字符串或 pg.Pool
   schema: 'memory',                    // PG schema 名称（默认 'aquifer'）
-  pg: {
-    connectionString: 'postgresql://user:pass@localhost:5432/mydb',
-  },
-  embedder: {
-    baseURL: 'http://localhost:11434/v1',   // Ollama
-    model: 'bge-m3',
-    apiKey: 'ollama',
+  tenantId: 'default',                 // 多租户隔离
+  embed: {
+    fn: async (texts) => embeddings,   // 你的 embedding 函数
+    dim: 1024,                         // 可选，维度提示
   },
   llm: {
-    baseURL: 'https://api.openai.com/v1',
-    model: 'gpt-4o-mini',
-    apiKey: process.env.OPENAI_API_KEY,
+    fn: async (prompt) => text,        // 你的 LLM 函数（内置摘要用）
+  },
+  entities: {
+    enabled: true,
+    scope: 'my-app',                   // 实体命名空间（默认 'default'）
   },
 });
 
@@ -88,26 +88,32 @@ const aquifer = createAquifer({
 await aquifer.migrate();
 ```
 
-### 写入 session
+### 写入路径：commit + enrich
 
 ```javascript
-await aquifer.ingest({
-  sessionId: 'conv-001',
+// 1. 保存 session
+await aquifer.commit('conv-001', [
+  { role: 'user', content: '我来说说新的 auth 做法...' },
+  { role: 'assistant', content: '了解，所以计划是...' },
+], { agentId: 'main' });
+
+// 2. 丰富化：摘要 + turn embedding + 实体提取
+const result = await aquifer.enrich('conv-001', {
   agentId: 'main',
-  messages: [
-    { role: 'user', content: '我来说说新的 auth 做法...' },
-    { role: 'assistant', content: '了解，所以计划是...' },
-  ],
+  summaryFn: async (msgs) => ({ summaryText, structuredSummary, entityRaw }),
+  entityParseFn: (text) => [{ name, normalizedName, type, aliases }],
+  postProcess: async (ctx) => { /* 后处理 hook */ },
 });
-// 存储 session → 生成摘要 → 创建 turn embedding → 提取实体
 ```
 
-### 查询
+### 查询路径：recall
 
 ```javascript
 const results = await aquifer.recall('auth middleware 决定', {
   agentId: 'main',
   limit: 5,
+  entities: ['auth-middleware'],       // 可选：实体感知搜索
+  entityMode: 'all',                   // 'any'（加分）或 'all'（硬筛）
 });
 // 返回排序后的 session，使用三路 RRF 融合
 ```
@@ -119,7 +125,7 @@ const results = await aquifer.recall('auth middleware 决定', {
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    createAquifer（入口）                      │
-│         配置 · Migration · Ingest · Recall · Enrich          │
+│         设定 · Migration · Ingest · Recall · Enrich          │
 └────────┬──────────┬──────────┬──────────┬───────────────────┘
          │          │          │          │
     ┌────▼───┐ ┌────▼────┐ ┌──▼───┐ ┌───▼──────────┐
@@ -132,10 +138,10 @@ const results = await aquifer.recall('auth middleware 决定', {
     │  + pgvector     │    │ API  │
     └────────────────┘    └──────┘
 
-    ┌─────────────────────────────┐
-    │         schema/             │
-    │  001-base.sql（sessions、   │
-    │    summaries、turns、FTS）   │
+    ┌───────────────────────────────────┐
+    │         schema/                   │
+    │  001-base.sql（sessions、          │
+    │    summaries、turns、FTS）          │
     │  002-entities.sql（KG）             │
     │  003-trust-feedback.sql（信任评分） │
     └───────────────────────────────────┘
@@ -146,7 +152,7 @@ const results = await aquifer.recall('auth middleware 决定', {
 | 文件 | 用途 |
 |------|------|
 | `index.js` | 入口——导出 `createAquifer`、`createEmbedder` |
-| `core/aquifer.js` | 主 facade：`migrate()`、`ingest()`、`recall()`、`enrich()` |
+| `core/aquifer.js` | 主 facade：`migrate()`、`commit()`、`recall()`、`enrich()` |
 | `core/storage.js` | Session/摘要/turn 的 CRUD、FTS 搜索、embedding 搜索 |
 | `core/entity.js` | 实体 upsert、mention 追踪、关系图谱、名称规范化 |
 | `core/hybrid-rank.js` | 三路 RRF 融合、时间衰减、信任乘数、实体加分、open-loop 加分 |
@@ -155,7 +161,7 @@ const results = await aquifer.recall('auth middleware 决定', {
 | `pipeline/extract-entities.js` | LLM 驱动的实体提取（12 种类型） |
 | `schema/001-base.sql` | DDL：sessions、summaries、turn_embeddings、FTS 索引 |
 | `schema/002-entities.sql` | DDL：entities、mentions、relations、entity_sessions |
-| `schema/003-trust-feedback.sql` | DDL：trust_score 列、session_feedback 审计表 |
+| `schema/003-trust-feedback.sql` | DDL：trust_score 字段、session_feedback 审计表 |
 
 ---
 
@@ -257,108 +263,88 @@ await aquifer.feedback('session-id', { verdict: 'unhelpful' });
 
 ### `createAquifer(config)`
 
-返回一个 Aquifer 实例，包含以下方法：
+返回一个 Aquifer 实例。设定：
+
+```javascript
+{
+  db,          // PG 连接字符串或 Pool 实例（必填）
+  schema,      // PG schema 名称（默认 'aquifer'）
+  tenantId,    // 多租户 key（默认 'default'）
+  embed: { fn, dim },      // embedding 函数（recall 必需）
+  llm: { fn },             // LLM 函数（内置摘要必需）
+  entities: {
+    enabled,               // 启用知识图谱（默认 false）
+    scope,                 // 实体命名空间（默认 'default'）
+    mergeCall,             // 合并实体提取到摘要 LLM 调用（默认 true）
+  },
+  rank: { rrf, timeDecay, access, entityBoost },  // 权重覆盖
+}
+```
 
 #### `aquifer.migrate()`
 
-执行 SQL migration（幂等）。创建表、索引和扩展。
+执行 SQL migration（幂等）。创建表、索引、trigger 和扩展。
 
-#### `aquifer.ingest(options)`
+#### `aquifer.commit(sessionId, messages, opts)`
 
-写入 session：存储消息、生成摘要、创建 turn embedding、提取实体。
+保存 session。返回 `{ id, sessionId, isNew }`。
 
-```javascript
-await aquifer.ingest({
-  sessionId: 'unique-id',
-  agentId: 'main',
-  source: 'api',                // 可选，默认 'api'
-  messages: [{ role, content }],
-  tenantId: 'default',          // 可选
-  model: 'gpt-4o',             // 可选，metadata
-  tokensIn: 1500,              // 可选
-  tokensOut: 800,              // 可选
-});
-```
+#### `aquifer.enrich(sessionId, opts)`
 
-#### `aquifer.recall(query, options)`
+丰富化已 commit 的 session：摘要、turn embedding、实体提取。支持自定义 pipeline（`summaryFn`、`entityParseFn`）和 `postProcess` 后处理 hook。使用乐观锁，卡住超过 10 分钟的 processing session 可被回收。
 
-跨 session 混合搜索。
+#### `aquifer.recall(query, opts)`
+
+三路混合搜索。支持 `entities` + `entityMode` 做实体感知查询。
 
 ```javascript
 const results = await aquifer.recall('搜索关键字', {
   agentId: 'main',
-  limit: 10,                    // 最大返回数
-  entities: ['postgres', 'migration'],  // 可选：明确指定实体
-  entityMode: 'all',            // 'any'（默认）或 'all'
-  weights: {                    // 可选：覆盖排序权重
-    rrf: 0.65,
-    timeDecay: 0.25,
-    access: 0.10,
-    entityBoost: 0.18,
-    openLoop: 0.08,
-  },
+  limit: 10,
+  entities: ['postgres', 'migration'],
+  entityMode: 'all',
+  weights: { rrf, timeDecay, access, entityBoost },
 });
-// 返回：[{ sessionId, score, trustScore, summaryText, matchedTurnText, _debug, ... }]
 ```
 
-#### `aquifer.feedback(sessionId, options)`
+#### `aquifer.feedback(sessionId, opts)`
 
-记录对 session 的明确信任反馈。
-
-```javascript
-await aquifer.feedback('session-id', {
-  verdict: 'helpful',   // 或 'unhelpful'
-  agentId: 'main',      // 可选
-  note: '原因',         // 可选
-});
-// 返回：{ trustBefore, trustAfter, verdict }
-```
-
-#### `aquifer.enrich(sessionId, options)`
-
-重新处理已有 session：重新生成摘要、embedding 和实体。
+记录信任反馈。返回 `{ trustBefore, trustAfter, verdict }`。
 
 #### `aquifer.close()`
 
-关闭 PostgreSQL 连接池。
+关闭 PostgreSQL 连接池（仅限 Aquifer 自行创建的 pool）。
 
 ---
 
-## 配置
+## 设定
+
+Aquifer 接受 `db` 连接（字符串或 `pg.Pool`），加上可选的 `embed` 和 `llm` 函数：
 
 ```javascript
 createAquifer({
-  // PostgreSQL schema 名称（所有表创建在此 schema 下）
+  db: 'postgresql://user:pass@localhost/mydb',  // 或既有 pg.Pool
   schema: 'aquifer',
-
-  // PostgreSQL 连接
-  pg: {
-    connectionString: 'postgresql://...',
-    // 或分开配置：host, port, database, user, password
-    max: 10,  // 连接池大小
-  },
-
-  // Embedding 提供商（任何 OpenAI 兼容 API）
-  embedder: {
-    baseURL: 'http://localhost:11434/v1',
-    model: 'bge-m3',
-    apiKey: 'ollama',
-    dimensions: 1024,           // 可选
-    timeout: 30000,             // 毫秒，默认 30 秒
-  },
-
-  // LLM（用于摘要与实体提取）
-  llm: {
-    baseURL: 'https://api.openai.com/v1',
-    model: 'gpt-4o-mini',
-    apiKey: process.env.OPENAI_API_KEY,
-    timeout: 60000,             // 毫秒，默认 60 秒
-  },
-
-  // 租户隔离
   tenantId: 'default',
+  embed: {
+    fn: myEmbedFn,             // async (texts: string[]) => number[][]
+    dim: 1024,
+  },
+  llm: {
+    fn: myLlmFn,               // async (prompt: string) => string
+  },
+  entities: {
+    enabled: true,
+    scope: 'my-app',           // 实体命名空间——与 agentId 解耦
+    mergeCall: true,
+  },
+  rank: { rrf: 0.65, timeDecay: 0.25, access: 0.10, entityBoost: 0.18 },
 });
 ```
+
+### 实体作用域（Entity Scope）
+
+`entities.scope` 定义实体身份的命名空间。唯一约束是 `(tenant_id, normalized_name, entity_scope)`——不同 scope 中的同名实体会创建独立的实体。这让实体身份与 `agentId` 解耦，允许多个 agent 共享同一个实体命名空间。
 
 ---
 
@@ -372,18 +358,18 @@ createAquifer({
 | `session_summaries` | LLM 生成的结构化摘要，含 embedding |
 | `turn_embeddings` | 逐 turn 的 user 消息 embedding，实现精确检索 |
 
-关键索引：messages GIN、`tsvector` GiST、embedding ivfflat、tenant/agent/timestamp B-tree。
+重要索引：messages GIN、`tsvector` GiST、embedding ivfflat、tenant/agent/timestamp B-tree。
 
 ### 002-entities.sql
 
 | 表 | 用途 |
 |----|------|
-| `entities` | 规范化命名实体，含类型、别名、频率、可选 embedding |
+| `entities` | 规范化命名实体，含类型、别名、频率、entity_scope、可选 embedding |
 | `entity_mentions` | 实体 × session 关联，含 mention 次数与上下文 |
 | `entity_relations` | 共现边（无向，`CHECK src < dst`） |
 | `entity_sessions` | 实体-session 关联，用于加分计算 |
 
-关键索引：实体名称 trigram、embedding GiST、tenant/agent 复合索引。
+重要索引：实体名称 trigram、embedding GiST、`(tenant_id, normalized_name, entity_scope)` 唯一索引。
 
 ### 003-trust-feedback.sql
 
@@ -391,7 +377,7 @@ createAquifer({
 |----|------|
 | `session_feedback` | 明确反馈审计记录（helpful/unhelpful 判定、信任分数变动） |
 
-另在 `session_summaries` 新增 `trust_score` 列（默认 0.5，范围 0–1）。
+另在 `session_summaries` 新增 `trust_score` 字段（默认 0.5，范围 0–1）。
 
 ---
 

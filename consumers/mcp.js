@@ -69,7 +69,7 @@ async function main() {
 
   const server = new McpServer({
     name: 'aquifer-memory',
-    version: '0.3.1',
+    version: '0.6.0',
   });
 
   server.tool(
