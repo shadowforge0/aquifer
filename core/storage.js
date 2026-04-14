@@ -335,8 +335,11 @@ async function searchSessions(pool, query, {
   dateFrom,  // m1: add date filtering
   dateTo,
   limit = 20,
+  ftsConfig = 'simple',
 } = {}) {
   const clampedLimit = Math.max(1, Math.min(100, limit));
+  // Sanitize ftsConfig to prevent SQL injection (must be a valid regconfig name)
+  const safeFts = /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(ftsConfig) ? ftsConfig : 'simple';
   const result = await pool.query(
     `SELECT
       s.id,
@@ -351,11 +354,11 @@ async function searchSessions(pool, query, {
       ss.access_count,
       ss.last_accessed_at,
       ss.trust_score,
-      ts_headline('simple', COALESCE(ss.summary_text, ''), plainto_tsquery('simple', $1)) AS summary_snippet,
-      ts_rank(ss.search_tsv, plainto_tsquery('simple', $1)) AS fts_rank
+      ts_headline('${safeFts}', COALESCE(ss.summary_text, ''), plainto_tsquery('${safeFts}', $1)) AS summary_snippet,
+      ts_rank(ss.search_tsv, plainto_tsquery('${safeFts}', $1)) AS fts_rank
     FROM ${qi(schema)}.sessions s
     LEFT JOIN ${qi(schema)}.session_summaries ss ON ss.session_row_id = s.id
-    WHERE ss.search_tsv @@ plainto_tsquery('simple', $1)
+    WHERE ss.search_tsv @@ plainto_tsquery('${safeFts}', $1)
       AND s.tenant_id = $2
       AND ($3::text IS NULL OR s.agent_id = $3)
       AND ($4::text IS NULL OR s.source = $4)

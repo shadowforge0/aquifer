@@ -81,6 +81,9 @@ function createAquifer(config) {
   const entityPromptFn = config.entities && config.entities.prompt ? config.entities.prompt : null;
   const entityScope = (config.entities && config.entities.scope) || 'default';
 
+  // FTS config (default: 'simple'; set to 'zhcfg' for Chinese tokenization)
+  const ftsConfig = config.ftsConfig || 'simple';
+
   // Rank weights
   const rankWeights = {
     rrf: 0.65,
@@ -624,7 +627,7 @@ function createAquifer(config) {
       // 3. Run 3 search paths in parallel
       const [ftsRows, embRows, turnResult] = await Promise.all([
         storage.searchSessions(pool, query, {
-          schema, tenantId, agentId, source, dateFrom, dateTo, limit: fetchLimit,
+          schema, tenantId, agentId, source, dateFrom, dateTo, limit: fetchLimit, ftsConfig,
         }).catch(() => []),
         embeddingSearchSummaries(queryVec, {
           agentId, source, dateFrom, dateTo, limit: fetchLimit,
