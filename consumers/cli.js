@@ -344,7 +344,12 @@ Options:
   }
 }
 
-main().catch(err => {
-  console.error(`aquifer: ${err.message}`);
-  process.exit(1);
-});
+// Export for testing; execute only when run directly
+module.exports = { parseArgs };
+
+if (require.main === module) {
+  main().catch(err => {
+    console.error(`aquifer: ${err.message}`);
+    process.exit(1);
+  });
+}

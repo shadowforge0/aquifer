@@ -2,27 +2,7 @@
 
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
-
-// parseArgs is not exported, so we test by extracting it
-// We'll inline a copy for unit testing
-const VALUE_FLAGS = new Set(['limit', 'agent-id', 'source', 'date-from', 'date-to', 'output', 'format', 'config', 'status', 'concurrency']);
-function parseArgs(argv) {
-  const args = { _: [], flags: {} };
-  for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === '--') { args._.push(...argv.slice(i + 1)); break; }
-    if (argv[i].startsWith('--')) {
-      const key = argv[i].slice(2);
-      if (VALUE_FLAGS.has(key) && i + 1 < argv.length && !argv[i + 1].startsWith('--')) {
-        args.flags[key] = argv[++i];
-      } else {
-        args.flags[key] = true;
-      }
-    } else {
-      args._.push(argv[i]);
-    }
-  }
-  return args;
-}
+const { parseArgs } = require('../consumers/cli');
 
 describe('parseArgs', () => {
   it('parses positional args', () => {
@@ -44,7 +24,6 @@ describe('parseArgs', () => {
 
   it('handles --limit at end without value as boolean', () => {
     const args = parseArgs(['recall', 'q', '--limit']);
-    // limit is a VALUE_FLAG but no next arg — should be true (boolean)
     assert.equal(args.flags.limit, true);
   });
 
@@ -76,5 +55,27 @@ describe('parseArgs', () => {
     const args = parseArgs(['--unknown-flag', 'some-value']);
     assert.equal(args.flags['unknown-flag'], true);
     assert.deepEqual(args._, ['some-value']);
+  });
+
+  // New: flags added after original test was written
+  it('parses --entities as value flag', () => {
+    const args = parseArgs(['recall', 'q', '--entities', 'Aquifer,Miranda']);
+    assert.equal(args.flags.entities, 'Aquifer,Miranda');
+  });
+
+  it('parses --entity-mode as value flag', () => {
+    const args = parseArgs(['recall', 'q', '--entity-mode', 'all']);
+    assert.equal(args.flags['entity-mode'], 'all');
+  });
+
+  it('parses --session-id as value flag', () => {
+    const args = parseArgs(['feedback', '--session-id', 'abc-123', '--verdict', 'helpful']);
+    assert.equal(args.flags['session-id'], 'abc-123');
+    assert.equal(args.flags.verdict, 'helpful');
+  });
+
+  it('parses --note as value flag', () => {
+    const args = parseArgs(['feedback', '--session-id', 'x', '--verdict', 'unhelpful', '--note', 'bad quality']);
+    assert.equal(args.flags.note, 'bad quality');
   });
 });
