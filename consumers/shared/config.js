@@ -31,6 +31,17 @@ const DEFAULTS = {
   },
   entities: { enabled: false, mergeCall: true, scope: 'default' },
   rank: { rrf: 0.65, timeDecay: 0.25, access: 0.10, entityBoost: 0.18 },
+  rerank: {
+    enabled: false,
+    provider: null,    // 'tei' | 'jina' | 'custom'
+    baseUrl: null,     // TEI base URL
+    apiKey: null,      // Jina API key
+    model: null,       // Jina model override
+    topK: 20,
+    maxChars: 1600,
+    timeoutMs: 2000,
+    maxRetries: 1,
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -58,6 +69,14 @@ const ENV_MAP = [
   ['AQUIFER_LLM_TEMPERATURE',   'llm.temperature',   Number],
   ['AQUIFER_ENTITIES_ENABLED',  'entities.enabled',  Boolean],
   ['AQUIFER_ENTITY_SCOPE',     'entities.scope'],
+  ['AQUIFER_RERANK_ENABLED',   'rerank.enabled',    Boolean],
+  ['AQUIFER_RERANK_PROVIDER',  'rerank.provider'],
+  ['AQUIFER_RERANK_BASE_URL',  'rerank.baseUrl'],
+  ['AQUIFER_RERANK_API_KEY',   'rerank.apiKey'],
+  ['AQUIFER_RERANK_MODEL',     'rerank.model'],
+  ['AQUIFER_RERANK_TOP_K',     'rerank.topK',       Number],
+  ['AQUIFER_RERANK_MAX_CHARS', 'rerank.maxChars',   Number],
+  ['AQUIFER_RERANK_TIMEOUT_MS','rerank.timeoutMs',   Number],
 ];
 
 // ---------------------------------------------------------------------------

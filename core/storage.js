@@ -331,6 +331,7 @@ async function searchSessions(pool, query, {
   schema,
   tenantId,
   agentId,
+  agentIds: rawAgentIds,
   source,
   dateFrom,  // m1: add date filtering
   dateTo,
@@ -340,6 +341,36 @@ async function searchSessions(pool, query, {
   const clampedLimit = Math.max(1, Math.min(100, limit));
   // Sanitize ftsConfig to prevent SQL injection (must be a valid regconfig name)
   const safeFts = /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(ftsConfig) ? ftsConfig : 'simple';
+
+  // Normalize agentId/agentIds
+  const agentIds = rawAgentIds && rawAgentIds.length > 0
+    ? rawAgentIds
+    : (agentId ? [agentId] : null);
+
+  const where = [
+    `ss.search_tsv @@ plainto_tsquery('${safeFts}', $1)`,
+    `s.tenant_id = $2`,
+  ];
+  const params = [query, tenantId];
+
+  if (agentIds) {
+    params.push(agentIds);
+    where.push(`s.agent_id = ANY($${params.length})`);
+  }
+  if (source) {
+    params.push(source);
+    where.push(`s.source = $${params.length}`);
+  }
+  if (dateFrom) {
+    params.push(dateFrom);
+    where.push(`s.started_at::date >= $${params.length}::date`);
+  }
+  if (dateTo) {
+    params.push(dateTo);
+    where.push(`s.started_at::date <= $${params.length}::date`);
+  }
+  params.push(clampedLimit);
+
   const result = await pool.query(
     `SELECT
       s.id,
@@ -358,15 +389,10 @@ async function searchSessions(pool, query, {
       ts_rank(ss.search_tsv, plainto_tsquery('${safeFts}', $1)) AS fts_rank
     FROM ${qi(schema)}.sessions s
     LEFT JOIN ${qi(schema)}.session_summaries ss ON ss.session_row_id = s.id
-    WHERE ss.search_tsv @@ plainto_tsquery('${safeFts}', $1)
-      AND s.tenant_id = $2
-      AND ($3::text IS NULL OR s.agent_id = $3)
-      AND ($4::text IS NULL OR s.source = $4)
-      AND ($5::date IS NULL OR s.started_at::date >= $5::date)
-      AND ($6::date IS NULL OR s.started_at::date <= $6::date)
+    WHERE ${where.join(' AND ')}
     ORDER BY fts_rank DESC, s.last_message_at DESC NULLS LAST
-    LIMIT $7`,
-    [query, tenantId, agentId || null, source || null, dateFrom || null, dateTo || null, clampedLimit]
+    LIMIT $${params.length}`,
+    params
   );
   return result.rows;
 }
@@ -482,23 +508,29 @@ async function searchTurnEmbeddings(pool, {
   dateFrom,
   dateTo,
   agentId,
+  agentIds: rawAgentIds,
   source,
   limit = 15,
 }) {
   const where = ['s.tenant_id = $1'];
   const params = [tenantId];
 
+  // Normalize agentId/agentIds
+  const agentIds = rawAgentIds && rawAgentIds.length > 0
+    ? rawAgentIds
+    : (agentId ? [agentId] : null);
+
   if (dateFrom) {
     params.push(dateFrom);
-    where.push(`($${params.length}::date IS NULL OR s.started_at::date >= $${params.length}::date)`);
+    where.push(`s.started_at::date >= $${params.length}::date`);
   }
   if (dateTo) {
     params.push(dateTo);
-    where.push(`($${params.length}::date IS NULL OR s.started_at::date <= $${params.length}::date)`);
+    where.push(`s.started_at::date <= $${params.length}::date`);
   }
-  if (agentId) {
-    params.push(agentId);
-    where.push(`t.agent_id = $${params.length}`);
+  if (agentIds) {
+    params.push(agentIds);
+    where.push(`t.agent_id = ANY($${params.length})`);
   }
   if (source) {
     params.push(source);

@@ -37,6 +37,24 @@ function loadSql(filename, schema) {
 }
 
 // ---------------------------------------------------------------------------
+// buildRerankDocument — assemble text for cross-encoder reranking
+// ---------------------------------------------------------------------------
+
+function buildRerankDocument(row, maxChars) {
+  let text = (row.summary_text || row.summary_snippet || '').replace(/\s+/g, ' ').trim();
+  const turn = (row.matched_turn_text || '').replace(/\s+/g, ' ').trim();
+
+  if (!text) {
+    text = turn;
+  } else if (turn && !text.includes(turn)) {
+    text = `${text}\n\nMatched turn:\n${turn}`;
+  }
+
+  if (text.length > maxChars) text = text.slice(0, maxChars);
+  return text;
+}
+
+// ---------------------------------------------------------------------------
 // createAquifer
 // ---------------------------------------------------------------------------
 
@@ -93,6 +111,16 @@ function createAquifer(config) {
     ...(config.rank || {}),
   };
 
+  // Reranker config (optional)
+  const rerankConfig = config.rerank || null;
+  let reranker = null;
+  if (rerankConfig) {
+    const { createReranker } = require('../pipeline/rerank');
+    reranker = createReranker(rerankConfig);
+  }
+  const defaultRerankTopK = rerankConfig ? Math.max(1, rerankConfig.topK || 20) : 0;
+  const rerankMaxChars = rerankConfig ? Math.max(200, rerankConfig.maxChars || 1600) : 0;
+
   // Source registry (in-memory)
   const sources = new Map();
 
@@ -109,7 +137,7 @@ function createAquifer(config) {
 
   // --- Helper: embed search on summaries ---
   async function embeddingSearchSummaries(queryVec, opts) {
-    const { agentId, source, dateFrom, dateTo, limit = 20 } = opts;
+    const { agentIds, source, dateFrom, dateTo, limit = 20 } = opts;
     const where = [`s.tenant_id = $1`];
     const params = [tenantId];
 
@@ -124,9 +152,9 @@ function createAquifer(config) {
       params.push(dateTo);
       where.push(`($${params.length}::date IS NULL OR s.started_at::date <= $${params.length}::date)`);
     }
-    if (agentId) {
-      params.push(agentId);
-      where.push(`s.agent_id = $${params.length}`);
+    if (agentIds && agentIds.length > 0) {
+      params.push(agentIds);
+      where.push(`s.agent_id = ANY($${params.length})`);
     }
     if (source) {
       params.push(source);
@@ -527,6 +555,7 @@ function createAquifer(config) {
 
       const {
         agentId,
+        agentIds: rawAgentIds,
         source,
         dateFrom,
         dateTo,
@@ -536,6 +565,12 @@ function createAquifer(config) {
         entityMode = 'any',
       } = opts;
 
+      // Normalize agentId/agentIds into a single resolved value
+      // agentIds takes precedence; agentId is sugar for agentIds: [agentId]
+      const resolvedAgentIds = rawAgentIds && rawAgentIds.length > 0
+        ? rawAgentIds
+        : (agentId ? [agentId] : null);
+
       // Validate before touching DB
       if (explicitEntities && explicitEntities.length > 0 && !entitiesEnabled) {
         throw new Error('Entities are not enabled');
@@ -543,7 +578,9 @@ function createAquifer(config) {
 
       await ensureMigrated();
 
-      const fetchLimit = limit * 4;
+      const rerankEnabled = !!reranker && opts.rerank !== false;
+      const rerankTopK = rerankEnabled ? Math.max(limit, opts.rerankTopK || defaultRerankTopK) : limit;
+      const fetchLimit = rerankTopK * 4;
 
       // 1. Embed query
       const queryVecResult = await embedFn([query]);
@@ -627,13 +664,13 @@ function createAquifer(config) {
       // 3. Run 3 search paths in parallel
       const [ftsRows, embRows, turnResult] = await Promise.all([
         storage.searchSessions(pool, query, {
-          schema, tenantId, agentId, source, dateFrom, dateTo, limit: fetchLimit, ftsConfig,
+          schema, tenantId, agentIds: resolvedAgentIds, source, dateFrom, dateTo, limit: fetchLimit, ftsConfig,
         }).catch(() => []),
         embeddingSearchSummaries(queryVec, {
-          agentId, source, dateFrom, dateTo, limit: fetchLimit,
+          agentIds: resolvedAgentIds, source, dateFrom, dateTo, limit: fetchLimit,
         }).catch(() => []),
         storage.searchTurnEmbeddings(pool, {
-          schema, tenantId, queryVec, dateFrom, dateTo, agentId, source, limit: fetchLimit,
+          schema, tenantId, queryVec, dateFrom, dateTo, agentIds: resolvedAgentIds, source, limit: fetchLimit,
         }).catch(() => ({ rows: [] })),
       ]);
 
@@ -694,15 +731,45 @@ function createAquifer(config) {
         [...filteredEmb, ...filterFn(externalRows)],
         filteredTurn,
         {
-          limit,
+          limit: rerankTopK,
           weights: mergedWeights,
           entityScoreBySession,
           openLoopSet,
         },
       );
 
+      // 6b. Rerank (optional)
+      let finalRanked = ranked;
+      if (rerankEnabled && ranked.length > 1) {
+        try {
+          const docs = ranked.map(r => buildRerankDocument(r, rerankMaxChars));
+          const rerankResult = await reranker.rerank(query, docs, { topN: ranked.length });
+          const scoreMap = new Map(rerankResult.map(r => [r.index, r.score]));
+
+          finalRanked = ranked.map((r, i) => ({
+            ...r,
+            _hybridScore: r._score,
+            _rerankScore: scoreMap.has(i) ? scoreMap.get(i) : null,
+          }));
+
+          finalRanked.sort((a, b) => {
+            const aR = a._rerankScore ?? -Infinity;
+            const bR = b._rerankScore ?? -Infinity;
+            if (aR !== bR) return bR - aR;
+            return (b._hybridScore || 0) - (a._hybridScore || 0);
+          });
+          finalRanked = finalRanked.slice(0, limit);
+        } catch (rerankErr) {
+          // Fallback: use original hybrid-rank order, flag in debug
+          if (process.env.AQUIFER_DEBUG) console.error('[aquifer] rerank error:', rerankErr.message);
+          finalRanked = ranked.slice(0, limit).map(r => ({ ...r, _rerankFallback: true }));
+        }
+      } else {
+        finalRanked = ranked.slice(0, limit);
+      }
+
       // 7. Record access
-      const sessionRowIds = ranked
+      const sessionRowIds = finalRanked
         .map(r => r.id || r.session_row_id)
         .filter(Boolean);
 
@@ -713,7 +780,7 @@ function createAquifer(config) {
       }
 
       // 8. Format results
-      return ranked.map(r => ({
+      return finalRanked.map(r => ({
         sessionId: r.session_id,
         agentId: r.agent_id,
         source: r.source,
@@ -723,7 +790,7 @@ function createAquifer(config) {
         summarySnippet: r.summary_snippet || null,
         matchedTurnText: r.matched_turn_text || null,
         matchedTurnIndex: r.matched_turn_index || null,
-        score: r._score,
+        score: r._rerankScore ?? r._score,
         trustScore: r._trustScore ?? 0.5,
         _debug: {
           rrf: r._rrf,
@@ -733,6 +800,9 @@ function createAquifer(config) {
           trustScore: r._trustScore,
           trustMultiplier: r._trustMultiplier,
           openLoopBoost: r._openLoopBoost,
+          hybridScore: r._hybridScore ?? r._score,
+          rerankScore: r._rerankScore ?? null,
+          rerankFallback: r._rerankFallback || false,
         },
       }));
     },

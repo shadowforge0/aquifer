@@ -1,7 +1,7 @@
 'use strict';
 
 const { Pool } = require('pg');
-const { createAquifer, createEmbedder } = require('../../index');
+const { createAquifer, createEmbedder, createReranker } = require('../../index');
 const { loadConfig } = require('./config');
 const { createLlmFn } = require('./llm');
 
@@ -57,6 +57,24 @@ function createAquiferFromConfig(overrides) {
     llmFn = createLlmFn(config.llm);
   }
 
+  // Rerank config (optional)
+  let rerankOpts = null;
+  if (config.rerank && config.rerank.enabled && config.rerank.provider) {
+    const rc = config.rerank;
+    const rerankConfig = { provider: rc.provider, topK: rc.topK, maxChars: rc.maxChars };
+    if (rc.provider === 'tei') {
+      rerankConfig.teiBaseUrl = rc.baseUrl || 'http://localhost:8080';
+      rerankConfig.timeout = rc.timeoutMs || 2000;
+      rerankConfig.maxRetries = rc.maxRetries ?? 1;
+    } else if (rc.provider === 'jina') {
+      rerankConfig.jinaApiKey = rc.apiKey;
+      if (rc.model) rerankConfig.jinaModel = rc.model;
+      rerankConfig.timeout = rc.timeoutMs || 2000;
+      rerankConfig.maxRetries = rc.maxRetries ?? 1;
+    }
+    rerankOpts = rerankConfig;
+  }
+
   const aquifer = createAquifer({
     db: pool,
     schema: config.schema,
@@ -65,6 +83,7 @@ function createAquiferFromConfig(overrides) {
     llm: llmFn ? { fn: llmFn } : null,
     entities: config.entities,
     rank: config.rank,
+    rerank: rerankOpts,
   });
 
   // Attach pool for lifecycle management
