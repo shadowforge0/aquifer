@@ -75,4 +75,14 @@ describe('config.loadConfig', () => {
     const config = loadConfig({ cwd: '/tmp/nonexistent-dir-12345', env: {} });
     assert.equal(config.schema, 'aquifer');
   });
+
+  it('reads AQUIFER_ENTITY_SCOPE from env', () => {
+    const config = loadConfig({ env: { AQUIFER_ENTITY_SCOPE: 'my-scope' } });
+    assert.equal(config.entities.scope, 'my-scope');
+  });
+
+  it('defaults entities.scope to "default"', () => {
+    const config = loadConfig({ env: {} });
+    assert.equal(config.entities.scope, 'default');
+  });
 });

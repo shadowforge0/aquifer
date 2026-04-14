@@ -29,7 +29,7 @@ const DEFAULTS = {
     maxRetries: 3,
     temperature: 0,
   },
-  entities: { enabled: false, mergeCall: true },
+  entities: { enabled: false, mergeCall: true, scope: 'default' },
   rank: { rrf: 0.65, timeDecay: 0.25, access: 0.10, entityBoost: 0.18 },
 };
 
@@ -57,6 +57,7 @@ const ENV_MAP = [
   ['AQUIFER_LLM_TIMEOUT_MS',    'llm.timeoutMs',     Number],
   ['AQUIFER_LLM_TEMPERATURE',   'llm.temperature',   Number],
   ['AQUIFER_ENTITIES_ENABLED',  'entities.enabled',  Boolean],
+  ['AQUIFER_ENTITY_SCOPE',     'entities.scope'],
 ];
 
 // ---------------------------------------------------------------------------
