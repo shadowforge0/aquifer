@@ -4,7 +4,7 @@
 
 **PG-native long-term memory for AI agents**
 
-*Turn-level embedding, hybrid RRF ranking, trust scoring, entity intersection, knowledge graph — all on PostgreSQL + pgvector.*
+*Turn-level embedding, hybrid RRF ranking, trust scoring, entity intersection, knowledge graph, entity scoping — all on PostgreSQL + pgvector.*
 
 [![npm version](https://img.shields.io/npm/v/@shadowforge0/aquifer-memory)](https://www.npmjs.com/package/@shadowforge0/aquifer-memory)
 [![PostgreSQL 15+](https://img.shields.io/badge/PostgreSQL-15%2B-336791)](https://www.postgresql.org/)
@@ -68,19 +68,19 @@ npm install @shadowforge0/aquifer-memory
 const { createAquifer } = require('@shadowforge0/aquifer-memory');
 
 const aquifer = createAquifer({
+  db: 'postgresql://user:pass@localhost:5432/mydb',  // connection string or pg.Pool
   schema: 'memory',                    // PG schema name (default: 'aquifer')
-  pg: {
-    connectionString: 'postgresql://user:pass@localhost:5432/mydb',
-  },
-  embedder: {
-    baseURL: 'http://localhost:11434/v1',   // Ollama
-    model: 'bge-m3',
-    apiKey: 'ollama',
+  tenantId: 'default',                 // multi-tenant isolation
+  embed: {
+    fn: async (texts) => embeddings,   // your embedding function
+    dim: 1024,                         // optional dimension hint
   },
   llm: {
-    baseURL: 'https://api.openai.com/v1',
-    model: 'gpt-4o-mini',
-    apiKey: process.env.OPENAI_API_KEY,
+    fn: async (prompt) => text,        // your LLM function (for built-in summarize)
+  },
+  entities: {
+    enabled: true,
+    scope: 'my-app',                   // entity namespace (default: 'default')
   },
 });
 
@@ -88,26 +88,36 @@ const aquifer = createAquifer({
 await aquifer.migrate();
 ```
 
-### Ingest a session
+### Write path: commit + enrich
 
 ```javascript
-await aquifer.ingest({
-  sessionId: 'conv-001',
+// 1. Store the session
+await aquifer.commit('conv-001', [
+  { role: 'user', content: 'Let me tell you about our new auth approach...' },
+  { role: 'assistant', content: 'Got it. So the plan is...' },
+], { agentId: 'main' });
+
+// 2. Enrich: summarize + embed turns + extract entities
+const result = await aquifer.enrich('conv-001', {
   agentId: 'main',
-  messages: [
-    { role: 'user', content: 'Let me tell you about our new auth approach...' },
-    { role: 'assistant', content: 'Got it. So the plan is...' },
-  ],
+  // Optional: bring your own summarize pipeline
+  summaryFn: async (msgs) => ({ summaryText, structuredSummary, entityRaw }),
+  entityParseFn: (text) => [{ name, normalizedName, type, aliases }],
+  // Optional: post-commit hook for downstream processing
+  postProcess: async (ctx) => {
+    // ctx contains session, summary, embedding, parsedEntities, etc.
+  },
 });
-// Stores session → generates summary → creates turn embeddings → extracts entities
 ```
 
-### Recall
+### Read path: recall
 
 ```javascript
 const results = await aquifer.recall('auth middleware decision', {
   agentId: 'main',
   limit: 5,
+  entities: ['auth-middleware'],       // optional: entity-aware search
+  entityMode: 'all',                   // 'any' (boost) or 'all' (hard filter)
 });
 // Returns ranked sessions with scores, using 3-way RRF fusion
 ```
@@ -257,107 +267,148 @@ Pass `schema: 'my_app'` to `createAquifer()` and all tables live under that Post
 
 ### `createAquifer(config)`
 
-Returns an Aquifer instance with the following methods:
+Returns an Aquifer instance. Config:
+
+```javascript
+{
+  db,          // pg connection string or Pool instance (required)
+  schema,      // PG schema name (default: 'aquifer')
+  tenantId,    // multi-tenant key (default: 'default')
+  embed: { fn, dim },      // embedding function (required for recall)
+  llm: { fn },             // LLM function (required for built-in summarize)
+  entities: {
+    enabled,               // enable KG (default: false)
+    scope,                 // entity namespace (default: 'default')
+    mergeCall,             // merge entity extraction into summary LLM call (default: true)
+  },
+  rank: { rrf, timeDecay, access, entityBoost },  // weight overrides
+}
+```
 
 #### `aquifer.migrate()`
 
-Runs SQL migrations (idempotent). Creates tables, indexes, and extensions.
+Runs SQL migrations (idempotent). Creates tables, indexes, triggers, and extensions.
 
-#### `aquifer.ingest(options)`
+#### `aquifer.commit(sessionId, messages, opts)`
 
-Ingests a session: stores messages, generates summary, creates turn embeddings, extracts entities.
+Stores a session. Returns `{ id, sessionId, isNew }`.
 
 ```javascript
-await aquifer.ingest({
-  sessionId: 'unique-id',
+await aquifer.commit('session-001', messages, {
   agentId: 'main',
-  source: 'api',                // optional, default 'api'
-  messages: [{ role, content }],
-  tenantId: 'default',          // optional
-  model: 'gpt-4o',             // optional metadata
-  tokensIn: 1500,              // optional
-  tokensOut: 800,              // optional
+  source: 'api',
+  sessionKey: 'optional-key',
+  model: 'gpt-4o',
+  tokensIn: 1500,
+  tokensOut: 800,
+  startedAt: isoString,
+  lastMessageAt: isoString,
 });
 ```
 
-#### `aquifer.recall(query, options)`
+#### `aquifer.enrich(sessionId, opts)`
 
-Hybrid search across sessions.
+Enriches a committed session: summarize, embed turns, extract entities. Uses optimistic locking with stale-reclaim (sessions stuck processing > 10 min are reclaimable).
+
+```javascript
+const result = await aquifer.enrich('session-001', {
+  agentId: 'main',
+  summaryFn,          // custom summarize pipeline (bypasses built-in LLM)
+  entityParseFn,      // custom entity parser
+  postProcess,        // async callback after tx commit
+  model: 'override',  // model metadata override
+  skipSummary: false,
+  skipTurnEmbed: false,
+  skipEntities: false,
+});
+// Returns: { summary, turnsEmbedded, entitiesFound, warnings, effectiveModel, postProcessError }
+```
+
+**postProcess hook**: runs after transaction commit, receives full context (session, summary, embedding, parsedEntities, etc.). Best-effort, at-most-once.
+
+#### `aquifer.recall(query, opts)`
+
+Hybrid search across sessions using 3-way RRF.
 
 ```javascript
 const results = await aquifer.recall('search query', {
   agentId: 'main',
-  limit: 10,                    // max results
-  entities: ['postgres', 'migration'],  // optional: explicit entity names
+  limit: 10,
+  entities: ['postgres', 'migration'],
   entityMode: 'all',            // 'any' (default) or 'all'
-  weights: {                    // optional: override ranking weights
-    rrf: 0.65,
-    timeDecay: 0.25,
-    access: 0.10,
-    entityBoost: 0.18,
-    openLoop: 0.08,
-  },
+  weights: { rrf, timeDecay, access, entityBoost },
 });
 // Returns: [{ sessionId, score, trustScore, summaryText, matchedTurnText, _debug, ... }]
 ```
 
-#### `aquifer.feedback(sessionId, options)`
+#### `aquifer.feedback(sessionId, opts)`
 
-Records explicit trust feedback on a session.
+Records trust feedback. Returns `{ trustBefore, trustAfter, verdict }`.
 
 ```javascript
 await aquifer.feedback('session-id', {
   verdict: 'helpful',   // or 'unhelpful'
-  agentId: 'main',      // optional
-  note: 'reason',       // optional
+  agentId: 'main',
+  note: 'reason',
 });
-// Returns: { trustBefore, trustAfter, verdict }
 ```
-
-#### `aquifer.enrich(sessionId, options)`
-
-Re-processes an existing session: regenerate summary, embeddings, and entities.
 
 #### `aquifer.close()`
 
-Closes the PostgreSQL connection pool.
+Closes the PostgreSQL connection pool (only if Aquifer created it).
 
 ---
 
 ## Configuration
 
+Aquifer takes a `db` connection (string or `pg.Pool`), plus optional `embed` and `llm` functions:
+
 ```javascript
 createAquifer({
-  // PostgreSQL schema name (all tables created under this schema)
-  schema: 'aquifer',
-
-  // PostgreSQL connection
-  pg: {
-    connectionString: 'postgresql://...',
-    // or individual: host, port, database, user, password
-    max: 10,  // pool size
+  db: 'postgresql://user:pass@localhost/mydb',  // or an existing pg.Pool
+  schema: 'aquifer',           // PG schema (default: 'aquifer')
+  tenantId: 'default',         // multi-tenant key
+  embed: {
+    fn: myEmbedFn,             // async (texts: string[]) => number[][]
+    dim: 1024,                 // optional dimension hint
   },
-
-  // Embedding provider (any OpenAI-compatible API)
-  embedder: {
-    baseURL: 'http://localhost:11434/v1',
-    model: 'bge-m3',
-    apiKey: 'ollama',
-    dimensions: 1024,           // optional
-    timeout: 30000,             // ms, default 30s
-  },
-
-  // LLM for summarization & entity extraction
   llm: {
-    baseURL: 'https://api.openai.com/v1',
-    model: 'gpt-4o-mini',
-    apiKey: process.env.OPENAI_API_KEY,
-    timeout: 60000,             // ms, default 60s
+    fn: myLlmFn,               // async (prompt: string) => string
   },
-
-  // Tenant isolation
-  tenantId: 'default',
+  entities: {
+    enabled: true,             // enable KG (default: false)
+    scope: 'my-app',           // entity namespace — decoupled from agentId
+    mergeCall: true,           // merge entity extraction into summary prompt
+  },
+  rank: {
+    rrf: 0.65,                 // FTS + embedding fusion weight
+    timeDecay: 0.25,           // recency weight
+    access: 0.10,              // access frequency weight
+    entityBoost: 0.18,         // entity match boost
+  },
 });
+```
+
+### Entity Scope
+
+`entities.scope` defines the namespace for entity identity. The unique constraint is `(tenant_id, normalized_name, entity_scope)` — the same entity name in different scopes creates separate entities. This decouples entity identity from `agentId`, allowing multiple agents to share an entity namespace.
+
+Fallback chain: `config.entities.scope` → `'default'`.
+
+### Consumers (CLI, MCP, OpenClaw plugin)
+
+For consumer-based setup using environment variables instead of code:
+
+```bash
+export DATABASE_URL="postgresql://..."
+export AQUIFER_EMBED_BASE_URL="http://localhost:11434/v1"
+export AQUIFER_EMBED_MODEL="bge-m3"
+export AQUIFER_ENTITIES_ENABLED=true
+
+aquifer migrate
+aquifer recall "search query" --limit 5
+aquifer backfill --concurrency 3
+aquifer stats --json
 ```
 
 ---
@@ -378,12 +429,12 @@ Key indexes: GIN on messages, GiST on `tsvector`, ivfflat on embeddings, B-tree 
 
 | Table | Purpose |
 |-------|---------|
-| `entities` | Normalized named entities with type, aliases, frequency, optional embedding |
+| `entities` | Normalized named entities with type, aliases, frequency, entity_scope, optional embedding |
 | `entity_mentions` | Entity × session join with mention count and context |
 | `entity_relations` | Co-occurrence edges (undirected, `CHECK src < dst`) |
 | `entity_sessions` | Entity-session association for boost scoring |
 
-Key indexes: trigram on entity names, GiST on embeddings, composite on tenant/agent.
+Key indexes: trigram on entity names, GiST on embeddings, unique on `(tenant_id, normalized_name, entity_scope)`.
 
 ### 003-trust-feedback.sql
 
