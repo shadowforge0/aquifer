@@ -79,15 +79,19 @@ function normalizeEntries(rawEntries) {
   };
 }
 
+function formatDate(value) {
+  if (!value) return 'unknown';
+  const parsed = new Date(value);
+  return isNaN(parsed.getTime()) ? 'unknown' : parsed.toISOString().slice(0, 10);
+}
+
 function formatRecallResults(results) {
   if (results.length === 0) return 'No matching sessions found.';
 
   return results.map((r, i) => {
     const ss = r.structuredSummary || {};
     const title = ss.title || r.summaryText?.slice(0, 60) || '(untitled)';
-    const date = r.startedAt
-      ? new Date(r.startedAt).toISOString().slice(0, 10)
-      : 'unknown';
+    const date = formatDate(r.startedAt);
 
     const lines = [`### ${i + 1}. ${title} (${date}, ${r.agentId || 'default'})`];
     if (ss.overview || r.summaryText) {

@@ -156,7 +156,7 @@ async function startServer(handler) {
 }
 
 const cliPrivate = loadModuleFromSource('consumers/cli.js', {
-  exportNames: ['cmdRecall', 'cmdBackfill', 'cmdStats', 'cmdExport'],
+  exportNames: ['cmdRecall', 'cmdBackfill', 'cmdStats', 'cmdExport', 'cmdQuickstart', 'formatDate', 'quoteIdentifier', 'parsePositiveInt'],
   mocks: {
     './shared/factory': { createAquiferFromConfig() { throw new Error('not used in unit tests'); } },
     './shared/config': { loadConfig() { return {}; } },
@@ -173,14 +173,14 @@ const mcpPrivate = loadModuleFromSource('consumers/mcp.js', {
 }).__private;
 
 const openclawPrivate = loadModuleFromSource('consumers/openclaw-plugin.js', {
-  exportNames: ['coerceRawEntries', 'normalizeEntries', 'formatRecallResults'],
+  exportNames: ['coerceRawEntries', 'normalizeEntries', 'formatRecallResults', 'formatDate'],
   mocks: {
     './shared/factory': { createAquiferFromConfig() { return {}; } },
   },
 }).__private;
 
 describe('consumers/cli.js', () => {
-  it('cmdRecall passes NaN through for invalid numeric limit', async () => {
+  it('cmdRecall falls back to default limit for invalid numeric input', async () => {
     let received = null;
     const aquifer = {
       async recall(query, opts) {
@@ -200,7 +200,26 @@ describe('consumers/cli.js', () => {
     }
 
     assert.equal(received.query, 'edge-case');
-    assert.equal(Number.isNaN(received.opts.limit), true);
+    assert.equal(received.opts.limit, 5);
+  });
+
+  it('cmdBackfill clamps invalid or too-small limits to a sane minimum', async () => {
+    let received = null;
+    const aquifer = {
+      async getPendingSessions(opts) {
+        received = opts;
+        return [];
+      },
+    };
+
+    const out = captureConsole('log');
+    try {
+      await cliPrivate.cmdBackfill(aquifer, { flags: { limit: '0' } });
+    } finally {
+      out.restore();
+    }
+
+    assert.equal(received.limit, 1);
   });
 
   it('cmdRecall exits when query is missing', async () => {
@@ -214,7 +233,7 @@ describe('consumers/cli.js', () => {
     }
   });
 
-  it('cmdRecall rejects on malformed startedAt values from recall results', async () => {
+  it('cmdRecall falls back for malformed startedAt values from recall results', async () => {
     const aquifer = {
       async recall() {
         return [{
@@ -225,10 +244,13 @@ describe('consumers/cli.js', () => {
       },
     };
 
-    await assert.rejects(
-      () => cliPrivate.cmdRecall(aquifer, { _: ['recall', 'q'], flags: {} }),
-      /Invalid time value/
-    );
+    const out = captureConsole('log');
+    try {
+      await cliPrivate.cmdRecall(aquifer, { _: ['recall', 'q'], flags: {} });
+      assert.ok(out.calls.some(line => /\(\?, agent-x\)/.test(line)), 'should print fallback date');
+    } finally {
+      out.restore();
+    }
   });
 
   it('cmdBackfill calls getPendingSessions and logs dry-run output', async () => {
@@ -275,6 +297,96 @@ describe('consumers/cli.js', () => {
       out.restore();
     }
   });
+
+  it('cmdExport falls back to default limit for invalid numeric input', async () => {
+    let received = null;
+    const aquifer = {
+      async exportSessions(opts) {
+        received = opts;
+        return [];
+      },
+    };
+
+    const out = captureConsole('log');
+    try {
+      await cliPrivate.cmdExport(aquifer, { flags: { limit: 'NaN' } });
+    } finally {
+      out.restore();
+    }
+
+    assert.equal(received.limit, 1000);
+  });
+
+  it('cmdQuickstart cleans up via parent session delete and closes the pool', async () => {
+    const calls = [];
+    let ended = false;
+
+    const aquifer = {
+      async migrate() {},
+      async commit() {},
+      async enrich() { return { turnsEmbedded: 1 }; },
+      async recall() { return [{ score: 0.9, matchedTurnText: 'hit' }]; },
+    };
+
+    const logs = captureConsole('log');
+    try {
+      await withPatchedModuleLoad({
+        './shared/config': { loadConfig() { return { db: { url: 'postgresql://example/test' }, schema: 'aq_test', tenantId: 'tenant-x' }; } },
+        pg: {
+          Pool: class FakePool {
+            async query(sql, params) {
+              calls.push({ sql, params });
+              return { rows: [] };
+            }
+            async end() {
+              ended = true;
+            }
+          },
+        },
+      }, async () => cliPrivate.cmdQuickstart(aquifer));
+    } finally {
+      logs.restore();
+    }
+
+    assert.equal(calls[0].sql, 'BEGIN');
+    assert.match(calls[1].sql, /DELETE FROM "aq_test"\.sessions WHERE tenant_id = \$1 AND agent_id = \$2 AND session_id = \$3/);
+    assert.deepEqual(calls[1].params, ['tenant-x', 'quickstart', calls[1].params[2]]);
+    assert.equal(calls[2].sql, 'COMMIT');
+    assert.equal(ended, true);
+  });
+
+  it('cmdQuickstart rolls back and closes the pool when cleanup fails', async () => {
+    const calls = [];
+    let ended = false;
+
+    const aquifer = {
+      async migrate() {},
+      async commit() {},
+      async enrich() { return { turnsEmbedded: 1 }; },
+      async recall() { return [{ score: 0.9 }]; },
+    };
+
+    await assert.rejects(
+      () => withPatchedModuleLoad({
+        './shared/config': { loadConfig() { return { db: { url: 'postgresql://example/test' }, schema: 'aq_test', tenantId: 'tenant-x' }; } },
+        pg: {
+          Pool: class FakePool {
+            async query(sql) {
+              calls.push(sql);
+              if (sql.startsWith('DELETE FROM')) throw new Error('cleanup failed');
+              return { rows: [] };
+            }
+            async end() {
+              ended = true;
+            }
+          },
+        },
+      }, async () => cliPrivate.cmdQuickstart(aquifer)),
+      /cleanup failed/
+    );
+    assert.deepEqual(calls, ['BEGIN', 'DELETE FROM "aq_test".sessions WHERE tenant_id = $1 AND agent_id = $2 AND session_id = $3', 'ROLLBACK']);
+    assert.equal(ended, true);
+  });
 });
 
 describe('consumers/mcp.js', () => {
@@ -300,11 +412,9 @@ describe('consumers/mcp.js', () => {
     assert.match(text, /\(untitled\)/);
   });
 
-  it('formatResults throws on malformed startedAt values', () => {
-    assert.throws(
-      () => mcpPrivate.formatResults([{ startedAt: 'bad-date', score: 1 }], 'q'),
-      /Invalid time value/
-    );
+  it('formatResults falls back on malformed startedAt values', () => {
+    const text = mcpPrivate.formatResults([{ startedAt: 'bad-date', score: 1 }], 'q');
+    assert.match(text, /unknown, default/);
   });
 
   it('main exits with an install hint when optional MCP dependencies are missing', async () => {
@@ -329,6 +439,32 @@ describe('consumers/mcp.js', () => {
 
     assert.match(stderr, /requires @modelcontextprotocol\/sdk and zod/);
     assert.match(stderr, /Install: npm install @modelcontextprotocol\/sdk zod/);
+  });
+
+  it('main rethrows non-missing dependency load errors', async () => {
+    await assert.rejects(
+      () => withPatchedModuleLoad(
+        { '@modelcontextprotocol/sdk/server/mcp.js': Object.assign(new Error('sdk exploded'), { code: 'ERR_REQUIRE_ESM' }) },
+        async () => mcpMain()
+      ),
+      /sdk exploded/
+    );
+  });
+
+  it('formatDate falls back for malformed values', () => {
+    assert.equal(cliPrivate.formatDate('not-a-date', '?'), '?');
+  });
+
+  it('quoteIdentifier rejects invalid schema names', () => {
+    assert.throws(() => cliPrivate.quoteIdentifier('bad-name;drop'), /Invalid schema name/);
+  });
+
+  it('parsePositiveInt returns fallback for invalid values and clamps to minimum 1', () => {
+    assert.equal(cliPrivate.parsePositiveInt('NaN', 5), 5);
+    assert.equal(cliPrivate.parsePositiveInt(undefined, 5), 5);
+    assert.equal(cliPrivate.parsePositiveInt('0', 5), 1);
+    assert.equal(cliPrivate.parsePositiveInt('-10', 5), 1);
+    assert.equal(cliPrivate.parsePositiveInt('7', 5), 7);
   });
 });
 
@@ -403,6 +539,15 @@ describe('consumers/openclaw-plugin.js', () => {
 
   it('formatRecallResults returns a no-match message for empty results', () => {
     assert.equal(openclawPrivate.formatRecallResults([]), 'No matching sessions found.');
+  });
+
+  it('formatRecallResults falls back on malformed startedAt values', () => {
+    const text = openclawPrivate.formatRecallResults([{ startedAt: 'bad-date', agentId: '', score: 0.1 }]);
+    assert.match(text, /unknown, default/);
+  });
+
+  it('formatDate falls back to unknown for malformed values', () => {
+    assert.equal(openclawPrivate.formatDate('bad-date'), 'unknown');
   });
 
   it('register disables the plugin when configuration is invalid', () => {

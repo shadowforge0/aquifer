@@ -36,12 +36,12 @@ function rrfFusion(ftsResults = [], embResults = [], turnResults = [], K = 60) {
 // timeDecay — sigmoid decay based on age in days
 // ---------------------------------------------------------------------------
 
-function timeDecay(startedAt, midpointDays = 45, steepness = 0.05) {
+function timeDecay(startedAt, midpointDays = 45, steepness = 0.05, nowMs = Date.now()) {
   if (!startedAt) return 0.5;
   const dt = typeof startedAt === 'string' ? new Date(startedAt) : startedAt;
   if (isNaN(dt.getTime())) return 0.5;
 
-  const ageDays = (Date.now() - dt.getTime()) / (1000 * 60 * 60 * 24);
+  const ageDays = (nowMs - dt.getTime()) / (1000 * 60 * 60 * 24);
   return 1 / (1 + Math.exp(steepness * (ageDays - midpointDays)));
 }
 
@@ -49,14 +49,14 @@ function timeDecay(startedAt, midpointDays = 45, steepness = 0.05) {
 // accessScore — exponential decay on access recency (30-day half-life)
 // ---------------------------------------------------------------------------
 
-function accessScore(accessCount, lastAccessedAt) {
+function accessScore(accessCount, lastAccessedAt, nowMs = Date.now()) {
   if (!accessCount || accessCount <= 0) return 0;
   if (!lastAccessedAt) return 0;
 
   const dt = typeof lastAccessedAt === 'string' ? new Date(lastAccessedAt) : lastAccessedAt;
   if (isNaN(dt.getTime())) return 0;
 
-  const daysSince = (Date.now() - dt.getTime()) / (1000 * 60 * 60 * 24);
+  const daysSince = (nowMs - dt.getTime()) / (1000 * 60 * 60 * 24);
   return accessCount * Math.exp(-0.693 * daysSince / 30);
 }
 
@@ -89,6 +89,7 @@ function hybridRank(ftsResults, embResults, turnResults, opts = {}) {
   } = opts;
 
   const w = { ...DEFAULT_WEIGHTS, ...weights };
+  const nowMs = opts.nowMs ?? Date.now();
 
   // Build allResults map: session_id → result object
   const allResults = new Map();
@@ -140,11 +141,12 @@ function hybridRank(ftsResults, embResults, turnResults, opts = {}) {
     const rawRrf = rrfScores.get(sessionId) || 0;
     const normRrf = maxRrf > 0 ? rawRrf / maxRrf : 0;
 
-    const td = timeDecay(result.started_at);
+    const td = timeDecay(result.started_at, 45, 0.05, nowMs);
 
     const accessEff = accessScore(
       result.access_count || 0,
       result.last_accessed_at,
+      nowMs,
     );
     const as = 1 - Math.exp(-accessEff / 5);
 

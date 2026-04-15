@@ -119,7 +119,7 @@ function makeExtractEntitiesMock() {
 }
 
 // Build a createAquifer with fully injected mocks
-function makeAquifer({ embedFn = null, ftsRows = [], turnRows = [], embRows = [] } = {}) {
+function makeAquifer({ embedFn = null, ftsRows = [], turnRows = [], embRows = [], storageOverrides = {} } = {}) {
   // embeddingSearchSummaries is a closure inside aquifer.js that calls pool.query directly.
   // We return embRows from pool.query for summary vector search.
   const pool = {
@@ -138,7 +138,7 @@ function makeAquifer({ embedFn = null, ftsRows = [], turnRows = [], embRows = []
     },
   };
 
-  const storageMock = makeStorageMock({ ftsRows, turnRows });
+  const storageMock = { ...makeStorageMock({ ftsRows, turnRows }), ...storageOverrides };
   const entityMock = makeEntityMock();
   const hrMock = makeHybridRankMock();
 
@@ -333,5 +333,50 @@ describe('recall backward compatibility', () => {
     assert.ok('score' in r, 'score field required');
     assert.ok('trustScore' in r, 'trustScore field required');
     assert.ok('_debug' in r, '_debug field required');
+  });
+
+  it('includes search path errors in debug output when recall can still return results', async () => {
+    const ftsRows = [{ session_id: 's4', agent_id: 'agent', source: 'api', started_at: new Date().toISOString(), summary_text: 'fts hit', structured_summary: null }];
+    const { aq } = makeAquifer({
+      embedFn: makeEmbedFn(),
+      ftsRows,
+      storageOverrides: {
+        searchTurnEmbeddings: async () => { throw new Error('turn path down'); },
+      },
+    });
+
+    const results = await recallWithMigration(aq, 'hello', { mode: 'hybrid' });
+    assert.equal(results.length, 1);
+    assert.deepEqual(results[0]._debug.searchErrors, [{ path: 'turn-vector', message: 'turn path down' }]);
+  });
+
+  it('throws when strictSearchErrors is enabled and all search paths fail', async () => {
+    const { aq } = makeAquifer({
+      embedFn: async () => { throw new Error('embed down'); },
+      storageOverrides: {
+        searchSessions: async () => { throw new Error('fts down'); },
+        searchTurnEmbeddings: async () => { throw new Error('turn down'); },
+      },
+    });
+
+    await assert.rejects(
+      () => recallWithMigration(aq, 'hello', { strictSearchErrors: true }),
+      /embed down/
+    );
+  });
+
+  it('throws aggregated path errors in strict mode when embed succeeds but searches fail', async () => {
+    const { aq } = makeAquifer({
+      embedFn: makeEmbedFn(),
+      storageOverrides: {
+        searchSessions: async () => { throw new Error('fts down'); },
+        searchTurnEmbeddings: async () => { throw new Error('turn down'); },
+      },
+    });
+
+    await assert.rejects(
+      () => recallWithMigration(aq, 'hello', { strictSearchErrors: true }),
+      /Recall search failed: fts: fts down; turn-vector: turn down/
+    );
   });
 });

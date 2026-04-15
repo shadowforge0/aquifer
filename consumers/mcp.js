@@ -38,9 +38,11 @@ function formatResults(results, query) {
     const r = results[i];
     const ss = r.structuredSummary || {};
     const title = ss.title || r.summaryText?.slice(0, 60) || '(untitled)';
-    const date = r.startedAt
-      ? new Date(r.startedAt).toISOString().slice(0, 10)
-      : 'unknown';
+    let date = 'unknown';
+    if (r.startedAt) {
+      const parsed = new Date(r.startedAt);
+      if (!isNaN(parsed.getTime())) date = parsed.toISOString().slice(0, 10);
+    }
 
     lines.push(`### ${i + 1}. ${title} (${date}, ${r.agentId || 'default'})`);
     if (ss.overview || r.summaryText) {
@@ -65,9 +67,11 @@ async function main() {
     ({ StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js'));
     ({ z } = require('zod'));
   } catch (e) {
+    const missingDep = e && (e.code === 'MODULE_NOT_FOUND' || /Cannot find module|^missing\b/i.test(e.message || ''));
+    if (!missingDep) throw e;
     process.stderr.write(
       'aquifer mcp requires @modelcontextprotocol/sdk and zod.\n' +
-      'These should be installed automatically. Try: npm install\n'
+      'Install: npm install @modelcontextprotocol/sdk zod\n'
     );
     process.exit(1);
   }

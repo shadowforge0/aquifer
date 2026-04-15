@@ -16,6 +16,26 @@
 
 const { createAquiferFromConfig } = require('./shared/factory');
 
+function formatDate(value, fallback) {
+  if (!value) return fallback;
+  const parsed = new Date(value);
+  return isNaN(parsed.getTime()) ? fallback : parsed.toISOString().slice(0, 10);
+}
+
+function quoteIdentifier(identifier) {
+  if (!/^[a-zA-Z_]\w{0,62}$/.test(identifier)) {
+    throw new Error(`Invalid schema name: "${identifier}"`);
+  }
+  return `"${identifier}"`;
+}
+
+function parsePositiveInt(value, fallback) {
+  if (value === undefined || value === null || value === true) return fallback;
+  const parsed = parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(1, parsed);
+}
+
 // ---------------------------------------------------------------------------
 // Argument parser (minimal, no deps)
 // ---------------------------------------------------------------------------
@@ -57,7 +77,7 @@ async function cmdRecall(aquifer, args) {
   }
 
   const recallOpts = {
-    limit: parseInt(args.flags.limit || '5', 10),
+    limit: parsePositiveInt(args.flags.limit, 5),
     agentId: args.flags['agent-id'] || undefined,
     source: args.flags.source || undefined,
     dateFrom: args.flags['date-from'] || undefined,
@@ -83,7 +103,7 @@ async function cmdRecall(aquifer, args) {
     const r = results[i];
     const ss = r.structuredSummary || {};
     const title = ss.title || r.summaryText?.slice(0, 60) || '(untitled)';
-    const date = r.startedAt ? new Date(r.startedAt).toISOString().slice(0, 10) : '?';
+    const date = formatDate(r.startedAt, '?');
     console.log(`${i + 1}. [${r.score?.toFixed(3)}] ${title} (${date}, ${r.agentId})`);
     if (ss.overview) console.log(`   ${ss.overview.slice(0, 200)}`);
     if (r.matchedTurnText) console.log(`   > ${r.matchedTurnText.slice(0, 150)}`);
@@ -114,7 +134,7 @@ async function cmdFeedback(aquifer, args) {
 }
 
 async function cmdBackfill(aquifer, args) {
-  const limit = parseInt(args.flags.limit || '100', 10);
+  const limit = parsePositiveInt(args.flags.limit, 100);
   const dryRun = !!args.flags['dry-run'];
   const skipSummary = !!args.flags['skip-summary'];
   const skipTurnEmbed = !!args.flags['skip-turn-embed'];
@@ -160,7 +180,7 @@ async function cmdStats(aquifer, args) {
     console.log(`Summaries: ${stats.summaries}`);
     console.log(`Turn embeddings: ${stats.turnEmbeddings}`);
     console.log(`Entities: ${stats.entities}`);
-    if (stats.earliest) console.log(`Range: ${new Date(stats.earliest).toISOString().slice(0, 10)} — ${new Date(stats.latest).toISOString().slice(0, 10)}`);
+    if (stats.earliest) console.log(`Range: ${formatDate(stats.earliest, '?')} — ${formatDate(stats.latest, '?')}`);
   }
 }
 
@@ -211,11 +231,21 @@ async function cmdQuickstart(aquifer) {
   const { loadConfig } = require('./shared/config');
   const config = loadConfig();
   const pool = new Pool({ connectionString: config.db.url });
-  const schema = config.schema || 'aquifer';
-  await pool.query(`DELETE FROM ${schema}.turn_embeddings WHERE session_id IN (SELECT id FROM ${schema}.sessions WHERE session_id = $1)`, [sessionId]);
-  await pool.query(`DELETE FROM ${schema}.session_summaries WHERE session_id IN (SELECT id FROM ${schema}.sessions WHERE session_id = $1)`, [sessionId]);
-  await pool.query(`DELETE FROM ${schema}.sessions WHERE session_id = $1`, [sessionId]);
-  await pool.end();
+  const schema = quoteIdentifier(config.schema || 'aquifer');
+  const tenantId = config.tenantId || 'default';
+  try {
+    await pool.query('BEGIN');
+    await pool.query(
+      `DELETE FROM ${schema}.sessions WHERE tenant_id = $1 AND agent_id = $2 AND session_id = $3`,
+      [tenantId, 'quickstart', sessionId]
+    );
+    await pool.query('COMMIT');
+  } catch (err) {
+    await pool.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    await pool.end();
+  }
   console.log('     OK\n');
 
   console.log('✓ Aquifer is working. You can now start the MCP server:');
@@ -224,7 +254,7 @@ async function cmdQuickstart(aquifer) {
 
 async function cmdExport(aquifer, args) {
   const output = args.flags.output || null;
-  const limit = parseInt(args.flags.limit || '1000', 10);
+  const limit = parsePositiveInt(args.flags.limit, 1000);
 
   const rows = await aquifer.exportSessions({
     agentId: args.flags['agent-id'],

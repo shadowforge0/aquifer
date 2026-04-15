@@ -583,7 +583,22 @@ function createAquifer(config) {
         weights: overrideWeights,
         entities: explicitEntities,
         entityMode = 'any',
+        strictSearchErrors = false,
       } = opts;
+      const searchErrors = [];
+
+      function recordSearchError(pathName, err) {
+        searchErrors.push({
+          path: pathName,
+          message: err && err.message ? err.message : String(err),
+        });
+      }
+
+      function maybeThrowSearchErrors() {
+        if (!strictSearchErrors || searchErrors.length === 0) return;
+        const details = searchErrors.map(e => `${e.path}: ${e.message}`).join('; ');
+        throw new Error(`Recall search failed: ${details}`);
+      }
 
       // Normalize agentId/agentIds into a single resolved value
       // agentIds takes precedence; agentId is sugar for agentIds: [agentId]
@@ -692,17 +707,26 @@ function createAquifer(config) {
         runFts
           ? storage.searchSessions(pool, query, {
               schema, tenantId, agentIds: resolvedAgentIds, source, dateFrom, dateTo, limit: fetchLimit, ftsConfig,
-            }).catch(() => [])
+            }).catch((err) => {
+              recordSearchError('fts', err);
+              return [];
+            })
           : Promise.resolve([]),
         runVector
           ? embeddingSearchSummaries(queryVec, {
               agentIds: resolvedAgentIds, source, dateFrom, dateTo, limit: fetchLimit,
-            }).catch(() => [])
+            }).catch((err) => {
+              recordSearchError('summary-vector', err);
+              return [];
+            })
           : Promise.resolve([]),
         runVector
           ? storage.searchTurnEmbeddings(pool, {
               schema, tenantId, queryVec, dateFrom, dateTo, agentIds: resolvedAgentIds, source, limit: fetchLimit,
-            }).catch(() => ({ rows: [] }))
+            }).catch((err) => {
+              recordSearchError('turn-vector', err);
+              return { rows: [] };
+            })
           : Promise.resolve({ rows: [] }),
       ]);
 
@@ -718,6 +742,7 @@ function createAquifer(config) {
       const filteredTurn = filterFn(turnRows);
 
       if (filteredFts.length === 0 && filteredEmb.length === 0 && filteredTurn.length === 0) {
+        maybeThrowSearchErrors();
         return [];
       }
 
@@ -737,7 +762,7 @@ function createAquifer(config) {
       const EXTERNAL_TIMEOUT = 10000;
       const externalRows = [];
       const externalPromises = [];
-      for (const [, sourceConfig] of sources) {
+      for (const [name, sourceConfig] of sources) {
         if (typeof sourceConfig.search === 'function') {
           const w = sourceConfig.weight !== null && sourceConfig.weight !== undefined ? sourceConfig.weight : 1.0;
           externalPromises.push(
@@ -750,7 +775,9 @@ function createAquifer(config) {
                   if (r && r.session_id) externalRows.push({ ...r, _externalWeight: w });
                 }
               }
-            }).catch(() => { /* external source failure/timeout non-fatal */ })
+            }).catch((err) => {
+              recordSearchError(`external:${name}`, err);
+            })
           );
         }
       }
@@ -835,6 +862,7 @@ function createAquifer(config) {
           hybridScore: r._hybridScore ?? r._score,
           rerankScore: r._rerankScore ?? null,
           rerankFallback: r._rerankFallback || false,
+          searchErrors: searchErrors.slice(),
         },
       }));
     },
