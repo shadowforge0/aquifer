@@ -31,7 +31,7 @@ const TURN_NOISE_RE = [
   /^A new session was started via \/new/,
 ];
 
-const VALID_STATUSES = new Set(['pending', 'processing', 'succeeded', 'partial', 'failed']);
+const VALID_STATUSES = new Set(['pending', 'processing', 'succeeded', 'partial', 'failed', 'skipped']);
 
 // ---------------------------------------------------------------------------
 // upsertSession
@@ -339,8 +339,17 @@ async function searchSessions(pool, query, {
   ftsConfig = 'simple',
 } = {}) {
   const clampedLimit = Math.max(1, Math.min(100, limit));
-  // Sanitize ftsConfig to prevent SQL injection (must be a valid regconfig name)
-  const safeFts = /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(ftsConfig) ? ftsConfig : 'simple';
+  // FTS config is locked to 'simple' — the search_tsv trigger always uses
+  // to_tsvector('simple', ...) so query semantics must match.  Warn callers
+  // that pass a different value rather than silently honouring it.
+  if (ftsConfig !== 'simple') {
+    console.warn(
+      `[aquifer/storage] searchSessions: ftsConfig '${ftsConfig}' ignored. ` +
+      `Only 'simple' is supported (index is built with simple tokenizer). ` +
+      `Using 'simple'.`
+    );
+  }
+  const safeFts = 'simple';
 
   // Normalize agentId/agentIds
   const agentIds = rawAgentIds && rawAgentIds.length > 0

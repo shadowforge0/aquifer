@@ -127,18 +127,28 @@ const results = await aquifer.recall('auth middleware decision', {
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    createAquifer (entry)                     │
-│         Config · Migration · Ingest · Recall · Enrich       │
-└────────┬──────────┬──────────┬──────────┬───────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                     Agent Hosts                              │
+│   Claude Code · OpenClaw · Codex · OpenCode · ...            │
+└──────────────────────┬───────────────────────────────────────┘
+                       │ MCP (stdio or HTTP)
+┌──────────────────────▼───────────────────────────────────────┐
+│              Aquifer MCP Server (canonical API)               │
+│   session_recall · session_feedback · memory_stats · ...     │
+└──────────────────────┬───────────────────────────────────────┘
+                       │
+┌──────────────────────▼───────────────────────────────────────┐
+│                    createAquifer (engine)                     │
+│         Config · Migration · Ingest · Recall · Enrich        │
+└────────┬──────────┬──────────┬──────────┬────────────────────┘
          │          │          │          │
     ┌────▼───┐ ┌────▼────┐ ┌──▼───┐ ┌───▼──────────┐
     │storage │ │hybrid-  │ │entity│ │   pipeline/   │
     │  .js   │ │rank.js  │ │ .js  │ │summarize.js   │
     └────────┘ └─────────┘ └──────┘ │embed.js       │
          │                     │    │extract-ent.js │
-    ┌────▼───────────┐    ┌───▼──┐  └───────────────┘
-    │  PostgreSQL     │    │ LLM  │
+    ┌────▼───────────┐    ┌───▼──┐  │rerank.js      │
+    │  PostgreSQL     │    │ LLM  │  └───────────────┘
     │  + pgvector     │    │ API  │
     └────────────────┘    └──────┘
 
@@ -151,11 +161,13 @@ const results = await aquifer.recall('auth middleware decision', {
     └──────────────────────────────────┘
 ```
 
+**Integration model:** MCP is the primary integration surface. Agent hosts connect to Aquifer through the MCP server (`consumers/mcp.js`), which exposes `session_recall`, `session_feedback`, `memory_stats`, and `memory_pending`. The CLI wraps the same engine for command-line use. The OpenClaw plugin (`consumers/openclaw-plugin.js`) is retained as a compatibility adapter for session capture but is not the primary tool delivery path.
+
 ### File Reference
 
 | File | Purpose |
 |------|---------|
-| `index.js` | Entry point — exports `createAquifer`, `createEmbedder` |
+| `index.js` | Entry point — exports `createAquifer`, `createEmbedder`, `createReranker`, `normalizeSession` |
 | `core/aquifer.js` | Main facade: `migrate()`, `ingest()`, `recall()`, `enrich()` |
 | `core/storage.js` | Session/summary/turn CRUD, FTS search, embedding search |
 | `core/entity.js` | Entity upsert, mention tracking, relation graph, normalization |
@@ -163,6 +175,8 @@ const results = await aquifer.recall('auth middleware decision', {
 | `pipeline/summarize.js` | LLM-powered session summarization with structured output |
 | `pipeline/embed.js` | Embedding client (any OpenAI-compatible API) |
 | `pipeline/extract-entities.js` | LLM-powered entity extraction (12 types) |
+| `pipeline/rerank.js` | Cross-encoder reranking (TEI, Jina, OpenRouter) |
+| `pipeline/normalize/` | Session normalization for Claude Code / gateway noise |
 | `schema/001-base.sql` | DDL: sessions, summaries, turn_embeddings, FTS indexes |
 | `schema/002-entities.sql` | DDL: entities, mentions, relations, entity_sessions |
 | `schema/003-trust-feedback.sql` | DDL: trust_score column, session_feedback audit trail |
@@ -395,9 +409,48 @@ createAquifer({
 
 Fallback chain: `config.entities.scope` → `'default'`.
 
-### Consumers (CLI, MCP, OpenClaw plugin)
+### MCP Server (primary integration)
 
-For consumer-based setup using environment variables instead of code:
+Agent hosts should connect through the Aquifer MCP server. For OpenClaw, add to `openclaw.json`:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "aquifer": {
+        "command": "node",
+        "args": ["/path/to/aquifer/consumers/mcp.js"],
+        "env": {
+          "DATABASE_URL": "postgresql://...",
+          "AQUIFER_SCHEMA": "aquifer",
+          "AQUIFER_EMBED_BASE_URL": "http://localhost:11434/v1",
+          "AQUIFER_EMBED_MODEL": "bge-m3"
+        }
+      }
+    }
+  }
+}
+```
+
+Tools are exposed as `aquifer__session_recall`, `aquifer__session_feedback`, `aquifer__memory_stats`, `aquifer__memory_pending` (server name prefix is added by the host).
+
+For Claude Code, add to `.claude.json`:
+
+```json
+{
+  "mcpServers": {
+    "aquifer": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["/path/to/aquifer/consumers/mcp.js"]
+    }
+  }
+}
+```
+
+### CLI (secondary)
+
+For command-line use with environment variables:
 
 ```bash
 export DATABASE_URL="postgresql://..."

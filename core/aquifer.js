@@ -77,6 +77,7 @@ function createAquifer(config) {
     ownsPool = true;
   } else {
     pool = config.db;
+    ownsPool = !!config.ownsPool;  // allow factory to claim ownership
   }
 
   // Embed config (lazy — only required for recall/enrich)
@@ -99,8 +100,18 @@ function createAquifer(config) {
   const entityPromptFn = config.entities && config.entities.prompt ? config.entities.prompt : null;
   const entityScope = (config.entities && config.entities.scope) || 'default';
 
-  // FTS config (default: 'simple'; set to 'zhcfg' for Chinese tokenization)
-  const ftsConfig = config.ftsConfig || 'simple';
+  // FTS config — locked to 'simple'.
+  // The search_tsv trigger always uses to_tsvector('simple', ...), so query-time
+  // config must match.  Warn and override if someone passes anything else.
+  const _rawFtsConfig = config.ftsConfig || 'simple';
+  if (_rawFtsConfig !== 'simple') {
+    console.warn(
+      `[aquifer] ftsConfig '${_rawFtsConfig}' is not currently supported. ` +
+      `The search_tsv index is built with 'simple'; only 'simple' is valid at query time. ` +
+      `Overriding to 'simple'.`
+    );
+  }
+  const ftsConfig = 'simple';
 
   // Rank weights
   const rankWeights = {
@@ -551,7 +562,16 @@ function createAquifer(config) {
 
     async recall(query, opts = {}) {
       if (!query) return [];
-      requireEmbed('recall');
+
+      const VALID_MODES = ['fts', 'hybrid', 'vector'];
+      const mode = opts.mode !== undefined ? opts.mode : 'hybrid';
+      if (!VALID_MODES.includes(mode)) {
+        throw new Error(`Invalid recall mode: "${mode}". Must be one of: ${VALID_MODES.join(', ')}`);
+      }
+
+      if (mode === 'hybrid' || mode === 'vector') {
+        requireEmbed('recall');
+      }
 
       const {
         agentId,
@@ -582,10 +602,13 @@ function createAquifer(config) {
       const rerankTopK = rerankEnabled ? Math.max(limit, opts.rerankTopK || defaultRerankTopK) : limit;
       const fetchLimit = rerankTopK * 4;
 
-      // 1. Embed query
-      const queryVecResult = await embedFn([query]);
-      const queryVec = queryVecResult[0];
-      if (!queryVec || !queryVec.length) return []; // m3: guard empty array too
+      // 1. Embed query (only needed for hybrid/vector modes)
+      let queryVec = null;
+      if (mode === 'hybrid' || mode === 'vector') {
+        const queryVecResult = await embedFn([query]);
+        queryVec = queryVecResult[0];
+        if (!queryVec || !queryVec.length) return []; // m3: guard empty array too
+      }
 
       // 2. Entity intersection pre-filter (when entityMode === 'all')
       let candidateSessionIds = null; // null = no filter
@@ -661,17 +684,26 @@ function createAquifer(config) {
         } catch (_) { /* entity search failure non-fatal */ }
       }
 
-      // 3. Run 3 search paths in parallel
+      // 3. Run search paths in parallel (conditioned on mode)
+      const runFts = mode === 'fts' || mode === 'hybrid';
+      const runVector = mode === 'vector' || mode === 'hybrid';
+
       const [ftsRows, embRows, turnResult] = await Promise.all([
-        storage.searchSessions(pool, query, {
-          schema, tenantId, agentIds: resolvedAgentIds, source, dateFrom, dateTo, limit: fetchLimit, ftsConfig,
-        }).catch(() => []),
-        embeddingSearchSummaries(queryVec, {
-          agentIds: resolvedAgentIds, source, dateFrom, dateTo, limit: fetchLimit,
-        }).catch(() => []),
-        storage.searchTurnEmbeddings(pool, {
-          schema, tenantId, queryVec, dateFrom, dateTo, agentIds: resolvedAgentIds, source, limit: fetchLimit,
-        }).catch(() => ({ rows: [] })),
+        runFts
+          ? storage.searchSessions(pool, query, {
+              schema, tenantId, agentIds: resolvedAgentIds, source, dateFrom, dateTo, limit: fetchLimit, ftsConfig,
+            }).catch(() => [])
+          : Promise.resolve([]),
+        runVector
+          ? embeddingSearchSummaries(queryVec, {
+              agentIds: resolvedAgentIds, source, dateFrom, dateTo, limit: fetchLimit,
+            }).catch(() => [])
+          : Promise.resolve([]),
+        runVector
+          ? storage.searchTurnEmbeddings(pool, {
+              schema, tenantId, queryVec, dateFrom, dateTo, agentIds: resolvedAgentIds, source, limit: fetchLimit,
+            }).catch(() => ({ rows: [] }))
+          : Promise.resolve({ rows: [] }),
       ]);
 
       const turnRows = turnResult.rows || [];
@@ -836,6 +868,27 @@ function createAquifer(config) {
       return storage.getSession(pool, sessionId, agentId, opts, { schema, tenantId });
     },
 
+    async skip(sessionId, opts = {}) {
+      const agentId = opts.agentId || 'agent';
+      const reason = opts.reason || null;
+      // Atomic CAS: only skip if still pending (avoids race with concurrent enrich)
+      const result = await pool.query(
+        `UPDATE ${qi(schema)}.sessions
+        SET processing_status = 'skipped', processing_error = $1
+        WHERE session_id = $2 AND agent_id = $3 AND tenant_id = $4
+          AND processing_status = 'pending'
+        RETURNING id`,
+        [reason, sessionId, agentId, tenantId]
+      );
+      if (result.rows.length === 0) {
+        // Check if session exists at all
+        const existing = await storage.getSession(pool, sessionId, agentId, {}, { schema, tenantId });
+        if (!existing) throw new Error(`Session not found: ${sessionId} (agentId=${agentId})`);
+        return null; // exists but not pending — no-op
+      }
+      return { id: result.rows[0].id, sessionId, agentId, status: 'skipped' };
+    },
+
     async getSessionFull(sessionId) {
       // Try to find the session across agents by querying directly
       const result = await pool.query(
@@ -867,6 +920,93 @@ function createAquifer(config) {
         segments: segResult.rows,
         summary: sumResult.rows[0] || null,
       };
+    },
+
+    // --- public config accessor ---
+
+    getConfig() {
+      return { schema, tenantId };
+    },
+
+    // --- admin query helpers ---
+
+    async getStats() {
+      const [sessions, summaries, turns, timeRange] = await Promise.all([
+        pool.query(
+          `SELECT processing_status, COUNT(*)::int as count
+          FROM ${qi(schema)}.sessions WHERE tenant_id = $1
+          GROUP BY processing_status`,
+          [tenantId]
+        ),
+        pool.query(
+          `SELECT COUNT(*)::int as count FROM ${qi(schema)}.session_summaries WHERE tenant_id = $1`,
+          [tenantId]
+        ),
+        pool.query(
+          `SELECT COUNT(*)::int as count FROM ${qi(schema)}.turn_embeddings WHERE tenant_id = $1`,
+          [tenantId]
+        ),
+        pool.query(
+          `SELECT MIN(started_at) as earliest, MAX(started_at) as latest
+          FROM ${qi(schema)}.sessions WHERE tenant_id = $1`,
+          [tenantId]
+        ),
+      ]);
+
+      let entityCount = 0;
+      try {
+        const entResult = await pool.query(
+          `SELECT COUNT(*)::int as count FROM ${qi(schema)}.entities WHERE tenant_id = $1`,
+          [tenantId]
+        );
+        entityCount = entResult.rows[0]?.count || 0;
+      } catch (_) { /* entities table may not exist */ }
+
+      return {
+        sessions: Object.fromEntries(sessions.rows.map(r => [r.processing_status, r.count])),
+        sessionTotal: sessions.rows.reduce((s, r) => s + r.count, 0),
+        summaries: summaries.rows[0]?.count || 0,
+        turnEmbeddings: turns.rows[0]?.count || 0,
+        entities: entityCount,
+        earliest: timeRange.rows[0]?.earliest || null,
+        latest: timeRange.rows[0]?.latest || null,
+      };
+    },
+
+    async getPendingSessions(opts = {}) {
+      const limit = opts.limit !== undefined ? opts.limit : 100;
+      const result = await pool.query(
+        `SELECT session_id, agent_id, processing_status
+        FROM ${qi(schema)}.sessions
+        WHERE tenant_id = $1
+          AND processing_status IN ('pending', 'failed')
+        ORDER BY started_at DESC
+        LIMIT $2`,
+        [tenantId, limit]
+      );
+      return result.rows;
+    },
+
+    async exportSessions(opts = {}) {
+      const { agentId, source, limit = 1000 } = opts;
+      const where = [`s.tenant_id = $1`];
+      const params = [tenantId];
+
+      if (agentId) { params.push(agentId); where.push(`s.agent_id = $${params.length}`); }
+      if (source) { params.push(source); where.push(`s.source = $${params.length}`); }
+      params.push(limit);
+
+      const result = await pool.query(
+        `SELECT s.session_id, s.agent_id, s.source, s.started_at, s.msg_count,
+                s.processing_status, ss.summary_text, ss.structured_summary
+        FROM ${qi(schema)}.sessions s
+        LEFT JOIN ${qi(schema)}.session_summaries ss ON ss.session_row_id = s.id
+        WHERE ${where.join(' AND ')}
+        ORDER BY s.started_at DESC
+        LIMIT $${params.length}`,
+        params
+      );
+      return result.rows;
     },
   };
 

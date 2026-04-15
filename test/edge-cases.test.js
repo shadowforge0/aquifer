@@ -231,36 +231,48 @@ describe('consumers/cli.js', () => {
     );
   });
 
-  it('cmdBackfill exits when direct pool access is unavailable', async () => {
-    const err = captureConsole('error');
+  it('cmdBackfill calls getPendingSessions and logs dry-run output', async () => {
+    const out = captureConsole('log');
     try {
-      const code = await captureExit(() => cliPrivate.cmdBackfill({ _config: {}, _pool: null }, { flags: {} }));
-      assert.equal(code, 1);
-      assert.match(err.calls[0], /Backfill requires direct pool access/);
+      const aquifer = {
+        async getPendingSessions() {
+          return [{ session_id: 'sid-1', agent_id: 'a1', processing_status: 'pending' }];
+        },
+      };
+      await cliPrivate.cmdBackfill(aquifer, { flags: { 'dry-run': true } });
+      assert.ok(out.calls.some(l => /sid-1/.test(l)), 'should log the session_id');
     } finally {
-      err.restore();
+      out.restore();
     }
   });
 
-  it('cmdStats exits when direct pool access is unavailable', async () => {
-    const err = captureConsole('error');
+  it('cmdStats calls getStats and prints session total', async () => {
+    const out = captureConsole('log');
     try {
-      const code = await captureExit(() => cliPrivate.cmdStats({ _config: {}, _pool: null }, { flags: {} }));
-      assert.equal(code, 1);
-      assert.match(err.calls[0], /Stats requires direct pool access/);
+      const aquifer = {
+        async getStats() {
+          return { sessions: { pending: 3 }, sessionTotal: 3, summaries: 1, turnEmbeddings: 5, entities: 0, earliest: null, latest: null };
+        },
+      };
+      await cliPrivate.cmdStats(aquifer, { flags: {} });
+      assert.ok(out.calls.some(l => /Sessions: 3/.test(l)), 'should print session total');
     } finally {
-      err.restore();
+      out.restore();
     }
   });
 
-  it('cmdExport exits when direct pool access is unavailable', async () => {
-    const err = captureConsole('error');
+  it('cmdExport calls exportSessions and writes JSONL to stdout', async () => {
+    const out = captureConsole('log');
     try {
-      const code = await captureExit(() => cliPrivate.cmdExport({ _config: {}, _pool: null }, { flags: {} }));
-      assert.equal(code, 1);
-      assert.match(err.calls[0], /Export requires direct pool access/);
+      const aquifer = {
+        async exportSessions() {
+          return [{ session_id: 'sid-x', agent_id: 'a1', source: 'api', started_at: null, msg_count: 2, processing_status: 'succeeded', summary_text: null, structured_summary: null }];
+        },
+      };
+      // cmdExport writes to process.stdout directly, so we just check it resolves without throwing
+      await cliPrivate.cmdExport(aquifer, { flags: {} });
     } finally {
-      err.restore();
+      out.restore();
     }
   });
 });
@@ -549,7 +561,7 @@ describe('consumers/shared/factory.js', () => {
     assert.equal(poolOptions.connectionString, 'postgres://example/db');
     assert.equal(embedderConfig.provider, 'ollama');
     assert.equal(embedderConfig.ollamaUrl, 'http://ollama.local:11434');
-    assert.equal(aquifer._config.tenantId, 'tenant-x');
+    assert.equal(aquifer.receivedConfig.tenantId, 'tenant-x');
   });
 
   it('does not create an llm function when llm.model is missing', () => {

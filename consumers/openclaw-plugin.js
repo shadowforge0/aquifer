@@ -1,11 +1,17 @@
 'use strict';
 
 /**
- * Aquifer Memory — OpenClaw Plugin
+ * Aquifer Memory — OpenClaw Host Adapter
  *
- * Auto-captures sessions on before_reset and provides session_recall tool.
+ * Ingest adapter: auto-captures sessions on before_reset.
+ * Tool adapter: exposes session_recall/session_feedback via OpenClaw registerTool().
+ *
+ * Status: COMPATIBILITY ONLY. The official tool delivery path is mcp.servers.aquifer
+ * (see consumers/mcp.js). registerTool() exposure has OpenClaw upstream limitations
+ * that prevent reliable tool visibility. This plugin is retained for before_reset
+ * session capture; tool registration code is kept for future upstream fixes.
+ *
  * Install: add to openclaw.json plugins or extensions directory.
- *
  * Config via plugin config, environment variables, or aquifer.config.json.
  */
 
@@ -169,6 +175,10 @@ module.exports = {
             } catch (enrichErr) {
               api.logger.warn(`[aquifer-memory] enrich failed for ${sessionId}: ${enrichErr.message}`);
             }
+          } else {
+            try {
+              await aquifer.skip(sessionId, { agentId, reason: `user_count=${norm.userCount} < min=${minUserMessages}` });
+            } catch (e) { api.logger.warn(`[aquifer-memory] skip failed for ${sessionId}: ${e.message}`); }
           }
 
           recentlyProcessed.set(dedupKey, Date.now());
@@ -189,8 +199,6 @@ module.exports = {
 
     // --- session_recall tool ---
 
-    // --- session_recall tool ---
-
     api.registerTool((ctx) => {
       if ((ctx?.sessionKey || '').includes('subagent')) return null;
 
@@ -208,6 +216,7 @@ module.exports = {
             dateTo: { type: 'string', description: 'End date YYYY-MM-DD' },
             entities: { type: 'array', items: { type: 'string' }, description: 'Entity names to match' },
             entityMode: { type: 'string', enum: ['any', 'all'], description: '"any" (default, boost) or "all" (only sessions with every entity)' },
+            mode: { type: 'string', enum: ['fts', 'hybrid', 'vector'], description: 'Recall mode: "fts" (keyword only), "hybrid" (default), "vector" (vector only)' },
           },
           required: ['query'],
         },
@@ -225,6 +234,7 @@ module.exports = {
               recallOpts.entities = params.entities;
               recallOpts.entityMode = params.entityMode || 'any';
             }
+            if (params.mode) recallOpts.mode = params.mode;
 
             const results = await aquifer.recall(params.query, recallOpts);
             const text = formatRecallResults(results);
@@ -253,14 +263,17 @@ module.exports = {
             sessionId: { type: 'string', description: 'Session ID to give feedback on' },
             verdict: { type: 'string', enum: ['helpful', 'unhelpful'], description: 'Was the recalled session useful?' },
             note: { type: 'string', description: 'Optional reason' },
+            agentId: { type: 'string', description: 'Agent ID the session was stored under (e.g. "main"). Defaults to context agent or "agent" if omitted.' },
           },
           required: ['sessionId', 'verdict'],
         },
         async execute(_toolCallId, params) {
           try {
+            const resolvedAgentId = params.agentId || ctx?.agentId || undefined;
             const result = await aquifer.feedback(params.sessionId, {
               verdict: params.verdict,
               note: params.note || undefined,
+              agentId: resolvedAgentId,
             });
             return {
               content: [{ type: 'text', text: `Feedback: ${result.verdict} (trust ${result.trustBefore.toFixed(2)} → ${result.trustAfter.toFixed(2)})` }],

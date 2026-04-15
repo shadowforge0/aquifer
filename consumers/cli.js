@@ -14,7 +14,6 @@
  */
 
 const { createAquiferFromConfig } = require('./shared/factory');
-const { loadConfig } = require('./shared/config');
 
 // ---------------------------------------------------------------------------
 // Argument parser (minimal, no deps)
@@ -120,30 +119,12 @@ async function cmdBackfill(aquifer, args) {
   const skipTurnEmbed = !!args.flags['skip-turn-embed'];
   const skipEntities = !!args.flags['skip-entities'];
 
-  const config = aquifer._config || {};
-  const schema = config.schema || 'aquifer';
-  const tenantId = config.tenantId || 'default';
-  const pool = aquifer._pool;
+  const pending = await aquifer.getPendingSessions({ limit });
 
-  if (!pool) {
-    console.error('Backfill requires direct pool access.');
-    process.exit(1);
-  }
-
-  const qi = (id) => `"${id}"`;
-  const { rows } = await pool.query(`
-    SELECT session_id, agent_id, processing_status
-    FROM ${qi(schema)}.sessions
-    WHERE tenant_id = $1
-      AND processing_status IN ('pending', 'failed')
-    ORDER BY started_at DESC
-    LIMIT $2
-  `, [tenantId, limit]);
-
-  console.log(`Found ${rows.length} sessions to backfill${dryRun ? ' (dry-run)' : ''}`);
+  console.log(`Found ${pending.length} sessions to backfill${dryRun ? ' (dry-run)' : ''}`);
 
   let enriched = 0, failed = 0;
-  for (const row of rows) {
+  for (const row of pending) {
     if (dryRun) {
       console.log(`  [dry-run] ${row.session_id} (${row.agent_id}) status=${row.processing_status}`);
       continue;
@@ -164,40 +145,12 @@ async function cmdBackfill(aquifer, args) {
     }
   }
 
-  console.log(`\nDone. enriched=${enriched} failed=${failed} total=${rows.length}`);
+  console.log(`\nDone. enriched=${enriched} failed=${failed} total=${pending.length}`);
   if (failed > 0) process.exitCode = 2;
 }
 
 async function cmdStats(aquifer, args) {
-  const config = aquifer._config || {};
-  const schema = config.schema || 'aquifer';
-  const tenantId = config.tenantId || 'default';
-  const pool = aquifer._pool;
-
-  if (!pool) {
-    console.error('Stats requires direct pool access.');
-    process.exit(1);
-  }
-
-  const qi = (id) => `"${id}"`;
-  const [sessions, summaries, turns, entities] = await Promise.all([
-    pool.query(`SELECT processing_status, COUNT(*)::int as count FROM ${qi(schema)}.sessions WHERE tenant_id = $1 GROUP BY processing_status`, [tenantId]),
-    pool.query(`SELECT COUNT(*)::int as count FROM ${qi(schema)}.session_summaries WHERE tenant_id = $1`, [tenantId]),
-    pool.query(`SELECT COUNT(*)::int as count FROM ${qi(schema)}.turn_embeddings WHERE tenant_id = $1`, [tenantId]),
-    pool.query(`SELECT COUNT(*)::int as count FROM ${qi(schema)}.entities WHERE tenant_id = $1`, [tenantId]).catch(() => ({ rows: [{ count: 0 }] })),
-  ]);
-
-  const timeRange = await pool.query(`SELECT MIN(started_at) as earliest, MAX(started_at) as latest FROM ${qi(schema)}.sessions WHERE tenant_id = $1`, [tenantId]);
-
-  const stats = {
-    sessions: Object.fromEntries(sessions.rows.map(r => [r.processing_status, r.count])),
-    sessionTotal: sessions.rows.reduce((s, r) => s + r.count, 0),
-    summaries: summaries.rows[0]?.count || 0,
-    turnEmbeddings: turns.rows[0]?.count || 0,
-    entities: entities.rows[0]?.count || 0,
-    earliest: timeRange.rows[0]?.earliest || null,
-    latest: timeRange.rows[0]?.latest || null,
-  };
+  const stats = await aquifer.getStats();
 
   if (args.flags.json) {
     console.log(JSON.stringify(stats, null, 2));
@@ -211,34 +164,14 @@ async function cmdStats(aquifer, args) {
 }
 
 async function cmdExport(aquifer, args) {
-  const config = aquifer._config || {};
-  const schema = config.schema || 'aquifer';
-  const tenantId = config.tenantId || 'default';
-  const pool = aquifer._pool;
   const output = args.flags.output || null;
   const limit = parseInt(args.flags.limit || '1000', 10);
 
-  if (!pool) {
-    console.error('Export requires direct pool access.');
-    process.exit(1);
-  }
-
-  const qi = (id) => `"${id}"`;
-  const where = [`s.tenant_id = $1`];
-  const params = [tenantId];
-
-  if (args.flags['agent-id']) { params.push(args.flags['agent-id']); where.push(`s.agent_id = $${params.length}`); }
-  if (args.flags.source) { params.push(args.flags.source); where.push(`s.source = $${params.length}`); }
-  params.push(limit);
-
-  const { rows } = await pool.query(`
-    SELECT s.*, ss.summary_text, ss.structured_summary
-    FROM ${qi(schema)}.sessions s
-    LEFT JOIN ${qi(schema)}.session_summaries ss ON ss.session_row_id = s.id
-    WHERE ${where.join(' AND ')}
-    ORDER BY s.started_at DESC
-    LIMIT $${params.length}
-  `, params);
+  const rows = await aquifer.exportSessions({
+    agentId: args.flags['agent-id'],
+    source: args.flags.source,
+    limit,
+  });
 
   const stream = output ? require('fs').createWriteStream(output) : process.stdout;
   for (const row of rows) {
@@ -340,7 +273,7 @@ Options:
         process.exit(1);
     }
   } finally {
-    if (aquifer._pool) await aquifer._pool.end();
+    await aquifer.close();
   }
 }
 

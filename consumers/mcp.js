@@ -2,7 +2,12 @@
 'use strict';
 
 /**
- * Aquifer MCP Server — session_recall tool via Model Context Protocol.
+ * Aquifer MCP Server — canonical external contract for agent host integration.
+ *
+ * This is the primary integration surface for Aquifer. Agent hosts (Claude Code,
+ * Codex, OpenCode, etc.) should integrate through this MCP server.
+ *
+ * Tools: session_recall, session_feedback, memory_stats, memory_pending
  *
  * Usage:
  *   npx aquifer mcp
@@ -69,7 +74,7 @@ async function main() {
 
   const server = new McpServer({
     name: 'aquifer-memory',
-    version: '0.6.0',
+    version: '0.8.0',
   });
 
   server.tool(
@@ -84,6 +89,7 @@ async function main() {
       dateTo: z.string().optional().describe('End date YYYY-MM-DD'),
       entities: z.array(z.string()).optional().describe('Entity names to match'),
       entityMode: z.enum(['any', 'all']).optional().describe('"any" (default, boost) or "all" (only sessions with every entity)'),
+      mode: z.enum(['fts', 'hybrid', 'vector']).optional().describe('Recall mode: "fts" (keyword only, no embed needed), "hybrid" (default, FTS + vector), "vector" (vector only)'),
     },
     async (params) => {
       try {
@@ -100,6 +106,7 @@ async function main() {
           recallOpts.entities = params.entities;
           recallOpts.entityMode = params.entityMode || 'any';
         }
+        if (params.mode) recallOpts.mode = params.mode;
 
         const results = await aquifer.recall(params.query, recallOpts);
         const text = formatResults(results, params.query);
@@ -120,6 +127,7 @@ async function main() {
       sessionId: z.string().min(1).describe('Session ID to give feedback on'),
       verdict: z.enum(['helpful', 'unhelpful']).describe('Was the recalled session useful?'),
       note: z.string().optional().describe('Optional reason'),
+      agentId: z.string().optional().describe('Agent ID the session was stored under (e.g. "main"). Defaults to "agent" if omitted.'),
     },
     async (params) => {
       try {
@@ -127,6 +135,7 @@ async function main() {
         const result = await aquifer.feedback(params.sessionId, {
           verdict: params.verdict,
           note: params.note || undefined,
+          agentId: params.agentId || undefined,
         });
         return {
           content: [{ type: 'text', text: `Feedback: ${result.verdict} (trust ${result.trustBefore.toFixed(2)} → ${result.trustAfter.toFixed(2)})` }],
@@ -140,9 +149,64 @@ async function main() {
     }
   );
 
+  server.tool(
+    'memory_stats',
+    'Return storage statistics for the Aquifer memory store (session counts by status, summaries, turn embeddings, entities, date range).',
+    {},
+    async () => {
+      try {
+        const aquifer = getAquifer();
+        const stats = await aquifer.getStats();
+        const lines = [
+          `Sessions: ${stats.sessionTotal} total`,
+        ];
+        for (const [status, count] of Object.entries(stats.sessions)) {
+          lines.push(`  ${status}: ${count}`);
+        }
+        lines.push(`Summaries: ${stats.summaries}`);
+        lines.push(`Turn embeddings: ${stats.turnEmbeddings}`);
+        lines.push(`Entities: ${stats.entities}`);
+        if (stats.earliest) lines.push(`Date range: ${new Date(stats.earliest).toISOString().slice(0, 10)} → ${new Date(stats.latest).toISOString().slice(0, 10)}`);
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+      } catch (err) {
+        return {
+          content: [{ type: 'text', text: `memory_stats error: ${err.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    'memory_pending',
+    'List sessions with pending or failed processing status.',
+    {
+      limit: z.number().int().min(1).max(200).optional().describe('Max results (default 20)'),
+    },
+    async (params) => {
+      try {
+        const aquifer = getAquifer();
+        const rows = await aquifer.getPendingSessions({ limit: params.limit ?? 20 });
+        if (rows.length === 0) {
+          return { content: [{ type: 'text', text: 'No pending or failed sessions.' }] };
+        }
+        const lines = [`${rows.length} pending/failed session(s):\n`];
+        for (const row of rows) {
+          lines.push(`${row.session_id}  [${row.processing_status}]  agent=${row.agent_id}`);
+        }
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+      } catch (err) {
+        return {
+          content: [{ type: 'text', text: `memory_pending error: ${err.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
   // Graceful shutdown
   const cleanup = async () => {
-    if (_aquifer?._pool) await _aquifer._pool.end().catch(() => {});
+    if (_aquifer) await _aquifer.close().catch(() => {});
     process.exit(0);
   };
   process.on('SIGINT', cleanup);
@@ -153,7 +217,7 @@ async function main() {
 
   // Clean up pool when transport closes (stdin EOF)
   transport.onclose = async () => {
-    if (_aquifer?._pool) await _aquifer._pool.end().catch(() => {});
+    if (_aquifer) await _aquifer.close().catch(() => {});
   };
 }
 

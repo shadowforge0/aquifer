@@ -33,10 +33,10 @@ const DEFAULTS = {
   rank: { rrf: 0.65, timeDecay: 0.25, access: 0.10, entityBoost: 0.18 },
   rerank: {
     enabled: false,
-    provider: null,    // 'tei' | 'jina' | 'custom'
+    provider: null,    // 'tei' | 'jina' | 'openrouter' | 'custom'
     baseUrl: null,     // TEI base URL
-    apiKey: null,      // Jina API key
-    model: null,       // Jina model override
+    apiKey: null,      // Jina / OpenRouter API key
+    model: null,       // model override (Jina / OpenRouter)
     topK: 20,
     maxChars: 1600,
     timeoutMs: 2000,

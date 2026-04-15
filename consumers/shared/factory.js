@@ -71,12 +71,18 @@ function createAquiferFromConfig(overrides) {
       if (rc.model) rerankConfig.jinaModel = rc.model;
       rerankConfig.timeout = rc.timeoutMs || 2000;
       rerankConfig.maxRetries = rc.maxRetries ?? 1;
+    } else if (rc.provider === 'openrouter') {
+      rerankConfig.openrouterApiKey = rc.apiKey;
+      if (rc.model) rerankConfig.model = rc.model;
+      rerankConfig.timeout = rc.timeoutMs || 5000;
+      rerankConfig.maxRetries = rc.maxRetries ?? 1;
     }
     rerankOpts = rerankConfig;
   }
 
   const aquifer = createAquifer({
     db: pool,
+    ownsPool: true,
     schema: config.schema,
     tenantId: config.tenantId,
     embed: embedFn ? { fn: embedFn, dim: config.embed.dim || null } : null,
@@ -85,10 +91,6 @@ function createAquiferFromConfig(overrides) {
     rank: config.rank,
     rerank: rerankOpts,
   });
-
-  // Attach pool for lifecycle management
-  aquifer._pool = pool;
-  aquifer._config = config;
 
   return aquifer;
 }
