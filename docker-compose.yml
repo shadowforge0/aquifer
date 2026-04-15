@@ -1,0 +1,53 @@
+# Aquifer local development stack
+# Usage: docker compose up -d
+# Provides PostgreSQL 16 + pgvector and Ollama with bge-m3 for embeddings.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: aquifer
+      POSTGRES_PASSWORD: aquifer
+      POSTGRES_DB: aquifer
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aquifer"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  ollama:
+    image: ollama/ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Pulls bge-m3 after Ollama is healthy — runs once then exits.
+  ollama-pull:
+    image: ollama/ollama
+    depends_on:
+      ollama:
+        condition: service_healthy
+    entrypoint: ["ollama", "pull", "bge-m3"]
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    restart: "no"
+
+volumes:
+  pgdata:
+  ollama:
+
+# After starting:
+#   export DATABASE_URL="postgresql://aquifer:aquifer@localhost:5432/aquifer"
+#   export AQUIFER_EMBED_BASE_URL="http://localhost:11434/v1"
+#   export AQUIFER_EMBED_MODEL="bge-m3"
+#   npx aquifer quickstart

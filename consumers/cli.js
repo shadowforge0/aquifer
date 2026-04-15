@@ -5,6 +5,7 @@
  * Aquifer CLI
  *
  * Usage:
+ *   aquifer quickstart                  Verify end-to-end setup
  *   aquifer migrate                     Run database migrations
  *   aquifer recall <query> [options]    Search sessions
  *   aquifer backfill [options]          Enrich pending sessions
@@ -163,6 +164,64 @@ async function cmdStats(aquifer, args) {
   }
 }
 
+async function cmdQuickstart(aquifer) {
+  console.log('Aquifer quickstart — verifying end-to-end setup.\n');
+
+  // 1. Migrate
+  console.log('1/5  Running migrations...');
+  await aquifer.migrate();
+  console.log('     OK\n');
+
+  // 2. Commit
+  const sessionId = `quickstart-${Date.now()}`;
+  console.log('2/5  Committing test session...');
+  await aquifer.commit(sessionId, [
+    { role: 'user', content: 'We decided to use PostgreSQL with pgvector for the AI memory store instead of a separate vector database.' },
+    { role: 'assistant', content: 'Good choice. PG gives us ACID transactions, full-text search, and vector similarity all in one place.' },
+    { role: 'user', content: 'The main advantage is turn-level embedding — we can find the exact moment a decision was made.' },
+  ], { agentId: 'quickstart', source: 'quickstart' });
+  console.log('     OK\n');
+
+  // 3. Enrich (skip summary — LLM may not be configured)
+  console.log('3/5  Enriching (turn embeddings)...');
+  const enrichResult = await aquifer.enrich(sessionId, {
+    agentId: 'quickstart',
+    skipSummary: true,
+    skipEntities: true,
+  });
+  console.log(`     OK — ${enrichResult.turnsEmbedded} turns embedded\n`);
+
+  // 4. Recall
+  console.log('4/5  Recalling "PostgreSQL memory store"...');
+  const results = await aquifer.recall('PostgreSQL memory store', { limit: 3 });
+  if (results.length === 0) {
+    console.error('     FAIL — no results returned. Check your embedding config.');
+    process.exitCode = 1;
+    return;
+  }
+  console.log(`     OK — ${results.length} result(s), top score: ${results[0].score?.toFixed(3)}`);
+  if (results[0].matchedTurnText) {
+    console.log(`     Matched: "${results[0].matchedTurnText.slice(0, 100)}..."`);
+  }
+  console.log();
+
+  // 5. Cleanup
+  console.log('5/5  Cleaning up test data...');
+  const { Pool } = require('pg');
+  const { loadConfig } = require('./shared/config');
+  const config = loadConfig();
+  const pool = new Pool({ connectionString: config.db.url });
+  const schema = config.schema || 'aquifer';
+  await pool.query(`DELETE FROM ${schema}.turn_embeddings WHERE session_id IN (SELECT id FROM ${schema}.sessions WHERE session_id = $1)`, [sessionId]);
+  await pool.query(`DELETE FROM ${schema}.session_summaries WHERE session_id IN (SELECT id FROM ${schema}.sessions WHERE session_id = $1)`, [sessionId]);
+  await pool.query(`DELETE FROM ${schema}.sessions WHERE session_id = $1`, [sessionId]);
+  await pool.end();
+  console.log('     OK\n');
+
+  console.log('✓ Aquifer is working. You can now start the MCP server:');
+  console.log('  npx aquifer mcp');
+}
+
 async function cmdExport(aquifer, args) {
   const output = args.flags.output || null;
   const limit = parseInt(args.flags.limit || '1000', 10);
@@ -201,6 +260,7 @@ async function main() {
     console.log(`Usage: aquifer <command> [options]
 
 Commands:
+  quickstart                  Verify end-to-end setup (migrate → commit → enrich → recall)
   migrate                     Run database migrations
   recall <query>              Search sessions (requires embed config)
   feedback                    Record trust feedback on a session
@@ -250,6 +310,9 @@ Options:
 
   try {
     switch (command) {
+      case 'quickstart':
+        await cmdQuickstart(aquifer);
+        break;
       case 'migrate':
         await cmdMigrate(aquifer);
         break;

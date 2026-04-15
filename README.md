@@ -32,7 +32,7 @@ Sessions, summaries, turn-level embeddings, entity graph — all live in one dat
 | **Ranking** | 3-way RRF: FTS + session embedding + turn embedding | Single vector similarity |
 | **Knowledge graph** | Built-in entity extraction & co-occurrence | Usually separate system |
 | **Multi-tenant** | `tenant_id` on every table, day-1 | Often an afterthought |
-| **Dependencies** | Just `pg` | Multiple SDKs |
+| **Dependencies** | `pg` + MCP SDK | Multiple SDKs |
 
 ### Before and after
 
@@ -48,79 +48,149 @@ Sessions, summaries, turn-level embeddings, entity graph — all live in one dat
 
 ---
 
-## Quick Start
+## Requirements
 
-### Prerequisites
+| Component | Required? | Purpose | Example |
+|-----------|-----------|---------|---------|
+| Node.js >= 18 | Yes | Runtime | — |
+| PostgreSQL 15+ | Yes | Storage for sessions, summaries, entities | Local, Docker, or managed |
+| pgvector extension | Yes | Vector similarity search | `CREATE EXTENSION vector;` (included in `pgvector/pgvector` Docker image) |
+| Embedding endpoint | Yes (for recall) | Turn + session embedding | Ollama `bge-m3`, OpenAI `text-embedding-3-small`, any OpenAI-compatible API |
+| LLM endpoint | Optional | Built-in summarization during `enrich` | Ollama, OpenRouter, OpenAI — or provide your own `summaryFn` |
+| `@modelcontextprotocol/sdk` + `zod` | Yes (for MCP server) | MCP protocol runtime | Included in dependencies — installed automatically |
 
-- Node.js >= 18
-- PostgreSQL 15+ with [pgvector](https://github.com/pgvector/pgvector) extension
-- An embedding API (OpenAI, Ollama, or any OpenAI-compatible endpoint)
+---
 
-### Install
+## Quick Start (MCP Server)
+
+This gets you from zero to a working MCP memory server. For library API usage, see [API Reference](#api-reference) below.
+
+### 1. Start the stack
+
+```bash
+docker compose up -d
+# Starts PostgreSQL 16 + pgvector and Ollama with bge-m3 (auto-pulled).
+# First run takes a few minutes while Ollama downloads the model.
+```
+
+Already have PostgreSQL + pgvector and an embedding endpoint? Skip this step.
+
+### 2. Install
 
 ```bash
 npm install @shadowforge0/aquifer-memory
 ```
 
-### Initialize
+### 3. Configure + verify
 
-```javascript
-const { createAquifer } = require('@shadowforge0/aquifer-memory');
+```bash
+export DATABASE_URL="postgresql://aquifer:aquifer@localhost:5432/aquifer"
+export AQUIFER_EMBED_BASE_URL="http://localhost:11434/v1"
+export AQUIFER_EMBED_MODEL="bge-m3"
 
-const aquifer = createAquifer({
-  db: 'postgresql://user:pass@localhost:5432/mydb',  // connection string or pg.Pool
-  schema: 'memory',                    // PG schema name (default: 'aquifer')
-  tenantId: 'default',                 // multi-tenant isolation
-  embed: {
-    fn: async (texts) => embeddings,   // your embedding function
-    dim: 1024,                         // optional dimension hint
-  },
-  llm: {
-    fn: async (prompt) => text,        // your LLM function (for built-in summarize)
-  },
-  entities: {
-    enabled: true,
-    scope: 'my-app',                   // entity namespace (default: 'default')
-  },
-});
-
-// Run migrations (safe to call multiple times)
-await aquifer.migrate();
+npx aquifer quickstart
 ```
 
-### Write path: commit + enrich
+`quickstart` runs migrations, commits a test session, embeds it, recalls it, and cleans up. If it prints `✓ Aquifer is working`, you're done.
 
-```javascript
-// 1. Store the session
-await aquifer.commit('conv-001', [
-  { role: 'user', content: 'Let me tell you about our new auth approach...' },
-  { role: 'assistant', content: 'Got it. So the plan is...' },
-], { agentId: 'main' });
+### 4. Start the MCP server
 
-// 2. Enrich: summarize + embed turns + extract entities
-const result = await aquifer.enrich('conv-001', {
-  agentId: 'main',
-  // Optional: bring your own summarize pipeline
-  summaryFn: async (msgs) => ({ summaryText, structuredSummary, entityRaw }),
-  entityParseFn: (text) => [{ name, normalizedName, type, aliases }],
-  // Optional: post-commit hook for downstream processing
-  postProcess: async (ctx) => {
-    // ctx contains session, summary, embedding, parsedEntities, etc.
-  },
-});
+```bash
+npx aquifer mcp
 ```
 
-### Read path: recall
+See [.env.example](.env.example) for all env vars, or [docs/setup.md](docs/setup.md) for the full setup guide.
 
-```javascript
-const results = await aquifer.recall('auth middleware decision', {
-  agentId: 'main',
-  limit: 5,
-  entities: ['auth-middleware'],       // optional: entity-aware search
-  entityMode: 'all',                   // 'any' (boost) or 'all' (hard filter)
-});
-// Returns ranked sessions with scores, using 3-way RRF fusion
+---
+
+## Environment Variables
+
+| Variable | Required? | Purpose | Example |
+|----------|-----------|---------|---------|
+| `DATABASE_URL` | Yes | PostgreSQL connection string | `postgresql://user:pass@localhost:5432/mydb` |
+| `AQUIFER_SCHEMA` | No | PG schema name (default: `aquifer`) | `memory` |
+| `AQUIFER_TENANT_ID` | No | Multi-tenant key (default: `default`) | `my-app` |
+| `AQUIFER_EMBED_BASE_URL` | Yes (for recall) | Embedding API base URL | `http://localhost:11434/v1` |
+| `AQUIFER_EMBED_MODEL` | Yes (for recall) | Embedding model name | `bge-m3` |
+| `AQUIFER_EMBED_API_KEY` | Provider-dependent | API key for hosted embedding providers | `sk-...` |
+| `AQUIFER_EMBED_DIM` | No | Embedding dimension override (auto-detected) | `1024` |
+| `AQUIFER_LLM_BASE_URL` | No | LLM API base URL (for built-in summarization) | `http://localhost:11434/v1` |
+| `AQUIFER_LLM_MODEL` | No | LLM model name | `llama3.1` |
+| `AQUIFER_LLM_API_KEY` | Provider-dependent | API key for hosted LLM providers | `sk-...` |
+| `AQUIFER_ENTITIES_ENABLED` | No | Enable knowledge graph (default: `false`) | `true` |
+| `AQUIFER_ENTITY_SCOPE` | No | Entity namespace (default: `default`) | `my-app` |
+| `AQUIFER_RERANK_ENABLED` | No | Enable cross-encoder reranking | `true` |
+| `AQUIFER_RERANK_PROVIDER` | No | Reranker provider: `tei`, `jina`, `openrouter` | `tei` |
+| `AQUIFER_RERANK_BASE_URL` | No | Reranker endpoint | `http://localhost:8080` |
+| `AQUIFER_AGENT_ID` | No | Default agent ID | `main` |
+
+Full env-to-config mapping is in [consumers/shared/config.js](consumers/shared/config.js).
+
+---
+
+## Host Integration
+
+MCP is the primary integration surface. Agent hosts connect to the Aquifer MCP server, which exposes four tools: `session_recall`, `session_feedback`, `memory_stats`, `memory_pending`.
+
+| Integration | Route | Status | When to use |
+|-------------|-------|--------|-------------|
+| MCP server | `consumers/mcp.js` | Primary | Claude Code, OpenClaw, Codex, any MCP-capable host |
+| Library API | `createAquifer()` | Primary | Backend apps, custom pipelines, direct Node.js usage |
+| CLI | `consumers/cli.js` | Secondary | Operations, debugging, manual recall/backfill |
+| OpenClaw plugin | `consumers/openclaw-plugin.js` | Compatibility only | Session capture via `before_reset` — not for tool delivery |
+
+### Claude Code
+
+Add to your project's `.claude.json` or user-level MCP config:
+
+```json
+{
+  "mcpServers": {
+    "aquifer": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["/path/to/aquifer/consumers/mcp.js"],
+      "env": {
+        "DATABASE_URL": "postgresql://...",
+        "AQUIFER_EMBED_BASE_URL": "http://localhost:11434/v1",
+        "AQUIFER_EMBED_MODEL": "bge-m3"
+      }
+    }
+  }
+}
 ```
+
+Tools appear as `mcp__aquifer__session_recall`, `mcp__aquifer__session_feedback`, etc.
+
+### OpenClaw
+
+Add to `openclaw.json` under `mcp.servers`:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "aquifer": {
+        "command": "node",
+        "args": ["/path/to/aquifer/consumers/mcp.js"],
+        "env": {
+          "DATABASE_URL": "postgresql://...",
+          "AQUIFER_EMBED_BASE_URL": "http://localhost:11434/v1",
+          "AQUIFER_EMBED_MODEL": "bge-m3"
+        }
+      }
+    }
+  }
+}
+```
+
+Tools materialize as `aquifer__session_recall`, `aquifer__session_feedback`, `aquifer__memory_stats`, `aquifer__memory_pending` (server name prefix added by the host).
+
+The OpenClaw plugin (`consumers/openclaw-plugin.js`) is retained for session capture via `before_reset` but is **not** the recommended tool delivery path. Use MCP.
+
+### Other MCP-capable hosts
+
+Any host that supports MCP stdio can connect the same way — point it at `node consumers/mcp.js` with the required env vars. The MCP server is the canonical external contract.
 
 ---
 
@@ -160,8 +230,6 @@ const results = await aquifer.recall('auth middleware decision', {
     │  003-trust-feedback.sql (trust)  │
     └──────────────────────────────────┘
 ```
-
-**Integration model:** MCP is the primary integration surface. Agent hosts connect to Aquifer through the MCP server (`consumers/mcp.js`), which exposes `session_recall`, `session_feedback`, `memory_stats`, and `memory_pending`. The CLI wraps the same engine for command-line use. The OpenClaw plugin (`consumers/openclaw-plugin.js`) is retained as a compatibility adapter for session capture but is not the primary tool delivery path.
 
 ### File Reference
 
@@ -375,7 +443,9 @@ Closes the PostgreSQL connection pool (only if Aquifer created it).
 
 ## Configuration
 
-Aquifer takes a `db` connection (string or `pg.Pool`), plus optional `embed` and `llm` functions:
+Aquifer resolves config from three sources in priority order: config file → environment variables → programmatic overrides. See [consumers/shared/config.js](consumers/shared/config.js) for the full env-to-config mapping.
+
+Config file is auto-discovered at `aquifer.config.json` in the working directory, or set `AQUIFER_CONFIG=/path/to/config.json`.
 
 ```javascript
 createAquifer({
@@ -409,61 +479,6 @@ createAquifer({
 
 Fallback chain: `config.entities.scope` → `'default'`.
 
-### MCP Server (primary integration)
-
-Agent hosts should connect through the Aquifer MCP server. For OpenClaw, add to `openclaw.json`:
-
-```json
-{
-  "mcp": {
-    "servers": {
-      "aquifer": {
-        "command": "node",
-        "args": ["/path/to/aquifer/consumers/mcp.js"],
-        "env": {
-          "DATABASE_URL": "postgresql://...",
-          "AQUIFER_SCHEMA": "aquifer",
-          "AQUIFER_EMBED_BASE_URL": "http://localhost:11434/v1",
-          "AQUIFER_EMBED_MODEL": "bge-m3"
-        }
-      }
-    }
-  }
-}
-```
-
-Tools are exposed as `aquifer__session_recall`, `aquifer__session_feedback`, `aquifer__memory_stats`, `aquifer__memory_pending` (server name prefix is added by the host).
-
-For Claude Code, add to `.claude.json`:
-
-```json
-{
-  "mcpServers": {
-    "aquifer": {
-      "type": "stdio",
-      "command": "node",
-      "args": ["/path/to/aquifer/consumers/mcp.js"]
-    }
-  }
-}
-```
-
-### CLI (secondary)
-
-For command-line use with environment variables:
-
-```bash
-export DATABASE_URL="postgresql://..."
-export AQUIFER_EMBED_BASE_URL="http://localhost:11434/v1"
-export AQUIFER_EMBED_MODEL="bge-m3"
-export AQUIFER_ENTITIES_ENABLED=true
-
-aquifer migrate
-aquifer recall "search query" --limit 5
-aquifer backfill --concurrency 3
-aquifer stats --json
-```
-
 ---
 
 ## Database Schema
@@ -477,6 +492,8 @@ aquifer stats --json
 | `turn_embeddings` | Per-turn user message embeddings for precise retrieval |
 
 Key indexes: GIN on messages, GiST on `tsvector`, ivfflat on embeddings, B-tree on tenant/agent/timestamps.
+
+Note: the schema uses basic ivfflat indexes suitable for development and moderate-scale use. For large deployments (100k+ embeddings), consider adding HNSW indexes — this is a future optimization area, not included out of the box.
 
 ### 002-entities.sql
 
@@ -499,15 +516,29 @@ Also adds `trust_score` column to `session_summaries` (default 0.5, range 0–1)
 
 ---
 
+## Troubleshooting
+
+**`error: type "vector" does not exist`** — pgvector extension is not installed. Run `CREATE EXTENSION IF NOT EXISTS vector;` as a superuser, or use the `pgvector/pgvector` Docker image which includes it.
+
+**`aquifer mcp requires @modelcontextprotocol/sdk and zod`** — These are now regular dependencies and should be installed automatically. If you see this error, run `npm install` again to ensure all deps are present.
+
+**Recall returns no results** — Make sure you've run `enrich` after `commit`. Raw sessions are not searchable until enriched (summarized + embedded). Check `aquifer stats` to see if summaries and turn embeddings exist.
+
+**OpenClaw tools not visible** — Use `mcp.servers.aquifer` in `openclaw.json`, not the plugin. Tools appear as `aquifer__session_recall` etc. The plugin (`consumers/openclaw-plugin.js`) is for session capture only.
+
+**Embedding provider connection refused** — Verify your `AQUIFER_EMBED_BASE_URL` is reachable. For local Ollama, make sure the server is running and the model is pulled (`ollama pull bge-m3`).
+
+---
+
 ## Dependencies
 
 | Package | Purpose |
 |---------|---------|
 | `pg` ≥ 8.13 | PostgreSQL client |
+| `@modelcontextprotocol/sdk` ≥ 1.29 | MCP server protocol |
+| `zod` ≥ 3.25 | Schema validation (MCP tools) |
 
-That's it. Aquifer has **one runtime dependency**.
-
-LLM and embedding calls use raw HTTP — no SDK required.
+LLM and embedding calls use raw HTTP — no additional SDK required.
 
 ---
 

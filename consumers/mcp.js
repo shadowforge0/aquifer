@@ -67,7 +67,7 @@ async function main() {
   } catch (e) {
     process.stderr.write(
       'aquifer mcp requires @modelcontextprotocol/sdk and zod.\n' +
-      'Install: npm install @modelcontextprotocol/sdk zod\n'
+      'These should be installed automatically. Try: npm install\n'
     );
     process.exit(1);
   }

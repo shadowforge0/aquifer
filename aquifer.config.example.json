@@ -1,0 +1,29 @@
+{
+  "db": {
+    "url": "postgresql://user:password@localhost:5432/mydb",
+    "max": 10
+  },
+  "schema": "aquifer",
+  "tenantId": "default",
+  "defaults": {
+    "agentId": "main",
+    "source": "api"
+  },
+  "embed": {
+    "baseUrl": "http://localhost:11434/v1",
+    "model": "bge-m3",
+    "dim": null
+  },
+  "llm": {
+    "baseUrl": null,
+    "model": null
+  },
+  "entities": {
+    "enabled": false,
+    "scope": "default"
+  },
+  "rerank": {
+    "enabled": false,
+    "provider": null
+  }
+}
