@@ -610,6 +610,80 @@ aliases:`;
     assert.equal(result.summary, null);
     assert.ok(result.turnsEmbedded >= 1, 'expected turn embeddings even with skipSummary');
   });
+
+  it('customSummaryFn 拋錯 → session 不卡 processing，標 partial', async () => {
+    // 驗什麼：pre-transaction summary failure 要收斂到 partial，不能讓
+    //   session 卡在 processing 等 stale 回收。
+    // 為什麼重要：operator 看不到錯誤會誤以為 enrich 正常。
+    await aq.commit('sid-sumfail', [{ role: 'user', content: 'keyword will fail.' }]);
+
+    const throwingFn = async () => { throw new Error('mock summary failure'); };
+    await aq.enrich('sid-sumfail', { summaryFn: throwingFn, skipTurnEmbed: true });
+
+    const row = await pool.query(
+      `SELECT processing_status, processing_error FROM "${schema}".sessions WHERE session_id = $1`,
+      ['sid-sumfail']
+    );
+    assert.notEqual(row.rows[0].processing_status, 'processing',
+      'session must not be stuck in processing');
+    assert.equal(row.rows[0].processing_status, 'partial');
+    assert.match(row.rows[0].processing_error || '', /summary/i);
+  });
+
+  it('concurrent enrich 同一個 session → 第二個拋 "already being enriched"', async () => {
+    // 驗什麼：claim UPDATE 是 race-safe，同一 session 不會被兩個 worker 同時處理。
+    // 為什麼重要：防重複寫入 / 資料錯亂。
+    await aq.commit('sid-concurrent', [{ role: 'user', content: 'keyword concurrent.' }]);
+
+    const slowFn = async () => {
+      await new Promise(r => setTimeout(r, 100));
+      return { summaryText: 'keyword done.' };
+    };
+
+    const [r1, r2] = await Promise.allSettled([
+      aq.enrich('sid-concurrent', { summaryFn: slowFn, skipTurnEmbed: true }),
+      new Promise(r => setTimeout(r, 10))
+        .then(() => aq.enrich('sid-concurrent', { summaryFn: slowFn, skipTurnEmbed: true })),
+    ]);
+
+    const fulfilled = [r1, r2].filter(r => r.status === 'fulfilled');
+    const rejected = [r1, r2].filter(r => r.status === 'rejected');
+    assert.equal(fulfilled.length, 1, 'exactly one enrich should succeed');
+    assert.equal(rejected.length, 1, 'exactly one enrich should be rejected');
+    assert.match(rejected[0].reason.message, /already being enriched/);
+  });
+
+  it('staleEnrichMinutes config 讓舊的 processing 可被 reclaim', async () => {
+    // 驗什麼：staleEnrichMinutes=1 + processing_started_at 在 5 min 前 → 第二次 enrich 可 reclaim。
+    // 為什麼重要：崩掉的 worker 留下的 processing session 不能永久卡住。
+    await aq.commit('sid-stale', [{ role: 'user', content: 'keyword stale.' }]);
+    await pool.query(
+      `UPDATE "${schema}".sessions
+         SET processing_status = 'processing',
+             processing_started_at = NOW() - INTERVAL '5 minutes'
+         WHERE session_id = $1`,
+      ['sid-stale']
+    );
+
+    const aqShort = createAquifer({
+      db: DB_URL, schema, tenantId: 'test',
+      embed: { fn: makeFakeEmbed() },
+      staleEnrichMinutes: 1,
+    });
+    try {
+      await aqShort.enrich('sid-stale', {
+        summaryFn: makeFakeSummaryFn({ summaryText: 'keyword reclaimed.' }),
+        skipTurnEmbed: true,
+      });
+      const row = await pool.query(
+        `SELECT processing_status FROM "${schema}".sessions WHERE session_id = $1`,
+        ['sid-stale']
+      );
+      assert.equal(row.rows[0].processing_status, 'succeeded');
+    } finally {
+      await aqShort.close();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
