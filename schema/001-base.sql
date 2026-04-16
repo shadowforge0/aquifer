@@ -113,6 +113,10 @@ BEGIN
       RAISE NOTICE '[aquifer] HNSW index on session_summaries.embedding deferred; re-run migrate() after the first embedded row';
     WHEN feature_not_supported THEN
       RAISE NOTICE '[aquifer] HNSW not available on this pgvector; upgrade to >= 0.5.0 for index-accelerated vector search';
+    WHEN out_of_memory THEN
+      RAISE WARNING '[aquifer] HNSW build on session_summaries.embedding ran out of memory; raise maintenance_work_mem and re-run migrate()';
+    WHEN program_limit_exceeded THEN
+      RAISE WARNING '[aquifer] HNSW build on session_summaries.embedding exceeded an internal limit; inspect pgvector logs';
   END;
 END$$;
 
@@ -216,5 +220,9 @@ BEGIN
       RAISE NOTICE '[aquifer] HNSW index on turn_embeddings.embedding deferred; re-run migrate() after the first embedded row';
     WHEN feature_not_supported THEN
       RAISE NOTICE '[aquifer] HNSW not available on this pgvector; upgrade to >= 0.5.0 for index-accelerated vector search';
+    WHEN out_of_memory THEN
+      RAISE WARNING '[aquifer] HNSW build on turn_embeddings.embedding ran out of memory; raise maintenance_work_mem and re-run migrate()';
+    WHEN program_limit_exceeded THEN
+      RAISE WARNING '[aquifer] HNSW build on turn_embeddings.embedding exceeded an internal limit; inspect pgvector logs';
   END;
 END$$;
