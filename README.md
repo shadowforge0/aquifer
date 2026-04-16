@@ -130,13 +130,14 @@ Full env-to-config mapping is in [consumers/shared/config.js](consumers/shared/c
 
 ## Host Integration
 
-MCP is the primary integration surface. Agent hosts connect to the Aquifer MCP server, which exposes four tools: `session_recall`, `session_feedback`, `memory_stats`, `memory_pending`.
+MCP is the primary integration surface. Agent hosts connect to the Aquifer MCP server, which exposes five tools: `session_recall`, `session_feedback`, `session_bootstrap`, `memory_stats`, `memory_pending`.
 
 | Integration | Route | Status | When to use |
 |-------------|-------|--------|-------------|
 | MCP server | `consumers/mcp.js` | Primary | Claude Code, OpenClaw, Codex, any MCP-capable host |
 | Library API | `createAquifer()` | Primary | Backend apps, custom pipelines, direct Node.js usage |
-| CLI | `consumers/cli.js` | Secondary | Operations, debugging, manual recall/backfill |
+| CLI | `consumers/cli.js` | Secondary | Operations, debugging, manual recall/backfill (`aquifer bootstrap`, `aquifer ingest-opencode`, etc.) |
+| OpenCode ingest | `consumers/opencode.js` | Secondary | Import sessions from OpenCode's SQLite DB |
 | OpenClaw plugin | `consumers/openclaw-plugin.js` | Compatibility only | Session capture via `before_reset` — not for tool delivery |
 
 ### Claude Code
@@ -160,7 +161,7 @@ Add to your project's `.claude.json` or user-level MCP config:
 }
 ```
 
-Tools appear as `mcp__aquifer__session_recall`, `mcp__aquifer__session_feedback`, etc.
+Tools appear as `mcp__aquifer__session_recall`, `mcp__aquifer__session_feedback`, `mcp__aquifer__session_bootstrap`, etc.
 
 ### OpenClaw
 
@@ -184,7 +185,7 @@ Add to `openclaw.json` under `mcp.servers`:
 }
 ```
 
-Tools materialize as `aquifer__session_recall`, `aquifer__session_feedback`, `aquifer__memory_stats`, `aquifer__memory_pending` (server name prefix added by the host).
+Tools materialize as `aquifer__session_recall`, `aquifer__session_feedback`, `aquifer__session_bootstrap`, `aquifer__memory_stats`, `aquifer__memory_pending` (server name prefix added by the host).
 
 The OpenClaw plugin (`consumers/openclaw-plugin.js`) is retained for session capture via `before_reset` but is **not** the recommended tool delivery path. Use MCP.
 
@@ -245,6 +246,7 @@ Any host that supports MCP stdio can connect the same way — point it at `node 
 | `pipeline/extract-entities.js` | LLM-powered entity extraction (12 types) |
 | `pipeline/rerank.js` | Cross-encoder reranking (TEI, Jina, OpenRouter) |
 | `pipeline/normalize/` | Session normalization for Claude Code / gateway noise |
+| `consumers/opencode.js` | OpenCode SQLite ingest — reads sessions from OpenCode's local DB |
 | `schema/001-base.sql` | DDL: sessions, summaries, turn_embeddings, FTS indexes |
 | `schema/002-entities.sql` | DDL: entities, mentions, relations, entity_sessions |
 | `schema/003-trust-feedback.sql` | DDL: trust_score column, session_feedback audit trail |
@@ -434,6 +436,24 @@ await aquifer.feedback('session-id', {
   note: 'reason',
 });
 ```
+
+#### `aquifer.bootstrap(opts)`
+
+Loads recent session context for a new conversation — summaries, open loops, and decisions. Time-based (no embedding search), designed for session-start injection.
+
+```javascript
+const result = await aquifer.bootstrap({
+  agentId: 'main',
+  limit: 5,              // max sessions (default: 5)
+  lookbackDays: 14,      // how far back (default: 14)
+  maxChars: 4000,        // max output chars (default: 4000)
+  format: 'text',        // 'text', 'structured', or 'both'
+});
+// format='text': result.text contains XML block ready for injection
+// format='structured': result.sessions, result.openLoops, result.recentDecisions
+```
+
+Cross-session dedup on open loops and decisions, sentinel filtering (removes 無/none/n/a), and maxChars truncation.
 
 #### `aquifer.close()`
 
