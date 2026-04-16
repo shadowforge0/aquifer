@@ -918,7 +918,6 @@ function createAquifer(config) {
     },
 
     async getSessionFull(sessionId) {
-      // Try to find the session across agents by querying directly
       const result = await pool.query(
         `SELECT * FROM ${qi(schema)}.sessions
         WHERE session_id = $1 AND tenant_id = $2
@@ -928,24 +927,15 @@ function createAquifer(config) {
       const session = result.rows[0];
       if (!session) return null;
 
-      const [segResult, sumResult] = await Promise.all([
-        pool.query(
-          `SELECT * FROM ${qi(schema)}.session_segments
-          WHERE session_row_id = $1
-          ORDER BY segment_no ASC`,
-          [session.id]
-        ),
-        pool.query(
-          `SELECT * FROM ${qi(schema)}.session_summaries
-          WHERE session_row_id = $1
-          LIMIT 1`,
-          [session.id]
-        ),
-      ]);
+      const sumResult = await pool.query(
+        `SELECT * FROM ${qi(schema)}.session_summaries
+        WHERE session_row_id = $1
+        LIMIT 1`,
+        [session.id]
+      );
 
       return {
         session,
-        segments: segResult.rows,
         summary: sumResult.rows[0] || null,
       };
     },

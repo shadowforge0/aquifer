@@ -97,44 +97,6 @@ async function upsertSession(pool, {
 }
 
 // ---------------------------------------------------------------------------
-// upsertSegments
-// ---------------------------------------------------------------------------
-
-async function upsertSegments(pool, sessionRowId, segments, { schema } = {}) {
-  if (!segments || segments.length === 0) return;
-  for (const seg of segments) {
-    await pool.query(
-      `INSERT INTO ${qi(schema)}.session_segments
-        (session_row_id, segment_no, start_msg_idx, end_msg_idx,
-         started_at, ended_at, raw_msg_count, effective_msg_count,
-         boundary_type, boundary_meta)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-      ON CONFLICT (session_row_id, segment_no) DO UPDATE SET
-        start_msg_idx = EXCLUDED.start_msg_idx,
-        end_msg_idx = EXCLUDED.end_msg_idx,
-        started_at = EXCLUDED.started_at,
-        ended_at = EXCLUDED.ended_at,
-        raw_msg_count = EXCLUDED.raw_msg_count,
-        effective_msg_count = EXCLUDED.effective_msg_count,
-        boundary_type = EXCLUDED.boundary_type,
-        boundary_meta = EXCLUDED.boundary_meta`,
-      [
-        sessionRowId,
-        seg.segmentNo,
-        seg.startMsgIdx !== null && seg.startMsgIdx !== undefined ? seg.startMsgIdx : null,
-        seg.endMsgIdx !== null && seg.endMsgIdx !== undefined ? seg.endMsgIdx : null,
-        seg.startedAt || null,
-        seg.endedAt || null,
-        seg.rawMsgCount || 0,
-        seg.effectiveMsgCount || 0,
-        seg.boundaryType || null,
-        seg.boundaryMeta ? JSON.stringify(seg.boundaryMeta) : '{}',
-      ]
-    );
-  }
-}
-
-// ---------------------------------------------------------------------------
 // upsertSummary
 // ---------------------------------------------------------------------------
 
@@ -159,9 +121,8 @@ async function upsertSummary(pool, sessionRowId, {
     `INSERT INTO ${qi(schema)}.session_summaries
       (session_row_id, tenant_id, agent_id, session_id, summary_version, model, source_hash,
        message_count, user_message_count, assistant_message_count,
-       boundary_count, fresh_tail_count,
        started_at, ended_at, structured_summary, summary_text, embedding, updated_at)
-    VALUES ($1,$2,$3,$4,1,$5,$6,$7,$8,$9,0,0,$10,$11,COALESCE($12::jsonb,'{}'::jsonb),COALESCE($13,''),$14::vector,now())
+    VALUES ($1,$2,$3,$4,1,$5,$6,$7,$8,$9,$10,$11,COALESCE($12::jsonb,'{}'::jsonb),COALESCE($13,''),$14::vector,now())
     ON CONFLICT (session_row_id) DO UPDATE SET
       tenant_id = EXCLUDED.tenant_id,
       agent_id = EXCLUDED.agent_id,
@@ -212,50 +173,6 @@ async function markStatus(pool, sessionRowId, status, error, { schema } = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// persistProcessingResults (@internal — prefer aquifer.enrich() for full pipeline)
-// ---------------------------------------------------------------------------
-
-async function persistProcessingResults(pool, sessionRowId, {
-  schema,
-  segments,
-  summaryText,
-  structuredSummary,
-  agentId,
-  sessionId,
-  tenantId,
-  model,
-  sourceHash,
-  msgCount,
-  userCount,
-  assistantCount,
-  startedAt,
-  endedAt,
-  embedding,
-}) {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    if (segments) await upsertSegments(client, sessionRowId, segments, { schema });
-    await upsertSummary(client, sessionRowId, {
-      schema, tenantId, agentId, sessionId, summaryText,
-      structuredSummary, model, sourceHash,
-      msgCount, userCount, assistantCount,
-      startedAt, endedAt, embedding,
-    });
-    await markStatus(client, sessionRowId, 'succeeded', null, { schema });
-    await client.query('COMMIT');
-  } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
-    try {
-      await markStatus(pool, sessionRowId, 'failed', err.message, { schema });
-    } catch (_) { /* swallow */ }
-    throw err;
-  } finally {
-    client.release();
-  }
-}
-
-// ---------------------------------------------------------------------------
 // getSession
 // ---------------------------------------------------------------------------
 
@@ -280,36 +197,6 @@ async function getSession(pool, sessionId, agentId, options = {}, { schema, tena
     [sessionId, agentId, tid, source]
   );
   return result.rows[0] || null;
-}
-
-// ---------------------------------------------------------------------------
-// getSessionFull
-// ---------------------------------------------------------------------------
-
-async function getSessionFull(pool, sessionId, agentId, { schema, tenantId } = {}) {
-  const session = await getSession(pool, sessionId, agentId, { tenantId }, { schema, tenantId });
-  if (!session) return null;
-
-  const [segResult, sumResult] = await Promise.all([
-    pool.query(
-      `SELECT * FROM ${qi(schema)}.session_segments
-      WHERE session_row_id = $1
-      ORDER BY segment_no ASC`,
-      [session.id]
-    ),
-    pool.query(
-      `SELECT * FROM ${qi(schema)}.session_summaries
-      WHERE session_row_id = $1
-      LIMIT 1`,
-      [session.id]
-    ),
-  ]);
-
-  return {
-    session,
-    segments: segResult.rows,
-    summary: sumResult.rows[0] || null,
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -414,7 +301,7 @@ async function recordAccess(pool, sessionRowIds, { schema } = {}) {
   if (!sessionRowIds || sessionRowIds.length === 0) return;
   await pool.query(
     `UPDATE ${qi(schema)}.session_summaries
-    SET access_count = access_count + 1, last_accessed_at = now()
+    SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = now()
     WHERE session_row_id = ANY($1)`,
     [sessionRowIds]
   );
@@ -643,12 +530,9 @@ async function recordFeedback(pool, {
 
 module.exports = {
   upsertSession,
-  upsertSegments,
   upsertSummary,
   markStatus,
-  persistProcessingResults,
   getSession,
-  getSessionFull,
   getMessages,
   searchSessions,
   recordAccess,
