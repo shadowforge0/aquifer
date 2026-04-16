@@ -236,7 +236,7 @@ Any host that supports MCP stdio can connect the same way — point it at `node 
 
 | File | Purpose |
 |------|---------|
-| `index.js` | Entry point — exports `createAquifer`, `createEmbedder`, `createReranker`, `normalizeSession` |
+| `index.js` | Entry point — exports `createAquifer`, `createEmbedder`, `createReranker` |
 | `core/aquifer.js` | Main facade: `migrate()`, `ingest()`, `recall()`, `enrich()` |
 | `core/storage.js` | Session/summary/turn CRUD, FTS search, embedding search |
 | `core/entity.js` | Entity upsert, mention tracking, relation graph, normalization |
@@ -408,7 +408,7 @@ const result = await aquifer.enrich('session-001', {
 // Returns: { summary, turnsEmbedded, entitiesFound, warnings, effectiveModel, postProcessError }
 ```
 
-**postProcess hook**: runs after transaction commit, receives full context (session, summary, embedding, parsedEntities, etc.). Best-effort, at-most-once.
+**postProcess hook**: runs after transaction commit, receives full context (session, summary, embedding, parsedEntities, etc.). Best-effort, at-most-once. If the hook throws, the error is captured and returned as `postProcessError` on the enrich result — the session itself remains committed and is not retried.
 
 #### `aquifer.recall(query, opts)`
 
