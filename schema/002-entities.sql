@@ -28,10 +28,24 @@ CREATE TABLE IF NOT EXISTS ${schema}.entities (
   last_seen_at    TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
 
--- Migration: add entity_scope if missing (idempotent)
--- For upgrades: backfill from agent_id so existing data keeps its scope
+-- Migration: add entity_scope if missing (idempotent, scope-corruption-safe).
+-- For upgrades: backfill from agent_id ONLY on the first run of this migration,
+-- detected via the column still being NULL-able. Once SET NOT NULL below fires,
+-- subsequent runs skip the backfill so operator-assigned 'default' values are
+-- never clobbered.
 ALTER TABLE ${schema}.entities ADD COLUMN IF NOT EXISTS entity_scope TEXT DEFAULT 'default';
-UPDATE ${schema}.entities SET entity_scope = agent_id WHERE entity_scope IS NULL OR entity_scope = 'default';
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = '${schema}' AND table_name = 'entities'
+      AND column_name = 'entity_scope' AND is_nullable = 'YES'
+  ) THEN
+    UPDATE ${schema}.entities
+      SET entity_scope = agent_id
+      WHERE entity_scope IS NULL OR entity_scope = 'default';
+  END IF;
+END$$;
 ALTER TABLE ${schema}.entities ALTER COLUMN entity_scope SET NOT NULL;
 
 -- Unique constraint: entity identity is (tenant, name, scope)

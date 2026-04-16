@@ -92,6 +92,12 @@ function createAquifer(config) {
   // Summarize config
   const summarizePromptFn = config.summarize && config.summarize.prompt ? config.summarize.prompt : null;
 
+  // Enrich stale-claim window: a 'processing' session older than this is
+  // reclaimable by a concurrent enrich() caller (covers crashed workers).
+  const staleEnrichMinutes = Number.isFinite(config.staleEnrichMinutes)
+    ? Math.max(1, Math.floor(config.staleEnrichMinutes))
+    : 10;
+
   // Entity config
   let entitiesEnabled = config.entities && config.entities.enabled === true;
   const mergeCall = config.entities && config.entities.mergeCall !== undefined ? config.entities.mergeCall : true;
@@ -302,17 +308,19 @@ function createAquifer(config) {
       const postProcess = opts.postProcess || null;  // async (ctx) => void
       const optModel = 'model' in opts ? opts.model : undefined; // undefined = no override
 
-      // 1. Optimistic lock: claim session for processing
-      //    Also reclaim stale 'processing' sessions (stuck > 10 min = likely killed process)
-      const STALE_MINUTES = 10;
+      // 1. Optimistic lock: claim session for processing.
+      //    Also reclaim stale 'processing' sessions (likely killed worker).
+      //    Stale window is config.staleEnrichMinutes (default 10).
       const claimResult = await pool.query(
         `UPDATE ${qi(schema)}.sessions
         SET processing_status = 'processing', processing_started_at = NOW()
         WHERE session_id = $1 AND agent_id = $2 AND tenant_id = $3
           AND (processing_status IN ('pending', 'failed')
-               OR (processing_status = 'processing' AND (processing_started_at IS NULL OR processing_started_at < NOW() - INTERVAL '${STALE_MINUTES} minutes')))
+               OR (processing_status = 'processing'
+                   AND (processing_started_at IS NULL
+                        OR processing_started_at < NOW() - make_interval(mins => $4))))
         RETURNING *`,
-        [sessionId, agentId, tenantId]
+        [sessionId, agentId, tenantId, staleEnrichMinutes]
       );
       const session = claimResult.rows[0];
       if (!session) {
@@ -333,34 +341,46 @@ function createAquifer(config) {
       // 2. Extract user turns
       const turns = storage.extractUserTurns(normalized);
 
+      // Collected across pre-tx and tx phases; any non-empty warnings demote
+      // the final status from 'succeeded' to 'partial' (see step 8 below).
+      const warnings = [];
+
       // 3. Summarize (custom or built-in)
       let summaryResult = null;
       let entityRaw = null;
       let extra = null;
 
       if (!skipSummary && normalized.length > 0) {
-        if (customSummaryFn) {
-          // Custom pipeline: caller handles LLM call and parsing
-          summaryResult = await customSummaryFn(normalized);
-          if (summaryResult.entityRaw) entityRaw = summaryResult.entityRaw;
-          if (summaryResult.extra) extra = summaryResult.extra;
-        } else {
-          // Built-in pipeline
-          const doMergeEntities = entitiesEnabled && mergeCall && !skipEntities;
-          summaryResult = await summarize(normalized, {
-            llmFn,
-            promptFn: summarizePromptFn,
-            mergeEntities: doMergeEntities,
-          });
-          if (summaryResult.entityRaw) {
-            entityRaw = summaryResult.entityRaw;
+        // Pre-transaction failures (customSummaryFn / summarize throws) would
+        // otherwise bubble out and leave the session stuck in 'processing'
+        // until stale reclaim. Capture as a warning so status ends 'partial',
+        // keeping parity with how embed/entity-extract failures are treated.
+        try {
+          if (customSummaryFn) {
+            // Custom pipeline: caller handles LLM call and parsing
+            summaryResult = await customSummaryFn(normalized);
+            if (summaryResult && summaryResult.entityRaw) entityRaw = summaryResult.entityRaw;
+            if (summaryResult && summaryResult.extra) extra = summaryResult.extra;
+          } else {
+            // Built-in pipeline
+            const doMergeEntities = entitiesEnabled && mergeCall && !skipEntities;
+            summaryResult = await summarize(normalized, {
+              llmFn,
+              promptFn: summarizePromptFn,
+              mergeEntities: doMergeEntities,
+            });
+            if (summaryResult.entityRaw) {
+              entityRaw = summaryResult.entityRaw;
+            }
           }
+        } catch (e) {
+          warnings.push(`summary step failed: ${e.message}`);
+          summaryResult = null;
         }
       }
 
       // 4. Pre-compute all LLM/embed results BEFORE opening transaction
       //    (avoids holding pool connection during slow LLM/embed calls)
-      const warnings = [];
       let summaryEmbedding = null;
       let turnVectors = null;
       let parsedEntities = [];
@@ -494,7 +514,11 @@ function createAquifer(config) {
         await client.query('ROLLBACK').catch(() => {});
         try {
           await storage.markStatus(pool, session.id, 'failed', err.message, { schema });
-        } catch { /* swallow */ }
+        } catch (markErr) {
+          // Secondary failure: session is stuck in 'processing' until stale reclaim.
+          // Surface so operators notice and don't silently rely on the timeout.
+          console.warn(`[aquifer] enrich failed for session ${sessionId} AND markStatus('failed') also failed: ${markErr.message}`);
+        }
         throw err;
       } finally {
         client.release();

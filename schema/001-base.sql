@@ -101,9 +101,20 @@ CREATE INDEX IF NOT EXISTS idx_summaries_embedding
 
 -- HNSW approximate nearest-neighbor index for cosine-distance vector search.
 -- Without this, ORDER BY embedding <=> $vec degrades to seq scan at scale.
--- Requires pgvector >= 0.5.0.
-CREATE INDEX IF NOT EXISTS idx_summaries_embedding_hnsw
-  ON ${schema}.session_summaries USING hnsw (embedding vector_cosine_ops);
+-- Requires pgvector >= 0.5.0. HNSW cannot build on an empty unsized `vector`
+-- column (can't infer dim), so we defer on failure — re-running migrate()
+-- after the first insert will finish the job.
+DO $$
+BEGIN
+  BEGIN
+    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_summaries_embedding_hnsw ON ${schema}.session_summaries USING hnsw (embedding vector_cosine_ops)';
+  EXCEPTION
+    WHEN invalid_parameter_value THEN
+      RAISE NOTICE '[aquifer] HNSW index on session_summaries.embedding deferred; re-run migrate() after the first embedded row';
+    WHEN feature_not_supported THEN
+      RAISE NOTICE '[aquifer] HNSW not available on this pgvector; upgrade to >= 0.5.0 for index-accelerated vector search';
+  END;
+END$$;
 
 -- FTS trigger: auto-update search_tsv on INSERT/UPDATE
 CREATE OR REPLACE FUNCTION ${schema}.session_summaries_search_tsv_update()
@@ -158,8 +169,12 @@ $$;
 DROP TRIGGER IF EXISTS trg_session_summaries_search_tsv
   ON ${schema}.session_summaries;
 
+-- Trigger fires on input-column changes only. search_text is a trigger output
+-- (derived from structured_summary + summary_text) and listing it here was
+-- redundant — PG's BEFORE semantics already prevent the assignment inside the
+-- trigger body from re-firing the trigger.
 CREATE TRIGGER trg_session_summaries_search_tsv
-  BEFORE INSERT OR UPDATE OF summary_text, structured_summary, search_text
+  BEFORE INSERT OR UPDATE OF summary_text, structured_summary
   ON ${schema}.session_summaries
   FOR EACH ROW
   EXECUTE FUNCTION ${schema}.session_summaries_search_tsv_update();
@@ -191,5 +206,15 @@ CREATE INDEX IF NOT EXISTS idx_turn_emb_tenant_agent
   ON ${schema}.turn_embeddings (tenant_id, agent_id, source);
 
 -- HNSW approximate nearest-neighbor index for turn-level vector search.
-CREATE INDEX IF NOT EXISTS idx_turn_emb_embedding_hnsw
-  ON ${schema}.turn_embeddings USING hnsw (embedding vector_cosine_ops);
+-- See notes on session_summaries.embedding HNSW above.
+DO $$
+BEGIN
+  BEGIN
+    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_turn_emb_embedding_hnsw ON ${schema}.turn_embeddings USING hnsw (embedding vector_cosine_ops)';
+  EXCEPTION
+    WHEN invalid_parameter_value THEN
+      RAISE NOTICE '[aquifer] HNSW index on turn_embeddings.embedding deferred; re-run migrate() after the first embedded row';
+    WHEN feature_not_supported THEN
+      RAISE NOTICE '[aquifer] HNSW not available on this pgvector; upgrade to >= 0.5.0 for index-accelerated vector search';
+  END;
+END$$;

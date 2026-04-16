@@ -149,13 +149,14 @@ describe('enrich stale reclaim', () => {
   };
 
   function makeEnrichPool({ claimReturns, lookupRow } = {}) {
-    const captured = { claimSql: null };
+    const captured = { claimSql: null, claimParams: null };
     return {
       captured,
-      async query(sql, _params) {
+      async query(sql, params) {
         // Claim UPDATE
         if (sql.includes('SET processing_status') && sql.includes('RETURNING')) {
           captured.claimSql = sql;
+          captured.claimParams = params;
           return { rows: claimReturns ? [claimRow] : [] };
         }
         // getSession lookup fallback
@@ -188,7 +189,29 @@ describe('enrich stale reclaim', () => {
     assert.ok(sql.includes("'failed'"), 'handles failed');
     assert.ok(sql.includes("processing_status = 'processing'"), 'handles stale processing');
     assert.ok(sql.includes('processing_started_at IS NULL'), 'handles null started_at');
-    assert.ok(sql.includes('10 minutes'), 'uses 10 minute threshold');
+    assert.ok(sql.includes('make_interval(mins =>'), 'uses bound interval param');
+    assert.equal(pool.captured.claimParams[3], 10, 'defaults to 10 minute threshold');
+  });
+
+  it('staleEnrichMinutes config overrides default', async () => {
+    const pool = makeEnrichPool({ claimReturns: true });
+    const aq = createAquifer({ db: pool, schema: 'aq', tenantId: 't', staleEnrichMinutes: 30 });
+    await aq.enrich('sid', { agentId: 'a', skipSummary: true, skipTurnEmbed: true, skipEntities: true });
+    assert.equal(pool.captured.claimParams[3], 30);
+  });
+
+  it('staleEnrichMinutes clamps non-finite to default', async () => {
+    const pool = makeEnrichPool({ claimReturns: true });
+    const aq = createAquifer({ db: pool, schema: 'aq', tenantId: 't', staleEnrichMinutes: 'bad' });
+    await aq.enrich('sid', { agentId: 'a', skipSummary: true, skipTurnEmbed: true, skipEntities: true });
+    assert.equal(pool.captured.claimParams[3], 10);
+  });
+
+  it('staleEnrichMinutes floors to 1', async () => {
+    const pool = makeEnrichPool({ claimReturns: true });
+    const aq = createAquifer({ db: pool, schema: 'aq', tenantId: 't', staleEnrichMinutes: 0 });
+    await aq.enrich('sid', { agentId: 'a', skipSummary: true, skipTurnEmbed: true, skipEntities: true });
+    assert.equal(pool.captured.claimParams[3], 1);
   });
 
   it('reclaim succeeds for stale processing session', async () => {
