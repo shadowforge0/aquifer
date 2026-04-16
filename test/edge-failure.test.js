@@ -878,20 +878,20 @@ describe('summarize.js — summarize', () => {
     assert.ok(r.summaryText.includes('hello'));
   });
 
-  it('llmFn returning non-string: isExtractive=false (BUG: no fallback)', async () => {
+  it('llmFn returning non-string triggers extractive fallback', async () => {
     const r = await summarize([{ role: 'user', content: 'hello' }], {
       llmFn: async () => null,
     });
-    assert.strictEqual(r.isExtractive, false);
-    assert.strictEqual(r.summaryText, null);
+    assert.strictEqual(r.isExtractive, true);
+    assert.ok(r.summaryText.includes('hello'));
   });
 
-  it('llmFn returning empty string: isExtractive=false (BUG: no fallback)', async () => {
+  it('llmFn returning empty string triggers extractive fallback', async () => {
     const r = await summarize([{ role: 'user', content: 'hello' }], {
       llmFn: async () => '',
     });
-    assert.strictEqual(r.isExtractive, false);
-    assert.strictEqual(r.summaryText, '');
+    assert.strictEqual(r.isExtractive, true);
+    assert.ok(r.summaryText.includes('hello'));
   });
 
   it('successful LLM response is parsed', async () => {

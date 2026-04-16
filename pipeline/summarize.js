@@ -206,6 +206,9 @@ async function summarize(messages, {
   try {
     const prompt = buildPrompt(messages, { mergeEntities });
     const response = await llmFn(prompt);
+    if (typeof response !== 'string' || response.trim() === '') {
+      return extractiveFallback(messages);
+    }
 
     // Parse structured fields
     const structuredSummary = _parseStructuredSummary(response);
@@ -232,7 +235,7 @@ async function summarize(messages, {
       entityRaw,
       isExtractive: false,
     };
-  } catch (err) {
+  } catch {
     // LLM failure: fall back to extractive
     return extractiveFallback(messages);
   }
