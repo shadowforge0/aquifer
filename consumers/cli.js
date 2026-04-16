@@ -43,7 +43,7 @@ function parsePositiveInt(value, fallback) {
 function parseArgs(argv) {
   const args = { _: [], flags: {} };
   // Flags that take a value (not boolean)
-  const VALUE_FLAGS = new Set(['limit', 'agent-id', 'source', 'date-from', 'date-to', 'output', 'format', 'config', 'status', 'concurrency', 'entities', 'entity-mode', 'session-id', 'verdict', 'note']);
+  const VALUE_FLAGS = new Set(['limit', 'agent-id', 'source', 'date-from', 'date-to', 'output', 'format', 'config', 'status', 'concurrency', 'entities', 'entity-mode', 'session-id', 'verdict', 'note', 'db', 'since', 'min-messages', 'lookback-days', 'max-chars']);
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--') { args._.push(...argv.slice(i + 1)); break; }
     if (argv[i].startsWith('--')) {
@@ -252,6 +252,30 @@ async function cmdQuickstart(aquifer) {
   console.log('  npx aquifer mcp');
 }
 
+async function cmdBootstrap(aquifer, args) {
+  const result = await aquifer.bootstrap({
+    agentId: args.flags['agent-id'] || undefined,
+    source: args.flags.source || undefined,
+    limit: parsePositiveInt(args.flags.limit, 5),
+    lookbackDays: parsePositiveInt(args.flags['lookback-days'], 14),
+    maxChars: parsePositiveInt(args.flags['max-chars'], 4000),
+    format: args.flags.json ? 'structured' : 'text',
+  });
+
+  if (args.flags.json) {
+    console.log(JSON.stringify(result, null, 2));
+  } else {
+    if (result.text) {
+      console.log(result.text);
+    } else {
+      // structured without text — format it
+      const { formatBootstrapText } = require('../core/aquifer');
+      const { text } = formatBootstrapText(result, result.meta?.maxChars || 4000);
+      console.log(text);
+    }
+  }
+}
+
 async function cmdExport(aquifer, args) {
   const output = args.flags.output || null;
   const limit = parsePositiveInt(args.flags.limit, 1000);
@@ -297,6 +321,8 @@ Commands:
   backfill                    Enrich pending sessions
   stats                       Show database statistics
   export                      Export sessions as JSONL
+  bootstrap                   Show recent session context (for new session start)
+  ingest-opencode             Import sessions from OpenCode's local SQLite DB
   mcp                         Start MCP server
 
 Options:
@@ -313,7 +339,12 @@ Options:
   --json                      JSON output
   --dry-run                   Preview only (backfill)
   --output PATH               Output file (export)
-  --config PATH               Config file path`);
+  --config PATH               Config file path
+  --lookback-days N           How far back in days (bootstrap, default: 14)
+  --max-chars N               Max output characters (bootstrap, default: 4000)
+  --db PATH                   OpenCode SQLite path (ingest-opencode)
+  --since YYYY-MM-DD          Only ingest sessions after date (ingest-opencode)
+  --min-messages N            Min user messages to ingest (ingest-opencode, default: 3)`);
     process.exit(0);
   }
 
@@ -361,6 +392,14 @@ Options:
       case 'export':
         await cmdExport(aquifer, args);
         break;
+      case 'bootstrap':
+        await cmdBootstrap(aquifer, args);
+        break;
+      case 'ingest-opencode': {
+        const { ingestOpenCode } = require('./opencode');
+        await ingestOpenCode(aquifer, args);
+        break;
+      }
       default:
         console.error(`Unknown command: ${command}. Run 'aquifer --help' for usage.`);
         process.exit(1);

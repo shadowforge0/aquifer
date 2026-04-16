@@ -387,6 +387,7 @@ describe('consumers/cli.js', () => {
     assert.deepEqual(calls, ['BEGIN', 'DELETE FROM "aq_test".sessions WHERE tenant_id = $1 AND agent_id = $2 AND session_id = $3', 'ROLLBACK']);
     assert.equal(ended, true);
   });
+
 });
 
 describe('consumers/mcp.js', () => {

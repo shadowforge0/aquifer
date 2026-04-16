@@ -208,6 +208,35 @@ async function main() {
     }
   );
 
+  server.tool(
+    'session_bootstrap',
+    'Load recent session context for a new conversation. Returns summaries, open items, and decisions from recent sessions. Call this at the start of a conversation for continuity; use session_recall for keyword search.',
+    {
+      agentId: z.string().optional().describe('Filter by agent ID'),
+      limit: z.number().int().min(1).max(20).optional().describe('Max sessions (default 5)'),
+      lookbackDays: z.number().int().min(1).max(90).optional().describe('How far back in days (default 14)'),
+      maxChars: z.number().int().min(500).max(12000).optional().describe('Max output characters (default 4000)'),
+    },
+    async (params) => {
+      try {
+        const aquifer = getAquifer();
+        const result = await aquifer.bootstrap({
+          agentId: params.agentId,
+          limit: params.limit,
+          lookbackDays: params.lookbackDays,
+          maxChars: params.maxChars,
+          format: 'text',
+        });
+        return { content: [{ type: 'text', text: result.text }] };
+      } catch (err) {
+        return {
+          content: [{ type: 'text', text: `session_bootstrap error: ${err.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
   // Graceful shutdown
   const cleanup = async () => {
     if (_aquifer) await _aquifer.close().catch(() => {});

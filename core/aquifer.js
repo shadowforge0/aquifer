@@ -1036,13 +1036,164 @@ function createAquifer(config) {
       );
       return result.rows;
     },
+
+    async bootstrap(opts = {}) {
+      await ensureMigrated();
+
+      const agentId = opts.agentId || null;
+      const source = opts.source || null;
+      const limit = Math.max(1, Math.min(20, opts.limit || 5));
+      const lookbackDays = opts.lookbackDays || 14;
+      const maxChars = opts.maxChars || 4000;
+      const format = opts.format || 'structured';
+
+      const where = [`s.tenant_id = $1`, `s.processing_status = 'succeeded'`];
+      const params = [tenantId];
+
+      if (agentId) {
+        params.push(agentId);
+        where.push(`s.agent_id = $${params.length}`);
+      }
+      if (source) {
+        params.push(source);
+        where.push(`s.source = $${params.length}`);
+      }
+
+      params.push(lookbackDays);
+      where.push(`s.started_at > now() - ($${params.length} || ' days')::interval`);
+
+      params.push(limit);
+
+      const result = await pool.query(
+        `SELECT s.session_id, s.agent_id, s.source, s.started_at, s.msg_count,
+                ss.summary_text, ss.structured_summary
+         FROM ${qi(schema)}.sessions s
+         JOIN ${qi(schema)}.session_summaries ss ON ss.session_row_id = s.id
+         WHERE ${where.join(' AND ')}
+         ORDER BY s.started_at DESC
+         LIMIT $${params.length}`,
+        params
+      );
+
+      const sessions = result.rows.map(r => {
+        const ss = r.structured_summary || {};
+        const hasSS = ss.title || ss.overview;
+        return {
+          sessionId: r.session_id,
+          agentId: r.agent_id,
+          source: r.source,
+          startedAt: r.started_at,
+          title: ss.title || (hasSS ? null : (r.summary_text || '').slice(0, 60).trim() || null),
+          overview: ss.overview || (hasSS ? null : (r.summary_text || '').slice(0, 200).trim() || null),
+          topics: Array.isArray(ss.topics) ? ss.topics : [],
+          decisions: Array.isArray(ss.decisions) ? ss.decisions : [],
+          openLoops: Array.isArray(ss.open_loops) ? ss.open_loops : [],
+          importantFacts: Array.isArray(ss.important_facts) ? ss.important_facts : [],
+        };
+      });
+
+      // Cross-session open loops merge + dedup + sentinel filter
+      const SENTINELS = new Set(['無', 'none', 'n/a', 'na', 'done', '']);
+      const seenLoops = new Set();
+      const openLoops = [];
+      for (const s of sessions) {
+        for (const loop of s.openLoops) {
+          const raw = typeof loop === 'string' ? loop : (loop.item || '');
+          const normalized = raw.trim().replace(/\s+/g, ' ').toLowerCase();
+          if (SENTINELS.has(normalized) || !normalized || seenLoops.has(normalized)) continue;
+          seenLoops.add(normalized);
+          openLoops.push({ item: raw.trim(), fromSession: s.sessionId, latestStartedAt: s.startedAt });
+        }
+      }
+
+      // Cross-session recent decisions dedup
+      const seenDecisions = new Set();
+      const recentDecisions = [];
+      for (const s of sessions) {
+        for (const d of s.decisions) {
+          const key = typeof d === 'string' ? d : (d.decision || '');
+          const normalized = key.trim().replace(/\s+/g, ' ').toLowerCase();
+          if (!normalized || seenDecisions.has(normalized)) continue;
+          seenDecisions.add(normalized);
+          recentDecisions.push({ decision: key.trim(), reason: d.reason || null, fromSession: s.sessionId });
+        }
+      }
+
+      const structured = {
+        sessions,
+        openLoops,
+        recentDecisions,
+        meta: { lookbackDays, count: sessions.length, maxChars, truncated: false },
+      };
+
+      if (format === 'text' || format === 'both') {
+        const textResult = formatBootstrapText(structured, maxChars);
+        structured.text = textResult.text;
+        structured.meta.truncated = textResult.truncated;
+      }
+
+      return structured;
+    },
   };
 
   return aquifer;
 }
 
 // ---------------------------------------------------------------------------
+// formatBootstrapText — pure function, builds <session-bootstrap> XML block
+// ---------------------------------------------------------------------------
+
+function formatBootstrapText(data, maxChars) {
+  if (!data.sessions || data.sessions.length === 0) {
+    return { text: 'No recent sessions found.', truncated: false };
+  }
+
+  let truncated = false;
+  const parts = [];
+
+  // Build session lines (newest first, truncate from oldest if over budget)
+  const sessionLines = [];
+  for (const s of data.sessions) {
+    const date = s.startedAt ? new Date(s.startedAt).toISOString().slice(0, 10) : '?';
+    const title = s.title || '(untitled)';
+    const overview = s.overview ? s.overview.slice(0, 200) : '';
+    let line = `- ${date} | ${title}`;
+    if (overview) line += ` — ${overview}`;
+    const decisions = s.decisions
+      .map(d => typeof d === 'string' ? d : d.decision)
+      .filter(Boolean);
+    if (decisions.length > 0) line += `\n  Decisions: ${decisions.join('; ')}`;
+    sessionLines.push(line);
+  }
+
+  // Fit within maxChars by removing oldest sessions
+  let bodyLines = [...sessionLines];
+  const footer = [];
+  if (data.openLoops.length > 0) {
+    footer.push(`Open items: ${data.openLoops.map(l => l.item).join(', ')}`);
+  }
+  if (data.recentDecisions.length > 0) {
+    footer.push(`Recent decisions: ${data.recentDecisions.map(d => d.decision).join(', ')}`);
+  }
+
+  const buildText = (lines) => {
+    const body = ['Recent sessions:', ...lines].join('\n');
+    const full = footer.length > 0 ? body + '\n' + footer.join('\n') : body;
+    return `<session-bootstrap sessions="${lines.length}" open_loops="${data.openLoops.length}">\n${full}\n</session-bootstrap>`;
+  };
+
+  let text = buildText(bodyLines);
+  while (text.length > maxChars && bodyLines.length > 1) {
+    bodyLines.pop();  // remove oldest
+    truncated = true;
+    text = buildText(bodyLines);
+  }
+
+  return { text, truncated };
+}
+
+// ---------------------------------------------------------------------------
 // Exports
 // ---------------------------------------------------------------------------
 
-module.exports = { createAquifer };
+module.exports = { createAquifer, formatBootstrapText };
