@@ -360,32 +360,45 @@ async function upsertTurnEmbeddings(pool, sessionRowId, {
     throw new Error(`turns.length (${turns.length}) !== vectors.length (${vectors.length})`);
   }
 
+  // Batch insert: build multi-row VALUES clause
+  const COLS_PER_ROW = 10;
+  const valueClauses = [];
+  const params = [];
+
   for (let i = 0; i < turns.length; i++) {
     const t = turns[i];
     const vec = vectors[i];
     if (!vec) continue;
 
     const contentHash = crypto.createHash('sha256').update(t.text).digest('hex').slice(0, 16);
-    await pool.query(
-      `INSERT INTO ${qi(schema)}.turn_embeddings
-        (session_row_id, tenant_id, session_id, agent_id, source,
-         turn_index, message_index, role, content_text, content_hash, embedding)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,'user',$8,$9,$10::vector)
-      ON CONFLICT (session_row_id, message_index) DO UPDATE SET
-        content_text = EXCLUDED.content_text,
-        content_hash = EXCLUDED.content_hash,
-        embedding = CASE
-          WHEN ${qi(schema)}.turn_embeddings.content_hash = EXCLUDED.content_hash
-          THEN ${qi(schema)}.turn_embeddings.embedding
-          ELSE EXCLUDED.embedding
-        END`,
-      [
-        sessionRowId, tenantId, sessionId, agentId, source || null,
-        t.turnIndex, t.messageIndex,
-        t.text, contentHash, vecToStr(vec),
-      ]
+    const off = params.length;
+    params.push(
+      sessionRowId, tenantId, sessionId, agentId, source || null,
+      t.turnIndex, t.messageIndex,
+      t.text, contentHash, vecToStr(vec),
+    );
+    valueClauses.push(
+      `($${off+1},$${off+2},$${off+3},$${off+4},$${off+5},$${off+6},$${off+7},'user',$${off+8},$${off+9},$${off+10}::vector)`
     );
   }
+
+  if (valueClauses.length === 0) return;
+
+  await pool.query(
+    `INSERT INTO ${qi(schema)}.turn_embeddings
+      (session_row_id, tenant_id, session_id, agent_id, source,
+       turn_index, message_index, role, content_text, content_hash, embedding)
+    VALUES ${valueClauses.join(',\n')}
+    ON CONFLICT (session_row_id, message_index) DO UPDATE SET
+      content_text = EXCLUDED.content_text,
+      content_hash = EXCLUDED.content_hash,
+      embedding = CASE
+        WHEN ${qi(schema)}.turn_embeddings.content_hash = EXCLUDED.content_hash
+        THEN ${qi(schema)}.turn_embeddings.embedding
+        ELSE EXCLUDED.embedding
+      END`,
+    params
+  );
 }
 
 // ---------------------------------------------------------------------------

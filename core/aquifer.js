@@ -187,21 +187,30 @@ function createAquifer(config) {
     // --- lifecycle ---
 
     async migrate() {
-      // 1. Run base DDL
-      const baseSql = loadSql('001-base.sql', schema);
-      await pool.query(baseSql);
+      // Advisory lock prevents concurrent migrations across processes.
+      // Lock key is derived from schema name to allow parallel migration
+      // of different schemas in the same database.
+      const lockKey = Buffer.from(`aquifer:${schema}`).reduce((h, b) => (h * 31 + b) & 0x7fffffff, 0);
+      await pool.query('SELECT pg_advisory_lock($1)', [lockKey]);
+      try {
+        // 1. Run base DDL
+        const baseSql = loadSql('001-base.sql', schema);
+        await pool.query(baseSql);
 
-      // 2. If entities enabled, run entity DDL
-      if (entitiesEnabled) {
-        const entitySql = loadSql('002-entities.sql', schema);
-        await pool.query(entitySql);
+        // 2. If entities enabled, run entity DDL
+        if (entitiesEnabled) {
+          const entitySql = loadSql('002-entities.sql', schema);
+          await pool.query(entitySql);
+        }
+
+        // 3. Trust + feedback (always, not gated by entities)
+        const trustSql = loadSql('003-trust-feedback.sql', schema);
+        await pool.query(trustSql);
+
+        migrated = true;
+      } finally {
+        await pool.query('SELECT pg_advisory_unlock($1)', [lockKey]).catch(() => {});
       }
-
-      // 3. Trust + feedback (always, not gated by entities)
-      const trustSql = loadSql('003-trust-feedback.sql', schema);
-      await pool.query(trustSql);
-
-      migrated = true;
     },
 
     async close() {

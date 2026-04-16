@@ -222,27 +222,41 @@ async function upsertEntityRelations(pool, {
 }) {
   if (!pairs || pairs.length === 0) return { upserted: 0 };
   const ts = occurredAt || new Date().toISOString();
-  let upserted = 0;
 
+  // Filter and normalize pairs
+  const validPairs = [];
   for (const { srcEntityId, dstEntityId } of pairs) {
     if (!srcEntityId || !dstEntityId || srcEntityId === dstEntityId) continue;
-
-    const lo = Math.min(srcEntityId, dstEntityId);
-    const hi = Math.max(srcEntityId, dstEntityId);
-
-    await pool.query(
-      `INSERT INTO ${qi(schema)}.entity_relations
-        (src_entity_id, dst_entity_id, co_occurrence_count, first_seen_at, last_seen_at)
-      VALUES ($1, $2, 1, $3, $3)
-      ON CONFLICT (src_entity_id, dst_entity_id) DO UPDATE SET
-        co_occurrence_count = ${qi(schema)}.entity_relations.co_occurrence_count + 1,
-        last_seen_at        = GREATEST(${qi(schema)}.entity_relations.last_seen_at, EXCLUDED.last_seen_at)`,
-      [lo, hi, ts]
-    );
-    upserted++;
+    validPairs.push({
+      lo: Math.min(srcEntityId, dstEntityId),
+      hi: Math.max(srcEntityId, dstEntityId),
+    });
   }
 
-  return { upserted };
+  if (validPairs.length === 0) return { upserted: 0 };
+
+  // Batch insert: multi-row VALUES
+  const COLS_PER_ROW = 3;
+  const valueClauses = [];
+  const params = [];
+
+  for (const { lo, hi } of validPairs) {
+    const off = params.length;
+    params.push(lo, hi, ts);
+    valueClauses.push(`($${off+1}, $${off+2}, 1, $${off+3}, $${off+3})`);
+  }
+
+  await pool.query(
+    `INSERT INTO ${qi(schema)}.entity_relations
+      (src_entity_id, dst_entity_id, co_occurrence_count, first_seen_at, last_seen_at)
+    VALUES ${valueClauses.join(',\n')}
+    ON CONFLICT (src_entity_id, dst_entity_id) DO UPDATE SET
+      co_occurrence_count = ${qi(schema)}.entity_relations.co_occurrence_count + 1,
+      last_seen_at        = GREATEST(${qi(schema)}.entity_relations.last_seen_at, EXCLUDED.last_seen_at)`,
+    params
+  );
+
+  return { upserted: validPairs.length };
 }
 
 // ---------------------------------------------------------------------------
