@@ -69,8 +69,20 @@ CREATE TABLE IF NOT EXISTS ${schema}.session_summaries (
   updated_at               TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
 
--- Cleanup legacy segment-era schema artifacts so migrate() converges old installs
-DROP TABLE IF EXISTS ${schema}.session_segments;
+-- Cleanup legacy segment-era schema artifacts so migrate() converges old installs.
+-- Wrapped because the implicit sequence on session_segments can be referenced from
+-- other schemas (e.g. bench/staging created via CREATE TABLE LIKE), which would
+-- otherwise hard-fail the migration. Operators get a NOTICE and must decouple
+-- dependents themselves before the table will actually drop.
+DO $$
+BEGIN
+  BEGIN
+    DROP TABLE IF EXISTS ${schema}.session_segments;
+  EXCEPTION
+    WHEN dependent_objects_still_exist THEN
+      RAISE NOTICE '[aquifer] skipped session_segments drop: %; decouple cross-schema dependents and re-run migrate to complete cleanup', SQLERRM;
+  END;
+END$$;
 ALTER TABLE ${schema}.session_summaries DROP COLUMN IF EXISTS boundary_count;
 ALTER TABLE ${schema}.session_summaries DROP COLUMN IF EXISTS fresh_tail_count;
 
@@ -86,6 +98,12 @@ CREATE INDEX IF NOT EXISTS idx_summaries_search_text_trgm
 CREATE INDEX IF NOT EXISTS idx_summaries_embedding
   ON ${schema}.session_summaries (session_row_id)
   WHERE embedding IS NOT NULL;
+
+-- HNSW approximate nearest-neighbor index for cosine-distance vector search.
+-- Without this, ORDER BY embedding <=> $vec degrades to seq scan at scale.
+-- Requires pgvector >= 0.5.0.
+CREATE INDEX IF NOT EXISTS idx_summaries_embedding_hnsw
+  ON ${schema}.session_summaries USING hnsw (embedding vector_cosine_ops);
 
 -- FTS trigger: auto-update search_tsv on INSERT/UPDATE
 CREATE OR REPLACE FUNCTION ${schema}.session_summaries_search_tsv_update()
@@ -171,3 +189,7 @@ CREATE INDEX IF NOT EXISTS idx_turn_emb_session_row
 
 CREATE INDEX IF NOT EXISTS idx_turn_emb_tenant_agent
   ON ${schema}.turn_embeddings (tenant_id, agent_id, source);
+
+-- HNSW approximate nearest-neighbor index for turn-level vector search.
+CREATE INDEX IF NOT EXISTS idx_turn_emb_embedding_hnsw
+  ON ${schema}.turn_embeddings USING hnsw (embedding vector_cosine_ops);

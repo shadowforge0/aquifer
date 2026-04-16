@@ -418,6 +418,16 @@ async function searchTurnEmbeddings(pool, {
   source,
   limit = 15,
 }) {
+  // HNSW index fires only on `ORDER BY embedding <=> $vec LIMIT N` without
+  // additional predicates in the same query level. So the CTE does a plain
+  // nearest-neighbor scan (uses idx_turn_emb_embedding_hnsw at scale), then
+  // the outer SELECT applies tenant/agent/date/source filters and dedups.
+  //
+  // Filter narrowness may leave fewer than `limit` rows after post-filter;
+  // NN_OVERFETCH trades extra vector work for filter survival headroom.
+  const NN_OVERFETCH = 10;
+  const nnLimit = Math.max(50, limit * NN_OVERFETCH);
+
   const where = ['s.tenant_id = $1'];
   const params = [tenantId];
 
@@ -436,36 +446,40 @@ async function searchTurnEmbeddings(pool, {
   }
   if (agentIds) {
     params.push(agentIds);
-    where.push(`t.agent_id = ANY($${params.length})`);
+    where.push(`s.agent_id = ANY($${params.length})`);
   }
   if (source) {
     params.push(source);
-    where.push(`t.source = $${params.length}`);
+    where.push(`s.source = $${params.length}`);
   }
 
   params.push(`[${queryVec.join(',')}]`);
   const vecPos = params.length;
-
-  // m5: use subquery with LIMIT to avoid scanning all rows
-  params.push(limit * 3); // fetch more than needed for DISTINCT ON dedup
-  const innerLimitPos = params.length;
+  params.push(nnLimit);
+  const nnLimitPos = params.length;
 
   const result = await pool.query(
-    `SELECT * FROM (
-      SELECT DISTINCT ON (t.session_row_id)
+    `WITH nn AS (
+      SELECT t.session_row_id, t.content_text, t.turn_index,
+             (t.embedding <=> $${vecPos}::vector) AS turn_distance
+      FROM ${qi(schema)}.turn_embeddings t
+      ORDER BY t.embedding <=> $${vecPos}::vector ASC
+      LIMIT $${nnLimitPos}
+    )
+    SELECT * FROM (
+      SELECT DISTINCT ON (nn.session_row_id)
         s.session_id, s.id AS session_row_id, s.agent_id, s.source, s.started_at,
         ss.summary_text, ss.structured_summary, ss.access_count, ss.last_accessed_at,
         COALESCE(ss.trust_score, 0.5) AS trust_score,
-        t.content_text AS matched_turn_text, t.turn_index AS matched_turn_index,
-        (t.embedding <=> $${vecPos}::vector) AS turn_distance
-      FROM ${qi(schema)}.turn_embeddings t
-      JOIN ${qi(schema)}.sessions s ON s.id = t.session_row_id
+        nn.content_text AS matched_turn_text, nn.turn_index AS matched_turn_index,
+        nn.turn_distance
+      FROM nn
+      JOIN ${qi(schema)}.sessions s ON s.id = nn.session_row_id
       LEFT JOIN ${qi(schema)}.session_summaries ss ON ss.session_row_id = s.id
       WHERE ${where.join(' AND ')}
-      ORDER BY t.session_row_id, turn_distance ASC
-    ) sub
-    ORDER BY turn_distance ASC
-    LIMIT $${innerLimitPos}`,
+      ORDER BY nn.session_row_id, nn.turn_distance ASC
+    ) dedup
+    ORDER BY turn_distance ASC`,
     params
   );
 

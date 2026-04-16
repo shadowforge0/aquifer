@@ -111,6 +111,28 @@ describe('storage.searchSessions trigram search', () => {
     assert.ok(captured[0].params.includes(7), 'limit 7 should be in params');
   });
 
+  it('searchTurnEmbeddings runs HNSW nearest-neighbor in a CTE ahead of filters', async () => {
+    const captured = [];
+    await storage.searchTurnEmbeddings(makePool(captured), {
+      schema: 'aquifer',
+      tenantId: 'default',
+      queryVec: new Array(1024).fill(0.1),
+    });
+    assert.equal(captured.length, 1);
+    const sql = captured[0].sql;
+    const cteMatch = sql.match(/WITH\s+nn\s+AS\s*\(([\s\S]+?)\)\s*SELECT/i);
+    assert.ok(cteMatch, 'must define an `nn` CTE before the outer SELECT');
+    const cteBody = cteMatch[1];
+    // HNSW index only fires on `ORDER BY embedding <=> vec LIMIT N` with no
+    // extra predicates at the same level. Guard that shape.
+    assert.ok(/ORDER BY\s+t\.embedding\s*<=>/i.test(cteBody),
+      'CTE must order by embedding distance');
+    assert.ok(/LIMIT\s+\$\d+/i.test(cteBody),
+      'CTE must have an explicit LIMIT for HNSW to engage');
+    assert.ok(!/tenant_id/i.test(cteBody),
+      'tenant/agent filters must live outside the NN CTE');
+  });
+
   it('orders substring-hit rows ahead of similarity-only matches', async () => {
     const captured = [];
     await storage.searchSessions(makePool(captured), 'hello', {
