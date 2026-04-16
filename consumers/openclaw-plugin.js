@@ -38,6 +38,7 @@ function normalizeEntries(rawEntries) {
   let startedAt = null, lastMessageAt = null;
 
   for (const entry of rawEntries) {
+    if (!entry) continue;
     const msg = entry.message || entry;
     if (!msg || !msg.role) continue;
     if (!['user', 'assistant', 'system'].includes(msg.role)) continue;
@@ -108,11 +109,21 @@ function formatRecallResults(results) {
 // Plugin
 // ---------------------------------------------------------------------------
 
-module.exports = {
-  id: 'aquifer-memory',
-  name: 'Aquifer Memory',
+function buildPlugin() {
+  return {
+    id: 'aquifer-memory',
+    name: 'Aquifer Memory',
+    register,
+  };
+}
 
-  register(api) {
+module.exports = buildPlugin();
+// Expose helpers for unit testing. Not part of the plugin's OpenClaw-visible
+// contract; OpenClaw reads { id, name, register } only.
+module.exports.normalizeEntries = normalizeEntries;
+module.exports.coerceRawEntries = coerceRawEntries;
+
+function register(api) {
     const pluginConfig = api.pluginConfig || {};
     let aquifer;
 
@@ -292,6 +303,5 @@ module.exports = {
       };
     }, { name: 'session_feedback' });
 
-    api.logger.info('[aquifer-memory] registered (before_reset + session_recall + session_feedback)');
-  },
-};
+  api.logger.info('[aquifer-memory] registered (before_reset + session_recall + session_feedback)');
+}
