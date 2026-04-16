@@ -2,6 +2,7 @@
 -- Usage: replace ${schema} with actual schema name (e.g., 'aquifer')
 
 CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE SCHEMA IF NOT EXISTS ${schema};
 
 -- =========================================================================
@@ -85,6 +86,7 @@ CREATE TABLE IF NOT EXISTS ${schema}.session_summaries (
   structured_summary       JSONB        NOT NULL DEFAULT '{}',
   embedding                vector,
   search_tsv               TSVECTOR,
+  search_text              TEXT,
   access_count             INT          NOT NULL DEFAULT 0,
   last_accessed_at         TIMESTAMPTZ,
   updated_at               TIMESTAMPTZ  NOT NULL DEFAULT now()
@@ -95,6 +97,9 @@ CREATE INDEX IF NOT EXISTS idx_summaries_tenant
 
 CREATE INDEX IF NOT EXISTS idx_summaries_search_tsv
   ON ${schema}.session_summaries USING GIN (search_tsv);
+
+CREATE INDEX IF NOT EXISTS idx_summaries_search_text_trgm
+  ON ${schema}.session_summaries USING GIN (search_text gin_trgm_ops);
 
 CREATE INDEX IF NOT EXISTS idx_summaries_embedding
   ON ${schema}.session_summaries (session_row_id)
@@ -141,6 +146,11 @@ BEGIN
     setweight(to_tsvector('simple', COALESCE(NEW.summary_text, '')), 'C') ||
     setweight(to_tsvector('simple', open_loops_text || ' ' || facts_text), 'D');
 
+  NEW.search_text :=
+    title_text || ' ' || overview_text || ' ' || topics_text || ' ' ||
+    decisions_text || ' ' || COALESCE(NEW.summary_text, '') || ' ' ||
+    open_loops_text || ' ' || facts_text;
+
   RETURN NEW;
 END;
 $$;
@@ -149,7 +159,7 @@ DROP TRIGGER IF EXISTS trg_session_summaries_search_tsv
   ON ${schema}.session_summaries;
 
 CREATE TRIGGER trg_session_summaries_search_tsv
-  BEFORE INSERT OR UPDATE OF summary_text, structured_summary
+  BEFORE INSERT OR UPDATE OF summary_text, structured_summary, search_text
   ON ${schema}.session_summaries
   FOR EACH ROW
   EXECUTE FUNCTION ${schema}.session_summaries_search_tsv_update();

@@ -100,19 +100,6 @@ function createAquifer(config) {
   const entityPromptFn = config.entities && config.entities.prompt ? config.entities.prompt : null;
   const entityScope = (config.entities && config.entities.scope) || 'default';
 
-  // FTS config — locked to 'simple'.
-  // The search_tsv trigger always uses to_tsvector('simple', ...), so query-time
-  // config must match.  Warn and override if someone passes anything else.
-  const _rawFtsConfig = config.ftsConfig || 'simple';
-  if (_rawFtsConfig !== 'simple') {
-    console.warn(
-      `[aquifer] ftsConfig '${_rawFtsConfig}' is not currently supported. ` +
-      `The search_tsv index is built with 'simple'; only 'simple' is valid at query time. ` +
-      `Overriding to 'simple'.`
-    );
-  }
-  const ftsConfig = 'simple';
-
   // Rank weights
   const rankWeights = {
     rrf: 0.65,
@@ -706,7 +693,7 @@ function createAquifer(config) {
       const [ftsRows, embRows, turnResult] = await Promise.all([
         runFts
           ? storage.searchSessions(pool, query, {
-              schema, tenantId, agentIds: resolvedAgentIds, source, dateFrom, dateTo, limit: fetchLimit, ftsConfig,
+              schema, tenantId, agentIds: resolvedAgentIds, source, dateFrom, dateTo, limit: fetchLimit,
             }).catch((err) => {
               recordSearchError('fts', err);
               return [];

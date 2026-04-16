@@ -211,7 +211,7 @@ async function getMessages(pool, sessionId, agentId, { schema, tenantId } = {}) 
 }
 
 // ---------------------------------------------------------------------------
-// searchSessions (FTS)
+// searchSessions (trigram + FTS fallback)
 // ---------------------------------------------------------------------------
 
 async function searchSessions(pool, query, {
@@ -220,34 +220,27 @@ async function searchSessions(pool, query, {
   agentId,
   agentIds: rawAgentIds,
   source,
-  dateFrom,  // m1: add date filtering
+  dateFrom,
   dateTo,
   limit = 20,
-  ftsConfig = 'simple',
 } = {}) {
   const clampedLimit = Math.max(1, Math.min(100, limit));
-  // FTS config is locked to 'simple' — the search_tsv trigger always uses
-  // to_tsvector('simple', ...) so query semantics must match.  Warn callers
-  // that pass a different value rather than silently honouring it.
-  if (ftsConfig !== 'simple') {
-    console.warn(
-      `[aquifer/storage] searchSessions: ftsConfig '${ftsConfig}' ignored. ` +
-      `Only 'simple' is supported (index is built with simple tokenizer). ` +
-      `Using 'simple'.`
-    );
-  }
-  const safeFts = 'simple';
 
   // Normalize agentId/agentIds
   const agentIds = rawAgentIds && rawAgentIds.length > 0
     ? rawAgentIds
     : (agentId ? [agentId] : null);
 
+  // Escape LIKE special characters in query
+  const likeQuery = query.replace(/[%_\\]/g, '\\$&');
+
+  // Primary: trigram ILIKE on search_text (works for CJK + Latin)
+  // Fallback: tsvector FTS (for installations without search_text populated)
   const where = [
-    `ss.search_tsv @@ plainto_tsquery('${safeFts}', $1)`,
-    `s.tenant_id = $2`,
+    `(ss.search_text ILIKE '%' || $1 || '%' OR ss.search_tsv @@ plainto_tsquery('simple', $2))`,
+    `s.tenant_id = $3`,
   ];
-  const params = [query, tenantId];
+  const params = [likeQuery, query, tenantId];
 
   if (agentIds) {
     params.push(agentIds);
@@ -281,8 +274,10 @@ async function searchSessions(pool, query, {
       ss.access_count,
       ss.last_accessed_at,
       ss.trust_score,
-      ts_headline('${safeFts}', COALESCE(ss.summary_text, ''), plainto_tsquery('${safeFts}', $1)) AS summary_snippet,
-      ts_rank(ss.search_tsv, plainto_tsquery('${safeFts}', $1)) AS fts_rank
+      CASE WHEN ss.search_text IS NOT NULL
+        THEN similarity(ss.search_text, $2)
+        ELSE ts_rank(ss.search_tsv, plainto_tsquery('simple', $2))
+      END AS fts_rank
     FROM ${qi(schema)}.sessions s
     LEFT JOIN ${qi(schema)}.session_summaries ss ON ss.session_row_id = s.id
     WHERE ${where.join(' AND ')}
