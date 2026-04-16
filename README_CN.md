@@ -243,7 +243,7 @@ OpenClaw 插件（`consumers/openclaw-plugin.js`）保留用于通过 `before_re
 
 | 文件 | 用途 |
 |------|------|
-| `index.js` | 入口——导出 `createAquifer`、`createEmbedder`、`createReranker`、`normalizeSession` |
+| `index.js` | 入口——导出 `createAquifer`、`createEmbedder`、`createReranker` |
 | `core/aquifer.js` | 主 facade：`migrate()`、`commit()`、`recall()`、`enrich()` |
 | `core/storage.js` | Session/摘要/turn 的 CRUD、FTS 搜索、embedding 搜索 |
 | `core/entity.js` | 实体 upsert、mention 追踪、关系图谱、名称规范化 |

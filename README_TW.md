@@ -243,7 +243,7 @@ OpenClaw plugin（`consumers/openclaw-plugin.js`）保留用於 `before_reset` s
 
 | 檔案 | 用途 |
 |------|------|
-| `index.js` | 入口——匯出 `createAquifer`、`createEmbedder`、`createReranker`、`normalizeSession` |
+| `index.js` | 入口——匯出 `createAquifer`、`createEmbedder`、`createReranker` |
 | `core/aquifer.js` | 主 facade：`migrate()`、`ingest()`、`recall()`、`enrich()` |
 | `core/storage.js` | Session/摘要/turn 的 CRUD、FTS 搜尋、embedding 搜尋 |
 | `core/entity.js` | 實體 upsert、mention 追蹤、關係圖譜、名稱正規化 |
