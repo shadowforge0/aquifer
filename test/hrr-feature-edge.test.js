@@ -27,6 +27,12 @@ function makeFeedbackPool(selectRows) {
         return { rows: selectRows };
       }
 
+      // Dedupe lookup: no prior feedback exists, so tests run the full
+      // trust-update path.
+      if (sql.includes('session_feedback') && sql.includes('SELECT 1')) {
+        return { rows: [] };
+      }
+
       if (sql.includes('UPDATE "aq".session_summaries')) {
         return { rows: [] };
       }
@@ -434,7 +440,7 @@ describe('storage.js edge cases', () => {
       const updateCall = mock.calls.find((call) => call.sql.includes('UPDATE "aq".session_summaries'));
       const insertCall = mock.calls.find((call) => call.sql.includes('INSERT INTO "aq".session_feedback'));
 
-      assert.deepEqual(result, { trustBefore: 0.5, trustAfter: 0.55, verdict: 'helpful' });
+      assert.deepEqual(result, { trustBefore: 0.5, trustAfter: 0.55, verdict: 'helpful', duplicate: false });
       assert.equal(updateCall.params[0], 0.55);
       assert.equal(insertCall.params[6], 0.5);
       assert.equal(insertCall.params[7], 0.55);
@@ -456,7 +462,7 @@ describe('storage.js edge cases', () => {
       const updateCall = mock.calls.find((call) => call.sql.includes('UPDATE "aq".session_summaries'));
       const insertCall = mock.calls.find((call) => call.sql.includes('INSERT INTO "aq".session_feedback'));
 
-      assert.deepEqual(result, { trustBefore: 0.5, trustAfter: 0.4, verdict: 'unhelpful' });
+      assert.deepEqual(result, { trustBefore: 0.5, trustAfter: 0.4, verdict: 'unhelpful', duplicate: false });
       assert.equal(updateCall.params[0], 0.4);
       assert.equal(insertCall.params[6], 0.5);
       assert.equal(insertCall.params[7], 0.4);
@@ -477,7 +483,7 @@ describe('storage.js edge cases', () => {
       const updateCall = mock.calls.find((call) => call.sql.includes('UPDATE "aq".session_summaries'));
       const insertCall = mock.calls.find((call) => call.sql.includes('INSERT INTO "aq".session_feedback'));
 
-      assert.deepEqual(result, { trustBefore: 0, trustAfter: 0, verdict: 'unhelpful' });
+      assert.deepEqual(result, { trustBefore: 0, trustAfter: 0, verdict: 'unhelpful', duplicate: false });
       assert.equal(updateCall.params[0], 0);
       assert.equal(insertCall.params[6], 0);
       assert.equal(insertCall.params[7], 0);
@@ -497,7 +503,7 @@ describe('storage.js edge cases', () => {
 
       const updateCall = mock.calls.find((call) => call.sql.includes('UPDATE "aq".session_summaries'));
 
-      assert.deepEqual(result, { trustBefore: 1, trustAfter: 1, verdict: 'helpful' });
+      assert.deepEqual(result, { trustBefore: 1, trustAfter: 1, verdict: 'helpful', duplicate: false });
       assert.equal(updateCall.params[0], 1);
     });
 

@@ -16,7 +16,10 @@ describe('storage.searchSessions trigram search', () => {
     return {
       query: async (sql, params) => {
         capturedQueries.push({ sql, params });
-        return { rows: [] };
+        // Default to a non-empty row so searchTurnEmbeddings' fallback path
+        // (triggered when primary returns 0 rows) doesn't fire in SQL-shape
+        // tests that only want to inspect the primary query.
+        return { rows: [{ session_id: 'mock', session_row_id: 1 }] };
       },
     };
   }
@@ -109,6 +112,49 @@ describe('storage.searchSessions trigram search', () => {
       limit: 7,
     });
     assert.ok(captured[0].params.includes(7), 'limit 7 should be in params');
+  });
+
+  it('searchTurnEmbeddings falls back to filter-first query when NN set filters out', async () => {
+    // Contract: when narrow tenant/agent filters eliminate every candidate from
+    // the HNSW NN set, we must still return qualifying rows (if any exist in
+    // the DB) rather than silently returning empty. Fallback is a filter-first
+    // scan — slower but guaranteed correct.
+    const calls = [];
+    const fakePool = {
+      query: async (sql, params) => {
+        calls.push({ sql, params });
+        if (calls.length === 1) return { rows: [] };
+        return { rows: [{ session_id: 'fallback-hit', session_row_id: 42 }] };
+      },
+    };
+    const result = await storage.searchTurnEmbeddings(fakePool, {
+      schema: 'aq',
+      tenantId: 't',
+      queryVec: [0.1, 0.2, 0.3],
+      limit: 5,
+    });
+    assert.equal(calls.length, 2, 'must issue a second fallback query');
+    assert.ok(!/WITH\s+nn\s+AS/i.test(calls[1].sql),
+      'fallback query must not use the NN CTE (runs filter-first scan instead)');
+    assert.equal(result.rows.length, 1);
+    assert.equal(result.rows[0].session_id, 'fallback-hit');
+  });
+
+  it('searchTurnEmbeddings skips fallback when primary returns results', async () => {
+    const calls = [];
+    const fakePool = {
+      query: async (sql, params) => {
+        calls.push({ sql, params });
+        return { rows: [{ session_id: 'primary-hit', session_row_id: 1 }] };
+      },
+    };
+    await storage.searchTurnEmbeddings(fakePool, {
+      schema: 'aq',
+      tenantId: 't',
+      queryVec: [0.1, 0.2, 0.3],
+      limit: 5,
+    });
+    assert.equal(calls.length, 1, 'must not run fallback when primary succeeds');
   });
 
   it('searchTurnEmbeddings runs HNSW nearest-neighbor in a CTE ahead of filters', async () => {

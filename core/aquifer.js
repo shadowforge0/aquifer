@@ -1033,7 +1033,11 @@ function createAquifer(config) {
       const maxChars = opts.maxChars || 4000;
       const format = opts.format || 'structured';
 
-      const where = [`s.tenant_id = $1`, `s.processing_status = 'succeeded'`];
+      // 'partial' sessions have a summary but recorded warnings during enrich;
+      // they are user-visible content, not in-progress — bootstrap must include
+      // them alongside 'succeeded'. 'pending' / 'processing' have no summary
+      // yet and are correctly excluded.
+      const where = [`s.tenant_id = $1`, `s.processing_status IN ('succeeded', 'partial')`];
       const params = [tenantId];
 
       if (agentId) {
@@ -1046,7 +1050,10 @@ function createAquifer(config) {
       }
 
       params.push(lookbackDays);
-      where.push(`s.started_at > now() - ($${params.length} || ' days')::interval`);
+      // upsertSession sets ended_at on every commit but started_at / last_message_at
+      // only when the caller supplies them — fall back through both so sessions
+      // committed without explicit timestamps remain reachable.
+      where.push(`COALESCE(s.last_message_at, s.ended_at, s.started_at) > now() - ($${params.length} || ' days')::interval`);
 
       params.push(limit);
 
@@ -1056,7 +1063,7 @@ function createAquifer(config) {
          FROM ${qi(schema)}.sessions s
          JOIN ${qi(schema)}.session_summaries ss ON ss.session_row_id = s.id
          WHERE ${where.join(' AND ')}
-         ORDER BY s.started_at DESC
+         ORDER BY COALESCE(s.last_message_at, s.ended_at, s.started_at) DESC
          LIMIT $${params.length}`,
         params
       );

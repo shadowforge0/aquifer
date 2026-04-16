@@ -969,6 +969,29 @@ describe('5. feedback() — trust_score', () => {
     );
   });
 
+  it('duplicate (agent, verdict) does not stack trust_score', async () => {
+    // Contract: same agent applying the same verdict twice must count once.
+    // Different agents applying the same verdict should still each move trust.
+    await aq.commit('sid-fb-dup', [{ role: 'user', content: 'keyword dedupe.' }]);
+    await aq.enrich('sid-fb-dup', {
+      summaryFn: makeFakeSummaryFn({ summaryText: 'keyword dedupe summary.' }),
+    });
+
+    const r1 = await aq.feedback('sid-fb-dup', { verdict: 'helpful' });
+    const r2 = await aq.feedback('sid-fb-dup', { verdict: 'helpful' });
+    assert.ok(Math.abs(r1.trustAfter - (r1.trustBefore + 0.05)) < 0.001,
+      'first helpful must apply +TRUST_UP');
+    assert.ok(Math.abs(r2.trustAfter - r1.trustAfter) < 0.001,
+      `duplicate (agent, verdict) must not stack trust: r2.before=${r2.trustBefore} after=${r2.trustAfter}`);
+    assert.equal(r2.duplicate, true, 'second call must flag duplicate');
+
+    // Same agent, different verdict must still move trust (not deduped).
+    const r3 = await aq.feedback('sid-fb-dup', { verdict: 'unhelpful' });
+    assert.ok(r3.trustAfter < r2.trustAfter,
+      `different verdict should still move trust: before=${r3.trustBefore} after=${r3.trustAfter}`);
+    assert.equal(r3.duplicate, false);
+  });
+
   it('trust_score 上限 clamp 到 1.0', async () => {
     // 驗什麼：Math.min(1.0, trust + 0.05)
     // 為什麼重要：防止 trust_score > 1 破壞 hybridRank trustMultiplier 計算
@@ -1146,5 +1169,68 @@ describe('7. pool 管理 + 邊界情況', () => {
       await adminPool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => {});
       await adminPool.end();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8. bootstrap() — contract over session visibility
+// ---------------------------------------------------------------------------
+
+describe('8. bootstrap() — session visibility contract', () => {
+  let aq, pool, schema;
+
+  before(async () => {
+    ({ aq, pool, schema } = await createTestInstance());
+    await aq.migrate();
+  });
+
+  after(async () => {
+    await teardown(aq, pool, schema);
+  });
+
+  it('includes sessions with processing_status = partial', async () => {
+    // 驗什麼：enrich 產生 warnings 的 session 標 'partial'（有 summary 但有失敗）
+    //   必須被 bootstrap 看見，否則 operator 永遠拿不到帶警訊的 session
+    // 為什麼重要：contract — 有 summary 就可見，不管是 'succeeded' 還是 'partial'
+    await aq.commit('sid-boot-partial', [
+      { role: 'user', content: 'keyword partial visibility.' },
+    ]);
+
+    // 讓 customSummaryFn 成功寫 summary，但強迫一條 warning（turn embed fail）
+    const failingEmbedAq = createAquifer({
+      db: DB_URL, schema, tenantId: 'test',
+      embed: { fn: async () => { throw new Error('mock embed fail'); }, dim: 3 },
+    });
+    try {
+      await failingEmbedAq.enrich('sid-boot-partial', {
+        summaryFn: makeFakeSummaryFn({ summaryText: 'keyword partial summary.' }),
+      });
+    } finally {
+      await failingEmbedAq.close();
+    }
+
+    const statusRow = await pool.query(
+      `SELECT processing_status FROM "${schema}".sessions WHERE session_id = $1`,
+      ['sid-boot-partial']
+    );
+    assert.equal(statusRow.rows[0].processing_status, 'partial',
+      'precondition: session must be partial for this test to be meaningful');
+
+    const boot = await aq.bootstrap({ limit: 10, lookbackDays: 30 });
+    const ids = boot.sessions.map(s => s.sessionId);
+    assert.ok(ids.includes('sid-boot-partial'),
+      `bootstrap must include 'partial' sessions; got ${JSON.stringify(ids)}`);
+  });
+
+  it('excludes sessions still in pending/processing (no summary yet)', async () => {
+    // 驗什麼：沒走過 enrich 的 session 不該出現（沒 summary 可顯示）
+    await aq.commit('sid-boot-pending', [
+      { role: 'user', content: 'keyword pending never enriched.' },
+    ]);
+
+    const boot = await aq.bootstrap({ limit: 10, lookbackDays: 30 });
+    const ids = boot.sessions.map(s => s.sessionId);
+    assert.ok(!ids.includes('sid-boot-pending'),
+      `bootstrap must not include pending sessions; got ${JSON.stringify(ids)}`);
   });
 });

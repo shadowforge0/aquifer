@@ -483,7 +483,33 @@ async function searchTurnEmbeddings(pool, {
     params
   );
 
-  return { rows: result.rows.slice(0, limit) };
+  if (result.rows.length > 0) {
+    return { rows: result.rows.slice(0, limit) };
+  }
+
+  // Fallback: HNSW-first path filtered out to nothing. This can happen when
+  // tenant/agent filters are narrow enough to eliminate every NN candidate.
+  // Pay the cost of a filter-first scan to guarantee we don't silently return
+  // empty when qualifying rows exist. No HNSW on this path — slower, correct.
+  const fallbackParams = params.slice(0, params.length - 1); // drop nnLimit
+  fallbackParams.push(limit);
+  const fallbackLimitPos = fallbackParams.length;
+  const fallback = await pool.query(
+    `SELECT DISTINCT ON (t.session_row_id)
+      s.session_id, s.id AS session_row_id, s.agent_id, s.source, s.started_at,
+      ss.summary_text, ss.structured_summary, ss.access_count, ss.last_accessed_at,
+      COALESCE(ss.trust_score, 0.5) AS trust_score,
+      t.content_text AS matched_turn_text, t.turn_index AS matched_turn_index,
+      (t.embedding <=> $${vecPos}::vector) AS turn_distance
+    FROM ${qi(schema)}.turn_embeddings t
+    JOIN ${qi(schema)}.sessions s ON s.id = t.session_row_id
+    LEFT JOIN ${qi(schema)}.session_summaries ss ON ss.session_row_id = s.id
+    WHERE ${where.join(' AND ')}
+    ORDER BY t.session_row_id, t.embedding <=> $${vecPos}::vector ASC
+    LIMIT $${fallbackLimitPos}`,
+    fallbackParams
+  );
+  return { rows: fallback.rows };
 }
 
 // ---------------------------------------------------------------------------
@@ -520,16 +546,32 @@ async function recordFeedback(pool, {
     }
 
     const trustBefore = parseFloat(current.rows[0].trust_score);
-    const trustAfter = verdict === 'helpful'
-      ? Math.min(1.0, trustBefore + TRUST_UP)
-      : Math.max(0.0, trustBefore - TRUST_DOWN);
 
-    await client.query(
-      `UPDATE ${qi(schema)}.session_summaries
-      SET trust_score = $1, updated_at = now()
-      WHERE session_row_id = $2`,
-      [trustAfter, sessionRowId]
+    // Dedupe: the same (agent, verdict) applied more than once must not stack.
+    // Audit row is still inserted so the sequence of feedback events is
+    // preserved; only the trust_score delta is skipped.
+    const prior = await client.query(
+      `SELECT 1 FROM ${qi(schema)}.session_feedback
+       WHERE session_row_id = $1 AND agent_id = $2 AND verdict = $3
+       LIMIT 1`,
+      [sessionRowId, agentId, verdict]
     );
+    const isDup = prior.rows.length > 0;
+
+    const trustAfter = isDup
+      ? trustBefore
+      : (verdict === 'helpful'
+          ? Math.min(1.0, trustBefore + TRUST_UP)
+          : Math.max(0.0, trustBefore - TRUST_DOWN));
+
+    if (!isDup) {
+      await client.query(
+        `UPDATE ${qi(schema)}.session_summaries
+        SET trust_score = $1, updated_at = now()
+        WHERE session_row_id = $2`,
+        [trustAfter, sessionRowId]
+      );
+    }
 
     await client.query(
       `INSERT INTO ${qi(schema)}.session_feedback
@@ -539,7 +581,7 @@ async function recordFeedback(pool, {
     );
 
     await client.query('COMMIT');
-    return { trustBefore, trustAfter, verdict };
+    return { trustBefore, trustAfter, verdict, duplicate: isDup };
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     throw err;
