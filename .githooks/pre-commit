@@ -1,0 +1,27 @@
+#!/bin/sh
+# Aquifer pre-commit: full test suite + lint must pass before commit.
+# If either fails, commit is aborted.
+
+set -e
+
+# Colors (best effort; harmless if not a tty)
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+printf "${DIM}[pre-commit] running unit tests...${RESET}\n"
+if ! node --test test/*.test.js >/tmp/aquifer-pre-commit-test.log 2>&1; then
+  printf "${RED}[pre-commit] tests failed — see /tmp/aquifer-pre-commit-test.log${RESET}\n"
+  tail -30 /tmp/aquifer-pre-commit-test.log
+  exit 1
+fi
+
+printf "${DIM}[pre-commit] running eslint...${RESET}\n"
+if ! npx --no-install eslint index.js core/*.js consumers/*.js pipeline/*.js scripts/*.js test/*.js >/tmp/aquifer-pre-commit-lint.log 2>&1; then
+  printf "${RED}[pre-commit] lint failed${RESET}\n"
+  cat /tmp/aquifer-pre-commit-lint.log
+  exit 1
+fi
+
+printf "${GREEN}[pre-commit] ok${RESET}\n"

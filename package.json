@@ -32,6 +32,12 @@
     "url": "https://github.com/shadowforge0/aquifer/issues"
   },
   "author": "shadowforge0",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "test:integration": "node --test test/integration.test.js",
+    "lint": "eslint index.js core/*.js consumers/*.js pipeline/*.js scripts/*.js test/*.js",
+    "prepare": "git config core.hooksPath .githooks 2>/dev/null || true"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "pg": "^8.13.0",
