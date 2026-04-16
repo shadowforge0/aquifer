@@ -281,7 +281,10 @@ async function searchSessions(pool, query, {
     FROM ${qi(schema)}.sessions s
     LEFT JOIN ${qi(schema)}.session_summaries ss ON ss.session_row_id = s.id
     WHERE ${where.join(' AND ')}
-    ORDER BY fts_rank DESC, s.last_message_at DESC NULLS LAST
+    ORDER BY
+      COALESCE(ss.search_text ILIKE '%' || $1 || '%', FALSE) DESC,
+      fts_rank DESC,
+      s.last_message_at DESC NULLS LAST
     LIMIT $${params.length}`,
     params
   );
@@ -361,7 +364,6 @@ async function upsertTurnEmbeddings(pool, sessionRowId, {
   }
 
   // Batch insert: build multi-row VALUES clause
-  const COLS_PER_ROW = 10;
   const valueClauses = [];
   const params = [];
 

@@ -110,4 +110,29 @@ describe('storage.searchSessions trigram search', () => {
     });
     assert.ok(captured[0].params.includes(7), 'limit 7 should be in params');
   });
+
+  it('orders substring-hit rows ahead of similarity-only matches', async () => {
+    const captured = [];
+    await storage.searchSessions(makePool(captured), 'hello', {
+      schema: 'aquifer',
+      tenantId: 'default',
+    });
+    const sql = captured[0].sql;
+    const orderIdx = sql.indexOf('ORDER BY');
+    assert.ok(orderIdx >= 0, 'SQL must contain ORDER BY');
+    const orderClause = sql.slice(orderIdx);
+    // Primary sort key must be the substring-hit boolean (true-first).
+    // Otherwise short CJK queries get buried by long rows with incidental trigram overlap.
+    assert.ok(
+      /COALESCE\(\s*ss\.search_text\s+ILIKE[^)]*\)\s+DESC/.test(orderClause),
+      `ORDER BY must lead with COALESCE(search_text ILIKE ...) DESC, got: ${orderClause}`
+    );
+    // substring-hit must come before fts_rank in ORDER BY
+    const ilikeIdx = orderClause.search(/ILIKE/);
+    const rankIdx = orderClause.indexOf('fts_rank');
+    assert.ok(
+      ilikeIdx >= 0 && rankIdx > ilikeIdx,
+      'substring-hit must be a higher-priority sort key than fts_rank'
+    );
+  });
 });
