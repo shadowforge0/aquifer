@@ -2,7 +2,7 @@
 
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
-const { loadConfig, DEFAULTS } = require('../consumers/shared/config');
+const { loadConfig } = require('../consumers/shared/config');
 
 describe('config.loadConfig', () => {
   it('returns defaults when no env or file', () => {

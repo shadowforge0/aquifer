@@ -6,7 +6,7 @@ const { parseEntityOutput } = require('../core/entity');
 // defaultEntityPrompt
 // ---------------------------------------------------------------------------
 
-function defaultEntityPrompt(messages, opts = {}) {
+function defaultEntityPrompt(messages) {
   const conversation = messages
     .map(m => `[${m.role}] ${typeof m.content === 'string' ? m.content : JSON.stringify(m.content)}`)
     .join('\n');
@@ -60,7 +60,7 @@ async function extractEntities(messages, {
     const prompt = buildPrompt(messages, {});
     const response = await llmFn(prompt);
     return parseEntityOutput(response);
-  } catch (err) {
+  } catch {
     // LLM failure: return empty, never throw
     return [];
   }

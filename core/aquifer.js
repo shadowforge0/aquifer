@@ -82,8 +82,6 @@ function createAquifer(config) {
 
   // Embed config (lazy — only required for recall/enrich)
   const embedFn = config.embed && typeof config.embed.fn === 'function' ? config.embed.fn : null;
-  let embedDim = config.embed ? (config.embed.dim || null) : null;
-
   function requireEmbed(op) {
     if (!embedFn) throw new Error(`Aquifer.${op}() requires config.embed.fn (async (texts) => number[][])`);
   }
@@ -209,7 +207,9 @@ function createAquifer(config) {
 
         migrated = true;
       } finally {
-        await pool.query('SELECT pg_advisory_unlock($1)', [lockKey]).catch(() => {});
+        await pool.query('SELECT pg_advisory_unlock($1)', [lockKey]).catch((err) => {
+          console.warn(`[aquifer] failed to release migration advisory lock for schema "${schema}": ${err.message}`);
+        });
       }
     },
 
@@ -494,7 +494,7 @@ function createAquifer(config) {
         await client.query('ROLLBACK').catch(() => {});
         try {
           await storage.markStatus(pool, session.id, 'failed', err.message, { schema });
-        } catch (_) { /* swallow */ }
+        } catch { /* swallow */ }
         throw err;
       } finally {
         client.release();
@@ -692,7 +692,7 @@ function createAquifer(config) {
               entityScoreBySession.set(row.session_id, parseInt(row.entity_count) / maxCount);
             }
           }
-        } catch (_) { /* entity search failure non-fatal */ }
+        } catch { /* entity search failure non-fatal */ }
       }
 
       // 3. Run search paths in parallel (conditioned on mode)
@@ -747,7 +747,7 @@ function createAquifer(config) {
       for (const r of [...filteredFts, ...filteredEmb, ...filteredTurn]) {
         const sid = r.session_id || String(r.id);
         const ss = typeof r.structured_summary === 'string'
-          ? (() => { try { return JSON.parse(r.structured_summary); } catch (_) { return null; } })()
+          ? (() => { try { return JSON.parse(r.structured_summary); } catch { return null; } })()
           : r.structured_summary;
         if (ss && Array.isArray(ss.open_loops) && ss.open_loops.length > 0) {
           openLoopSet.add(sid);
@@ -831,7 +831,7 @@ function createAquifer(config) {
       if (sessionRowIds.length > 0) {
         try {
           await storage.recordAccess(pool, sessionRowIds, { schema });
-        } catch (_) { /* access recording non-fatal */ }
+        } catch { /* access recording non-fatal */ }
       }
 
       // 8. Format results
@@ -842,7 +842,6 @@ function createAquifer(config) {
         startedAt: r.started_at,
         summaryText: r.summary_text || null,
         structuredSummary: r.structured_summary || null,
-        summarySnippet: r.summary_snippet || null,
         matchedTurnText: r.matched_turn_text || null,
         matchedTurnIndex: r.matched_turn_index || null,
         score: r._rerankScore ?? r._score,
@@ -913,29 +912,6 @@ function createAquifer(config) {
       return { id: result.rows[0].id, sessionId, agentId, status: 'skipped' };
     },
 
-    async getSessionFull(sessionId) {
-      const result = await pool.query(
-        `SELECT * FROM ${qi(schema)}.sessions
-        WHERE session_id = $1 AND tenant_id = $2
-        LIMIT 1`,
-        [sessionId, tenantId]
-      );
-      const session = result.rows[0];
-      if (!session) return null;
-
-      const sumResult = await pool.query(
-        `SELECT * FROM ${qi(schema)}.session_summaries
-        WHERE session_row_id = $1
-        LIMIT 1`,
-        [session.id]
-      );
-
-      return {
-        session,
-        summary: sumResult.rows[0] || null,
-      };
-    },
-
     // --- public config accessor ---
 
     getConfig() {
@@ -974,7 +950,7 @@ function createAquifer(config) {
           [tenantId]
         );
         entityCount = entResult.rows[0]?.count || 0;
-      } catch (_) { /* entities table may not exist */ }
+      } catch { /* entities table may not exist */ }
 
       return {
         sessions: Object.fromEntries(sessions.rows.map(r => [r.processing_status, r.count])),
@@ -1135,8 +1111,6 @@ function formatBootstrapText(data, maxChars) {
   }
 
   let truncated = false;
-  const parts = [];
-
   // Build session lines (newest first, truncate from oldest if over budget)
   const sessionLines = [];
   for (const s of data.sessions) {

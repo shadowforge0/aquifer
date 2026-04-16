@@ -29,7 +29,7 @@ function closeServer(server) {
 
 describe('llm response parsing', () => {
   it('extracts content from valid OpenAI-format response', async () => {
-    const { server, port, baseUrl } = await createTestServer((req, res) => {
+    const { server, baseUrl } = await createTestServer((req, res) => {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         choices: [{ message: { content: 'hello from LLM' } }],
@@ -46,7 +46,7 @@ describe('llm response parsing', () => {
   });
 
   it('throws on missing choices[0].message.content', async () => {
-    const { server, port, baseUrl } = await createTestServer((req, res) => {
+    const { server, baseUrl } = await createTestServer((req, res) => {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ choices: [] }));
     });
@@ -60,7 +60,7 @@ describe('llm response parsing', () => {
   });
 
   it('throws on non-JSON response', async () => {
-    const { server, port, baseUrl } = await createTestServer((req, res) => {
+    const { server, baseUrl } = await createTestServer((req, res) => {
       res.writeHead(200, { 'Content-Type': 'text/plain' });
       res.end('not json');
     });
@@ -74,7 +74,7 @@ describe('llm response parsing', () => {
   });
 
   it('throws on HTTP error with truncated body', async () => {
-    const { server, port, baseUrl } = await createTestServer((req, res) => {
+    const { server, baseUrl } = await createTestServer((req, res) => {
       res.writeHead(400, { 'Content-Type': 'text/plain' });
       res.end('A'.repeat(500)); // long error body
     });
@@ -96,7 +96,7 @@ describe('llm response parsing', () => {
 describe('llm retry logic', () => {
   it('retries on 500 and succeeds on second attempt', async () => {
     let attempt = 0;
-    const { server, port, baseUrl } = await createTestServer((req, res) => {
+    const { server, baseUrl } = await createTestServer((req, res) => {
       attempt++;
       if (attempt === 1) {
         res.writeHead(500);
@@ -123,7 +123,7 @@ describe('llm retry logic', () => {
 
   it('retries on 429 (rate limit)', async () => {
     let attempt = 0;
-    const { server, port, baseUrl } = await createTestServer((req, res) => {
+    const { server, baseUrl } = await createTestServer((req, res) => {
       attempt++;
       if (attempt <= 2) {
         res.writeHead(429);
@@ -150,7 +150,7 @@ describe('llm retry logic', () => {
 
   it('does NOT retry on 400 (non-retryable)', async () => {
     let attempt = 0;
-    const { server, port, baseUrl } = await createTestServer((req, res) => {
+    const { server, baseUrl } = await createTestServer((req, res) => {
       attempt++;
       res.writeHead(400);
       res.end('bad request');
@@ -171,7 +171,7 @@ describe('llm retry logic', () => {
 
   it('does NOT retry on 401 (auth error)', async () => {
     let attempt = 0;
-    const { server, port, baseUrl } = await createTestServer((req, res) => {
+    const { server, baseUrl } = await createTestServer((req, res) => {
       attempt++;
       res.writeHead(401);
       res.end('unauthorized');
@@ -192,7 +192,7 @@ describe('llm retry logic', () => {
 
   it('gives up after maxRetries exhausted', async () => {
     let attempt = 0;
-    const { server, port, baseUrl } = await createTestServer((req, res) => {
+    const { server, baseUrl } = await createTestServer((req, res) => {
       attempt++;
       res.writeHead(503);
       res.end('unavailable');
@@ -213,7 +213,7 @@ describe('llm retry logic', () => {
 
   it('sends correct request body (model, temperature, prompt)', async () => {
     let receivedBody = null;
-    const { server, port, baseUrl } = await createTestServer((req, res) => {
+    const { server, baseUrl } = await createTestServer((req, res) => {
       const chunks = [];
       req.on('data', c => chunks.push(c));
       req.on('end', () => {
@@ -240,7 +240,7 @@ describe('llm retry logic', () => {
 
   it('sends Authorization header when apiKey is provided', async () => {
     let receivedHeaders = null;
-    const { server, port, baseUrl } = await createTestServer((req, res) => {
+    const { server, baseUrl } = await createTestServer((req, res) => {
       receivedHeaders = req.headers;
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ choices: [{ message: { content: 'ok' } }] }));
@@ -260,7 +260,7 @@ describe('llm retry logic', () => {
 
   it('does NOT send Authorization header when apiKey is null', async () => {
     let receivedHeaders = null;
-    const { server, port, baseUrl } = await createTestServer((req, res) => {
+    const { server, baseUrl } = await createTestServer((req, res) => {
       receivedHeaders = req.headers;
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ choices: [{ message: { content: 'ok' } }] }));

@@ -109,7 +109,6 @@ describe('hybrid-rank.js — Open-loop edge cases', () => {
   });
 
   it('openLoopSet contains ALL sessions → relative order unchanged', () => {
-    const now = new Date().toISOString();
     const fts = [
       { session_id: 'a', started_at: new Date(Date.now() - 1).toISOString() },
       { session_id: 'b', started_at: new Date(Date.now() - 2).toISOString() },
@@ -243,7 +242,7 @@ describe('entity.js — resolveEntities edge cases', () => {
   it('case-variant duplicates (Pg, pg, PG) → deduped, one query', async () => {
     let queryCount = 0;
     const mockPool = {
-      async query(sql, params) {
+        async query(_sql, _params) {
         queryCount++;
         return { rows: [{ id: 1, name: 'Pg', normalized_name: 'pg' }] };
       },
@@ -537,7 +536,7 @@ describe('storage.js — recordFeedback edge cases', () => {
     const mockPool = {
       async connect() {
         return {
-          async query(sql, params) {
+          async query(sql, _params) {
             if (sql.includes('FOR UPDATE')) {
               return { rows: [{ trust_score: 0.04 }] };
             }
@@ -671,14 +670,10 @@ describe('aquifer.js — recall with entities edge cases', () => {
 
   it('recall with explicit empty entities → no resolveEntities call (skipped by guard), searchEntities path entered', async () => {
     let resolveEntitiesAttempted = false;
-    let searchEntitiesAttempted = false;
-    const mockPool = {
+      const mockPool = {
       async query(sql) {
         if (sql.includes('FOR UPDATE') && sql.includes('entity')) {
           resolveEntitiesAttempted = true;
-        }
-        if (sql.includes('frequency') && sql.includes('entity')) {
-          searchEntitiesAttempted = true;
         }
         return { rows: [] };
       },

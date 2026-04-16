@@ -60,7 +60,7 @@ describe('createAquifer', () => {
     const aq = createAquifer({
       db: 'pg://x',
       embed: { fn: async (texts) => texts.map(() => [0.1, 0.2]) },
-      llm: { fn: async (prompt) => 'response' },
+      llm: { fn: async () => 'response' },
       entities: { enabled: true },
     });
     assert.ok(aq.enrich);

@@ -44,27 +44,6 @@ CREATE INDEX IF NOT EXISTS idx_sessions_processing_status
   WHERE processing_status IN ('pending', 'processing');
 
 -- =========================================================================
--- Session segments: conversation boundary metadata
--- =========================================================================
-CREATE TABLE IF NOT EXISTS ${schema}.session_segments (
-  id                  BIGSERIAL    PRIMARY KEY,
-  session_row_id      BIGINT       NOT NULL REFERENCES ${schema}.sessions(id) ON DELETE CASCADE,
-  segment_no          INT          NOT NULL,
-  start_msg_idx       INT,
-  end_msg_idx         INT,
-  started_at          TIMESTAMPTZ,
-  ended_at            TIMESTAMPTZ,
-  raw_msg_count       INT          NOT NULL DEFAULT 0,
-  effective_msg_count INT          NOT NULL DEFAULT 0,
-  boundary_type       TEXT,
-  boundary_meta       JSONB        NOT NULL DEFAULT '{}',
-  UNIQUE (session_row_id, segment_no)
-);
-
-CREATE INDEX IF NOT EXISTS idx_session_segments_row
-  ON ${schema}.session_segments (session_row_id);
-
--- =========================================================================
 -- Session summaries: LLM-generated or extractive summaries
 -- =========================================================================
 CREATE TABLE IF NOT EXISTS ${schema}.session_summaries (
@@ -78,8 +57,6 @@ CREATE TABLE IF NOT EXISTS ${schema}.session_summaries (
   message_count            INT          NOT NULL DEFAULT 0,
   user_message_count       INT          NOT NULL DEFAULT 0,
   assistant_message_count  INT          NOT NULL DEFAULT 0,
-  boundary_count           INT          NOT NULL DEFAULT 0,
-  fresh_tail_count         INT          NOT NULL DEFAULT 0,
   started_at               TIMESTAMPTZ,
   ended_at                 TIMESTAMPTZ,
   summary_text             TEXT,
@@ -91,6 +68,11 @@ CREATE TABLE IF NOT EXISTS ${schema}.session_summaries (
   last_accessed_at         TIMESTAMPTZ,
   updated_at               TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
+
+-- Cleanup legacy segment-era schema artifacts so migrate() converges old installs
+DROP TABLE IF EXISTS ${schema}.session_segments;
+ALTER TABLE ${schema}.session_summaries DROP COLUMN IF EXISTS boundary_count;
+ALTER TABLE ${schema}.session_summaries DROP COLUMN IF EXISTS fresh_tail_count;
 
 CREATE INDEX IF NOT EXISTS idx_summaries_tenant
   ON ${schema}.session_summaries (tenant_id);

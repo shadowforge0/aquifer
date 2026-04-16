@@ -18,7 +18,6 @@ const {
   searchEntities,
   getEntityRelations,
   resolveEntities,
-  normalizeEntityName,
   getSessionsByEntityIntersection,
 } = require('../core/entity');
 const {
@@ -33,7 +32,6 @@ const {
   extractUserTurns,
   upsertTurnEmbeddings,
   getMessages,
-  recordFeedback,
 } = storage;
 const indexExports = require('../index');
 const { createEmbedder } = require('../pipeline/embed');

@@ -236,7 +236,6 @@ async function upsertEntityRelations(pool, {
   if (validPairs.length === 0) return { upserted: 0 };
 
   // Batch insert: multi-row VALUES
-  const COLS_PER_ROW = 3;
   const valueClauses = [];
   const params = [];
 
@@ -387,8 +386,7 @@ async function resolveEntities(pool, {
     if (!normQ || seen.has(normQ)) continue;
     seen.set(normQ, true);
 
-    const escaped = _escapeIlike(normQ);
-    const result = await pool.query(
+  const result = await pool.query(
       `SELECT id, name, normalized_name
       FROM ${qi(schema)}.entities
       WHERE status = 'active'

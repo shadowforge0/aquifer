@@ -13,7 +13,7 @@ function spyPool(returnRows = []) {
   const calls = [];
   return {
     calls,
-    async query(sql, params) {
+        async query(sql, params) {
       calls.push({ sql, params });
       return { rows: returnRows };
     },
@@ -152,7 +152,7 @@ describe('enrich stale reclaim', () => {
     const captured = { claimSql: null };
     return {
       captured,
-      async query(sql, params) {
+      async query(sql, _params) {
         // Claim UPDATE
         if (sql.includes('SET processing_status') && sql.includes('RETURNING')) {
           captured.claimSql = sql;
@@ -239,7 +239,7 @@ describe('createAquifer entityScope propagation via enrich', () => {
     const entityInserts = [];
     return {
       entityInserts,
-      async query(sql, params) {
+      async query(sql, _params) {
         // Claim
         if (sql.includes('SET processing_status') && sql.includes('RETURNING')) {
           return { rows: [claimRow] };
@@ -273,10 +273,10 @@ describe('createAquifer entityScope propagation via enrich', () => {
     structuredSummary: {},
     entityRaw: '[ENTITIES]\nname: TestEntity\ntype: concept\naliases:\n---',
   });
-  const customEntityParseFn = (text) => [{
+  const customEntityParseFn = () => [{
     name: 'TestEntity', normalizedName: 'testentity', type: 'concept', aliases: [],
   }];
-  const embedFn = async (texts) => texts.map(() => [0.1, 0.2, 0.3]);
+  const embedFn = async (_texts) => [[0.1, 0.2, 0.3]];
 
   it('config.entities.scope flows to upsertEntity during enrich', async () => {
     const pool = makeFullPool();

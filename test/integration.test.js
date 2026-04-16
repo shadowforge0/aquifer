@@ -118,7 +118,7 @@ async function createTestInstance(extraConfig = {}) {
  * 先 aq.close() 關 aquifer 自己的 pool，再用 adminPool DROP schema。
  */
 async function teardown(aq, adminPool, schema) {
-  try { await aq.close(); } catch (_) {}
+  try { await aq.close(); } catch {}
   try {
     await adminPool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
   } finally {
@@ -143,7 +143,7 @@ describe('1. migrate() — DDL 完整性', () => {
   });
 
   it('建立所有 base tables', async () => {
-    // 驗什麼：sessions / session_segments / session_summaries / turn_embeddings 都存在
+    // 驗什麼：sessions / session_summaries / turn_embeddings 都存在
     // 為什麼重要：migrate 是所有 API 的前提，schema 缺損後面全爛
     const res = await pool.query(
       `SELECT table_name FROM information_schema.tables
@@ -153,7 +153,6 @@ describe('1. migrate() — DDL 完整性', () => {
     );
     const tables = res.rows.map(r => r.table_name);
     assert.ok(tables.includes('sessions'), 'sessions table missing');
-    assert.ok(tables.includes('session_segments'), 'session_segments table missing');
     assert.ok(tables.includes('session_summaries'), 'session_summaries table missing');
     assert.ok(tables.includes('turn_embeddings'), 'turn_embeddings table missing');
   });
@@ -857,14 +856,6 @@ describe('5. feedback() — trust_score', () => {
   it('feedback 寫入 session_feedback audit trail', async () => {
     // 驗什麼：每次 feedback 有一條 audit row
     // 為什麼重要：audit trail 用於 debug 和 ML 訓練資料
-    const before = await pool.query(
-      `SELECT COUNT(*) FROM "${schema}".session_feedback sf
-       JOIN "${schema}".sessions s ON s.id = sf.session_row_id
-       WHERE s.session_id = $1`,
-      ['sid-feedback']
-    );
-    const countBefore = parseInt(before.rows[0].count);
-
     await aq.feedback('sid-feedback', { verdict: 'helpful', note: 'great answer' });
 
     const after = await pool.query(

@@ -39,7 +39,7 @@ function createTEIReranker(config) {
   const initialBackoffMs = config.initialBackoffMs || 250;
 
   return {
-    async rerank(query, documents, opts = {}) {
+    async rerank(query, documents, _opts = {}) {
       if (!query || !documents || documents.length === 0) return [];
 
       const result = await withRetry(

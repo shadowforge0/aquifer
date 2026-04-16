@@ -26,8 +26,6 @@
 
 const path = require('path');
 const os = require('os');
-const { createAquiferFromConfig } = require('./shared/factory');
-
 // ---------------------------------------------------------------------------
 // SQLite access — use Node 22+ built-in or fall back to better-sqlite3
 // ---------------------------------------------------------------------------
@@ -37,7 +35,7 @@ function openSqlite(dbPath) {
   try {
     const { DatabaseSync } = require('node:sqlite');
     return new DatabaseSync(dbPath, { open: true, readOnly: true });
-  } catch (_) {
+  } catch {
     // not available
   }
 
@@ -45,7 +43,7 @@ function openSqlite(dbPath) {
   try {
     const Database = require('better-sqlite3');
     return new Database(dbPath, { readonly: true });
-  } catch (_) {
+  } catch {
     // not available
   }
 
@@ -220,7 +218,7 @@ async function ingestOpenCode(aquifer, args) {
   try {
     const existing = await aquifer.exportSessions({ source: 'opencode', limit: 10000 });
     for (const row of existing) existingSet.add(row.session_id);
-  } catch (_) {
+  } catch {
     // exportSessions may not exist in all versions
   }
 
@@ -300,7 +298,9 @@ async function ingestOpenCode(aquifer, args) {
       if (jsonOutput) {
         results.push(info);
       } else {
-        const enrichNote = info.turnsEmbedded != null ? ` (${info.turnsEmbedded} turns, ${info.entitiesFound} entities)` : '';
+        const enrichNote = info.turnsEmbedded !== null && info.turnsEmbedded !== undefined
+          ? ` (${info.turnsEmbedded} turns, ${info.entitiesFound} entities)`
+          : '';
         console.log(`  [${committed}] ${sid} "${session.title}"${enrichNote}`);
       }
     } catch (err) {

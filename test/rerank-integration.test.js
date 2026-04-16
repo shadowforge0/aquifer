@@ -11,7 +11,7 @@ describe('rerank integration', () => {
       embed: { fn: async (texts) => texts.map(() => [0.1, 0.2]) },
       rerank: {
         provider: 'custom',
-        fn: async ({ query, documents, topN }) => {
+        fn: async ({ documents }) => {
           return documents.map((_, i) => ({ index: i, score: 1 - i * 0.1 }));
         },
       },
