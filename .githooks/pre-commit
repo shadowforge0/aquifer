@@ -18,7 +18,7 @@ if ! node --test test/*.test.js >/tmp/aquifer-pre-commit-test.log 2>&1; then
 fi
 
 printf "${DIM}[pre-commit] running eslint...${RESET}\n"
-if ! npx --no-install eslint index.js core/*.js consumers/*.js pipeline/*.js scripts/*.js test/*.js >/tmp/aquifer-pre-commit-lint.log 2>&1; then
+if ! npm run --silent lint >/tmp/aquifer-pre-commit-lint.log 2>&1; then
   printf "${RED}[pre-commit] lint failed${RESET}\n"
   cat /tmp/aquifer-pre-commit-lint.log
   exit 1

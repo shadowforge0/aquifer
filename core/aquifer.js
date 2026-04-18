@@ -100,6 +100,9 @@ function createAquifer(config) {
 
   // Entity config
   let entitiesEnabled = config.entities && config.entities.enabled === true;
+
+  // Facts config (opt-in consolidation lifecycle)
+  let factsEnabled = config.facts && config.facts.enabled === true;
   const mergeCall = config.entities && config.entities.mergeCall !== undefined ? config.entities.mergeCall : true;
   const entityPromptFn = config.entities && config.entities.prompt ? config.entities.prompt : null;
   const entityScope = (config.entities && config.entities.scope) || 'default';
@@ -211,6 +214,12 @@ function createAquifer(config) {
         const trustSql = loadSql('003-trust-feedback.sql', schema);
         await pool.query(trustSql);
 
+        // 4. Facts / consolidation (opt-in)
+        if (factsEnabled) {
+          const factsSql = loadSql('004-facts.sql', schema);
+          await pool.query(factsSql);
+        }
+
         migrated = true;
       } finally {
         await pool.query('SELECT pg_advisory_unlock($1)', [lockKey]).catch((err) => {
@@ -242,6 +251,32 @@ function createAquifer(config) {
         const entitySql = loadSql('002-entities.sql', schema);
         await pool.query(entitySql);
       }
+    },
+
+    async enableFacts() {
+      factsEnabled = true;
+      // Run the facts DDL (idempotent — all CREATE/ALTER use IF NOT EXISTS).
+      // Safe to call repeatedly; also safe to call before migrate() (will no-op
+      // until base schema exists, which enrich/commit will materialize).
+      await ensureMigrated();
+      const factsSql = loadSql('004-facts.sql', schema);
+      await pool.query(factsSql);
+    },
+
+    async consolidate(sessionId, opts = {}) {
+      if (!factsEnabled) throw new Error('aquifer.consolidate() requires enableFacts() first');
+      await ensureMigrated();
+      const { applyConsolidation } = require('../pipeline/consolidation');
+      const agentId = opts.agentId || 'agent';
+      return applyConsolidation(pool, {
+        actions: opts.actions || [],
+        agentId,
+        sessionId,
+        schema,
+        tenantId,
+        normalizeSubject: opts.normalizeSubject || null,
+        recapOverview: opts.recapOverview || '',
+      });
     },
 
     // --- write path ---
