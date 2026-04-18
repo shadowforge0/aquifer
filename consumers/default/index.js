@@ -49,15 +49,18 @@ function createPersona(personaOpts = {}) {
   let _instance = null;
   function getAquifer({ pool, embedFn, llmFn, rerankKey } = {}) {
     if (_instance) return _instance;
-    _instance = createAquifer({
+    // v1.2.0: all four are optional. If omitted, Aquifer core falls back to
+    // DATABASE_URL + EMBED_PROVIDER + AQUIFER_LLM_PROVIDER env.
+    const cfg = {
       schema: persona.schema,
-      db: pool,
       tenantId: 'default',
-      embed: embedFn ? { fn: embedFn } : undefined,
-      llm: llmFn ? { fn: llmFn } : undefined,
       entities: { enabled: !persona.skipEntities, scope: persona.scope },
-      ...(rerankKey ? { rerank: { provider: 'openrouter', openrouterApiKey: rerankKey, topK: 20, maxChars: 1600 } } : {}),
-    });
+    };
+    if (pool !== undefined) cfg.db = pool;
+    if (embedFn) cfg.embed = { fn: embedFn };
+    if (llmFn) cfg.llm = { fn: llmFn };
+    if (rerankKey) cfg.rerank = { provider: 'openrouter', openrouterApiKey: rerankKey, topK: 20, maxChars: 1600 };
+    _instance = createAquifer(cfg);
     return _instance;
   }
   function resetAquifer() { _instance = null; }
@@ -123,16 +126,20 @@ function createPersona(personaOpts = {}) {
   // ------- OpenClaw mount -------
 
   function resolveCommon(opts) {
-    if (!opts.pool) throw new Error('default persona: pool is required');
-    if (!opts.embedFn) throw new Error('default persona: embedFn is required');
-    if (!opts.llmFn) throw new Error('default persona: llmFn is required (pass via AQUIFER_LLM_PROVIDER or explicit opts)');
+    // v1.2.0: all four are env-driven by default. Host may override any of
+    // them via opts. Aquifer core throws with clear guidance if the required
+    // env vars are missing, so we do not pre-validate here.
+    const aquifer = getAquifer(opts);
+    const pool = opts.pool || aquifer.getPool();
+    const llmFn = opts.llmFn || aquifer.getLlmFn();
+    const embedFn = opts.embedFn || aquifer.getEmbedFn();
     return {
-      pool: opts.pool,
-      embedFn: opts.embedFn,
-      llmFn: opts.llmFn,
+      pool,
+      embedFn,
+      llmFn,
       defaultAgentId: opts.agentId || 'main',
       minUserMessages: opts.minUserMessages || 3,
-      aquifer: getAquifer(opts),
+      aquifer,
     };
   }
 

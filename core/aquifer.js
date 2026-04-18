@@ -1027,6 +1027,25 @@ function createAquifer(config = {}) {
       return { schema, tenantId };
     },
 
+    // v1.2.0: expose the internal pool so host persona layers can reuse it
+    // for host-owned tables (e.g. daily_entries). Read-only — callers should
+    // not call pool.end() on it; use aquifer.close() for that.
+    getPool() {
+      return pool;
+    },
+
+    // v1.2.0: expose resolved LLM function. May be null if no llm.fn was
+    // supplied and AQUIFER_LLM_PROVIDER env is unset. Persona layers that
+    // implement custom summaryFn can reuse this instead of wiring their own.
+    getLlmFn() {
+      return llmFn;
+    },
+
+    // v1.2.0: expose resolved embed function (may be null same as LLM).
+    getEmbedFn() {
+      return embedFn;
+    },
+
     // --- admin query helpers ---
 
     async getStats() {
