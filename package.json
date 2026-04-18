@@ -22,7 +22,10 @@
     "./consumers/opencode": "./consumers/opencode.js",
     "./consumers/shared/config": "./consumers/shared/config.js",
     "./consumers/shared/factory": "./consumers/shared/factory.js",
-    "./consumers/shared/entity-parser": "./consumers/shared/entity-parser.js"
+    "./consumers/shared/entity-parser": "./consumers/shared/entity-parser.js",
+    "./consumers/shared/normalize": "./consumers/shared/normalize.js",
+    "./consumers/shared/ingest": "./consumers/shared/ingest.js",
+    "./consumers/shared/recall-format": "./consumers/shared/recall-format.js"
   },
   "repository": {
     "type": "git",
