@@ -156,40 +156,35 @@ function buildPostProcess({
 }
 
 // ---------------------------------------------------------------------------
-// mountOnOpenClaw — gateway plugin helper
+// Mount helpers — afterburn / context-inject / session_recall tool.
+// Each is independently mountable so different OpenClaw extensions can claim
+// the hooks they care about. mountOnOpenClaw() is the all-in-one convenience.
 // ---------------------------------------------------------------------------
 
+function resolveCommon(opts) {
+    if (!opts.pool) throw new Error('Miranda: pool is required');
+    if (!opts.embedFn) throw new Error('Miranda: embedFn is required');
+    return {
+        pool: opts.pool,
+        embedFn: opts.embedFn,
+        defaultAgentId: opts.agentId || 'main',
+        workspaceDir: opts.workspaceDir || null,
+        minUserMessages: opts.minUserMessages || 3,
+        aquifer: instance.getAquifer({
+            pool: opts.pool, embedFn: opts.embedFn, llmFn: opts.llmFn, rerankKey: opts.rerankKey,
+        }),
+    };
+}
+
 /**
- * Register Miranda-flavored hooks on an OpenClaw plugin `api` object:
- *   - before_reset: normalize+commit+enrich with Miranda summaryFn & postProcess
- *   - before_prompt_build: inject Miranda session context
- *   - session_recall tool: zh-TW formatted recall
- *
- * @param {object} api — OpenClaw plugin API (api.on, api.registerTool, api.logger, api.pluginConfig)
- * @param {object} opts
- * @param {object} opts.pool     — pg.Pool
- * @param {function} opts.embedFn
- * @param {function} [opts.llmFn] — defaults to Miranda's callLlm
- * @param {string}  [opts.agentId='main']
- * @param {string}  [opts.workspaceDir]
- * @param {string}  [opts.rerankKey]
- * @param {number}  [opts.minUserMessages=3]
+ * Register Miranda's afterburn hook (before_reset) on the OpenClaw api.
+ * Runs commit + enrich with Miranda's summaryFn and postProcess.
  */
-function mountOnOpenClaw(api, opts = {}) {
-    const pool = opts.pool;
-    const embedFn = opts.embedFn;
-    const defaultAgentId = opts.agentId || 'main';
-    const workspaceDir = opts.workspaceDir || null;
-    const minUserMessages = opts.minUserMessages || 3;
-
-    const aquifer = instance.getAquifer({
-        pool, embedFn, llmFn: opts.llmFn, rerankKey: opts.rerankKey,
-    });
-
+function registerAfterburn(api, opts = {}) {
+    const { pool, aquifer, defaultAgentId, workspaceDir, minUserMessages } = resolveCommon(opts);
     const recentlyProcessed = new Map();
     const inFlight = new Set();
 
-    // --- before_reset: capture session ---
     api.on('before_reset', (event, ctx) => {
         const sessionId = ctx?.sessionId || event?.sessionId;
         const agentId = ctx?.agentId || defaultAgentId;
@@ -237,7 +232,18 @@ function mountOnOpenClaw(api, opts = {}) {
         })();
     });
 
-    // --- before_prompt_build: inject Miranda briefing ---
+    api.logger.info('[miranda] registerAfterburn: before_reset hooked');
+    return { aquifer };
+}
+
+/**
+ * Register the before_prompt_build Miranda context injection.
+ * Separate from afterburn so the Driftwood ext can install it while the
+ * afterburn ext owns the before_reset hook.
+ */
+function registerContextInject(api, opts = {}) {
+    const { pool, aquifer, defaultAgentId } = resolveCommon(opts);
+
     api.on('before_prompt_build', async (event, ctx) => {
         try {
             const agentId = ctx?.agentId || defaultAgentId;
@@ -255,7 +261,16 @@ function mountOnOpenClaw(api, opts = {}) {
         }
     });
 
-    // --- session_recall tool (zh-TW format) ---
+    api.logger.info('[miranda] registerContextInject: before_prompt_build hooked');
+    return { aquifer };
+}
+
+/**
+ * Register the zh-TW session_recall tool.
+ */
+function registerRecallTool(api, opts = {}) {
+    const { aquifer } = resolveCommon(opts);
+
     api.registerTool((ctx) => {
         if ((ctx?.sessionKey || '').includes('subagent')) return null;
         return {
@@ -295,8 +310,19 @@ function mountOnOpenClaw(api, opts = {}) {
         };
     }, { name: 'session_recall' });
 
-    api.logger.info('[miranda] mounted on OpenClaw (before_reset + before_prompt_build + session_recall)');
+    api.logger.info('[miranda] registerRecallTool: session_recall tool registered');
     return { aquifer };
+}
+
+/**
+ * Convenience: register all three on the same api. Equivalent to calling
+ * registerAfterburn + registerContextInject + registerRecallTool.
+ */
+function mountOnOpenClaw(api, opts = {}) {
+    const r1 = registerAfterburn(api, opts);
+    registerContextInject(api, opts);
+    registerRecallTool(api, opts);
+    return r1;
 }
 
 // ---------------------------------------------------------------------------
@@ -306,6 +332,9 @@ function mountOnOpenClaw(api, opts = {}) {
 module.exports = {
     // Persona entry points
     mountOnOpenClaw,
+    registerAfterburn,
+    registerContextInject,
+    registerRecallTool,
     buildPostProcess,
     buildSummaryFn,
     buildEntityParseFn,
