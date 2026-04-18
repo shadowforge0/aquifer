@@ -120,8 +120,25 @@ module.exports.coerceRawEntries = coerceRawEntries;
 
 function register(api) {
     const pluginConfig = api.pluginConfig || {};
-    let aquifer;
 
+    // v1.2.0: delegate to a persona layer if one is configured, otherwise
+    // run the generic default path (before_reset + session_recall + feedback).
+    const personaPath = pluginConfig.persona || process.env.AQUIFER_PERSONA;
+    if (personaPath) {
+      try {
+        const persona = require(personaPath);
+        if (persona && typeof persona.mountOnOpenClaw === 'function') {
+          persona.mountOnOpenClaw(api, pluginConfig);
+          api.logger.info(`[aquifer-memory] registered via persona: ${personaPath}`);
+          return;
+        }
+        api.logger.warn(`[aquifer-memory] persona at ${personaPath} lacks mountOnOpenClaw; falling back to default`);
+      } catch (err) {
+        api.logger.warn(`[aquifer-memory] failed to load persona ${personaPath}: ${err.message}; falling back to default`);
+      }
+    }
+
+    let aquifer;
     try {
       aquifer = createAquiferFromConfig(pluginConfig);
     } catch (err) {

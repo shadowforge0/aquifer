@@ -1,0 +1,10 @@
+{
+  "name": "aquifer-openclaw-ext",
+  "version": "1.2.0",
+  "private": true,
+  "main": "index.js",
+  "description": "Drop-in OpenClaw extension for Aquifer Memory. Symlink into $OPENCLAW_HOME/extensions/aquifer-memory/ — no host-side boilerplate required.",
+  "openclaw": {
+    "plugin": "./openclaw.plugin.json"
+  }
+}

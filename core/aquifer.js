@@ -9,6 +9,7 @@ const entity = require('./entity');
 const { hybridRank } = require('./hybrid-rank');
 const { summarize } = require('../pipeline/summarize');
 const { extractEntities } = require('../pipeline/extract-entities');
+const { createEmbedder } = require('../pipeline/embed');
 
 // ---------------------------------------------------------------------------
 // Schema name validation
@@ -55,39 +56,88 @@ function buildRerankDocument(row, maxChars) {
 }
 
 // ---------------------------------------------------------------------------
+// resolveEmbedFn — v1.2.0 embed autodetect (explicit > object > env > null)
+// ---------------------------------------------------------------------------
+
+function resolveEmbedFn(embedConfig, env) {
+  if (embedConfig && typeof embedConfig.fn === 'function') {
+    return embedConfig.fn;
+  }
+  if (embedConfig && embedConfig.provider) {
+    const embedder = createEmbedder(embedConfig);
+    return (texts) => embedder.embedBatch(texts);
+  }
+  const provider = env.EMBED_PROVIDER;
+  if (!provider) return null;
+
+  const opts = { provider };
+  if (provider === 'ollama') {
+    opts.ollamaUrl = env.OLLAMA_URL || env.AQUIFER_EMBED_BASE_URL || 'http://localhost:11434';
+    opts.model = env.AQUIFER_EMBED_MODEL || 'bge-m3';
+  } else if (provider === 'openai') {
+    opts.openaiApiKey = env.OPENAI_API_KEY;
+    if (!opts.openaiApiKey) {
+      throw new Error('EMBED_PROVIDER=openai requires OPENAI_API_KEY');
+    }
+    opts.openaiModel = env.AQUIFER_EMBED_MODEL || 'text-embedding-3-small';
+    if (env.AQUIFER_EMBED_DIM) opts.openaiDimensions = Number(env.AQUIFER_EMBED_DIM);
+  } else {
+    throw new Error(`EMBED_PROVIDER=${provider} not supported by autodetect (use 'ollama' or 'openai', or pass config.embed.fn explicitly)`);
+  }
+  const embedder = createEmbedder(opts);
+  return (texts) => embedder.embedBatch(texts);
+}
+
+// ---------------------------------------------------------------------------
 // createAquifer
 // ---------------------------------------------------------------------------
 
-function createAquifer(config) {
-  if (!config || !config.db) {
-    throw new Error('config.db (pg.Pool or connection string) is required');
+function createAquifer(config = {}) {
+  // v1.2.0: db falls back to DATABASE_URL / AQUIFER_DB_URL env so hosts can
+  // call createAquifer() with zero args for install-and-go.
+  const dbInput = config.db !== undefined
+    ? config.db
+    : (process.env.DATABASE_URL || process.env.AQUIFER_DB_URL || null);
+
+  if (!dbInput) {
+    throw new Error(
+      'Aquifer requires a database: pass config.db (pg.Pool or connection string), '
+      + 'or set DATABASE_URL / AQUIFER_DB_URL in the environment.'
+    );
   }
 
-  const schema = config.schema || 'aquifer';
+  const schema = config.schema || process.env.AQUIFER_SCHEMA || 'aquifer';
   validateSchema(schema);
 
   if (config.tenantId === '') throw new Error('config.tenantId must not be empty');
-  const tenantId = config.tenantId || 'default';
+  const tenantId = config.tenantId || process.env.AQUIFER_TENANT_ID || 'default';
 
   // Pool management
   let pool;
   let ownsPool = false;
-  if (typeof config.db === 'string') {
-    pool = new Pool({ connectionString: config.db });
+  if (typeof dbInput === 'string') {
+    pool = new Pool({ connectionString: dbInput });
     ownsPool = true;
   } else {
-    pool = config.db;
+    pool = dbInput;
     ownsPool = !!config.ownsPool;  // allow factory to claim ownership
   }
 
   // Embed config (lazy — only required for recall/enrich)
-  const embedFn = config.embed && typeof config.embed.fn === 'function' ? config.embed.fn : null;
+  // v1.2.0 fallback chain:
+  //   1. config.embed.fn (explicit function)
+  //   2. config.embed.provider (build via createEmbedder)
+  //   3. EMBED_PROVIDER env + provider-specific key (zero-arg install-and-go)
+  //   4. null — defer to requireEmbed() at call time
+  const embedFn = resolveEmbedFn(config.embed, process.env);
   function requireEmbed(op) {
-    if (!embedFn) throw new Error(`Aquifer.${op}() requires config.embed.fn (async (texts) => number[][])`);
+    if (!embedFn) throw new Error(`Aquifer.${op}() requires config.embed.fn or EMBED_PROVIDER env (async (texts) => number[][])`);
   }
 
   // LLM config (optional — only needed for enrich with built-in summarize)
-  const llmFn = config.llm && typeof config.llm.fn === 'function' ? config.llm.fn : null;
+  // v1.2.0: falls back to AQUIFER_LLM_PROVIDER env + provider-specific key.
+  const { resolveLlmFn } = require('../consumers/shared/llm-autodetect');
+  const llmFn = resolveLlmFn(config.llm, process.env);
 
   // Summarize config
   const summarizePromptFn = config.summarize && config.summarize.prompt ? config.summarize.prompt : null;
@@ -240,7 +290,7 @@ function createAquifer(config) {
       sources.set(name, {
         type: opts.type || 'custom',
         search: opts.search || null,
-        weight: opts.weight !== null && opts.weight !== undefined ? opts.weight : 1.0,
+        weight: opts.weight !== undefined && opts.weight !== undefined ? opts.weight : 1.0,
       });
     },
 
@@ -819,7 +869,7 @@ function createAquifer(config) {
       const externalPromises = [];
       for (const [name, sourceConfig] of sources) {
         if (typeof sourceConfig.search === 'function') {
-          const w = sourceConfig.weight !== null && sourceConfig.weight !== undefined ? sourceConfig.weight : 1.0;
+          const w = sourceConfig.weight !== undefined && sourceConfig.weight !== undefined ? sourceConfig.weight : 1.0;
           externalPromises.push(
             Promise.race([
               sourceConfig.search(query, opts),

@@ -1,0 +1,9 @@
+{
+  "id": "aquifer-memory",
+  "name": "Aquifer Memory",
+  "version": "1.2.0",
+  "description": "Session ingest + recall + feedback. Reads DATABASE_URL / EMBED_PROVIDER / AQUIFER_LLM_PROVIDER from host env; delegates to AQUIFER_PERSONA module if set.",
+  "main": "index.js",
+  "hooks": ["before_reset"],
+  "configSchema": {}
+}

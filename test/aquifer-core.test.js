@@ -5,8 +5,16 @@ const assert = require('node:assert/strict');
 const { createAquifer } = require('../index');
 
 describe('createAquifer', () => {
-  it('throws if no db config', () => {
-    assert.throws(() => createAquifer({}), /config\.db/);
+  it('throws if no db config and no env', () => {
+    const prev = { url: process.env.DATABASE_URL, aq: process.env.AQUIFER_DB_URL };
+    delete process.env.DATABASE_URL;
+    delete process.env.AQUIFER_DB_URL;
+    try {
+      assert.throws(() => createAquifer({}), /database|DATABASE_URL/i);
+    } finally {
+      if (prev.url !== undefined) process.env.DATABASE_URL = prev.url;
+      if (prev.aq !== undefined) process.env.AQUIFER_DB_URL = prev.aq;
+    }
   });
 
   it('creates without embed or llm (lazy validation)', () => {

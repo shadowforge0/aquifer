@@ -1,6 +1,6 @@
 {
   "name": "@shadowforge0/aquifer-memory",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "PG-native long-term memory for AI agents. Turn-level embedding, hybrid RRF ranking, optional knowledge graph. MCP server, CLI, and library API.",
   "main": "index.js",
   "files": [
@@ -10,6 +10,8 @@
     "schema/",
     "consumers/",
     "consumers/miranda/",
+    "consumers/default/",
+    "consumers/openclaw-ext/",
     "docs/",
     "scripts/"
   ],
@@ -23,12 +25,15 @@
     "./consumers/opencode": "./consumers/opencode.js",
     "./consumers/claude-code": "./consumers/claude-code.js",
     "./consumers/miranda": "./consumers/miranda/index.js",
+    "./consumers/default": "./consumers/default/index.js",
+    "./consumers/openclaw-ext": "./consumers/openclaw-ext/index.js",
     "./consumers/shared/config": "./consumers/shared/config.js",
     "./consumers/shared/factory": "./consumers/shared/factory.js",
     "./consumers/shared/entity-parser": "./consumers/shared/entity-parser.js",
     "./consumers/shared/normalize": "./consumers/shared/normalize.js",
     "./consumers/shared/ingest": "./consumers/shared/ingest.js",
-    "./consumers/shared/recall-format": "./consumers/shared/recall-format.js"
+    "./consumers/shared/recall-format": "./consumers/shared/recall-format.js",
+    "./consumers/shared/llm-autodetect": "./consumers/shared/llm-autodetect.js"
   },
   "repository": {
     "type": "git",
@@ -42,7 +47,7 @@
   "scripts": {
     "test": "node --test test/*.test.js",
     "test:integration": "node --test test/integration.test.js",
-    "lint": "eslint index.js core/*.js consumers/*.js consumers/shared/*.js consumers/miranda/*.js consumers/miranda/prompts/*.js pipeline/*.js pipeline/consolidation/*.js scripts/*.js test/*.js",
+    "lint": "eslint index.js core/*.js consumers/*.js consumers/shared/*.js consumers/miranda/*.js consumers/miranda/prompts/*.js consumers/default/*.js consumers/default/prompts/*.js consumers/openclaw-ext/*.js pipeline/*.js pipeline/consolidation/*.js scripts/*.js test/*.js",
     "prepare": "git config core.hooksPath .githooks 2>/dev/null || true"
   },
   "dependencies": {
