@@ -43,6 +43,8 @@ function evictStale(dedupMap, now = Date.now()) {
  * @param {object} [opts.preNormalized] — { messages, userCount, ... } ready to commit,
  *        required when adapter === 'preNormalized'
  * @param {number} [opts.minUserMessages=3] — enrich threshold
+ * @param {boolean} [opts.enrich=true] — when false, commit only; don't enrich or skip.
+ *        Useful for pull-style ingest (OpenCode) where enrichment runs later.
  * @param {Map} [opts.dedupMap] — Map<key, timestamp>; same session won't process twice within TTL
  * @param {Set} [opts.inFlight] — Set<key>; concurrent firings are guarded
  * @param {function} [opts.postProcess] — forwarded to enrich()
@@ -56,6 +58,7 @@ async function runIngest(opts = {}) {
         aquifer, sessionId, agentId, source, sessionKey,
         rawEntries, adapter, preNormalized,
         minUserMessages = 3,
+        enrich = true,
         dedupMap = null, inFlight = null,
         postProcess = null, summaryFn = null, entityParseFn = null,
         logger = console,
@@ -101,8 +104,12 @@ async function runIngest(opts = {}) {
         });
         if (logger && logger.info) logger.info(`[aquifer-ingest] committed ${sessionId} (${norm.messages.length} msgs, user=${norm.userCount})`);
 
-        // 3. Enrich or skip
+        // 3. Enrich or skip (unless caller opts out — then commit only)
         let enrichResult = null;
+        if (!enrich) {
+            if (dedupMap) { dedupMap.set(dedupKey, Date.now()); evictStale(dedupMap); }
+            return { status: 'committed_only', normalized: norm.messages, counts: norm, enrichResult: null };
+        }
         if (norm.userCount >= minUserMessages) {
             try {
                 enrichResult = await aquifer.enrich(sessionId, {

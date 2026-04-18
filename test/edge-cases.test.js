@@ -171,11 +171,13 @@ const mcpPrivate = loadModuleFromSource('consumers/mcp.js', {
 }).__private;
 
 const openclawPrivate = loadModuleFromSource('consumers/openclaw-plugin.js', {
-  exportNames: ['coerceRawEntries', 'normalizeEntries', 'formatRecallResults', 'formatDate'],
+  exportNames: ['coerceRawEntries', 'normalizeEntries', 'formatRecallResults'],
   mocks: {
     './shared/factory': { createAquiferFromConfig() { return {}; } },
   },
 }).__private;
+
+const { formatDateIso } = require('../consumers/shared/recall-format');
 
 describe('consumers/cli.js', () => {
   it('cmdRecall falls back to default limit for invalid numeric input', async () => {
@@ -545,8 +547,9 @@ describe('consumers/openclaw-plugin.js', () => {
     assert.match(text, /unknown, default/);
   });
 
-  it('formatDate falls back to unknown for malformed values', () => {
-    assert.equal(openclawPrivate.formatDate('bad-date'), 'unknown');
+  it('formatDateIso (shared) falls back to unknown for malformed values', () => {
+    assert.equal(formatDateIso('bad-date'), 'unknown');
+    assert.equal(formatDateIso(null), 'unknown');
   });
 
   it('register disables the plugin when configuration is invalid', () => {

@@ -26,6 +26,7 @@
 
 const path = require('path');
 const os = require('os');
+const { runIngest } = require('./shared/ingest');
 // ---------------------------------------------------------------------------
 // SQLite access — use Node 22+ built-in or fall back to better-sqlite3
 // ---------------------------------------------------------------------------
@@ -269,30 +270,26 @@ async function ingestOpenCode(aquifer, args) {
       continue;
     }
 
-    // Commit to Aquifer
+    // Commit + optional enrich via shared ingest pipeline
     try {
-      await aquifer.commit(sid, norm.messages, {
+      const ingestResult = await runIngest({
+        aquifer,
+        sessionId: sid,
         agentId,
         source: 'opencode',
-        model: norm.model,
-        tokensIn: norm.tokensIn,
-        tokensOut: norm.tokensOut,
-        startedAt: norm.startedAt,
-        lastMessageAt: norm.lastMessageAt,
+        adapter: 'preNormalized',
+        preNormalized: norm,
+        enrich: doEnrich,
+        minUserMessages,
+        logger: { info() {}, warn(m) { info.enrichError = m; } },
       });
+
       committed++;
       info.status = 'committed';
-
-      // Enrich if requested
-      if (doEnrich) {
-        try {
-          const enrichResult = await aquifer.enrich(sid, { agentId });
-          info.status = 'enriched';
-          info.turnsEmbedded = enrichResult.turnsEmbedded;
-          info.entitiesFound = enrichResult.entitiesFound;
-        } catch (enrichErr) {
-          info.enrichError = enrichErr.message;
-        }
+      if (ingestResult.enrichResult) {
+        info.status = 'enriched';
+        info.turnsEmbedded = ingestResult.enrichResult.turnsEmbedded;
+        info.entitiesFound = ingestResult.enrichResult.entitiesFound;
       }
 
       if (jsonOutput) {

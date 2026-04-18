@@ -30,30 +30,10 @@ function getAquifer() {
 // Format recall results as readable text
 // ---------------------------------------------------------------------------
 
+const { formatRecallResults } = require('./shared/recall-format');
+
 function formatResults(results, query) {
-  if (results.length === 0) return `No results found for "${query}".`;
-
-  const lines = [`Found ${results.length} result(s) for "${query}":\n`];
-  for (let i = 0; i < results.length; i++) {
-    const r = results[i];
-    const ss = r.structuredSummary || {};
-    const title = ss.title || r.summaryText?.slice(0, 60) || '(untitled)';
-    let date = 'unknown';
-    if (r.startedAt) {
-      const parsed = new Date(r.startedAt);
-      if (!isNaN(parsed.getTime())) date = parsed.toISOString().slice(0, 10);
-    }
-
-    lines.push(`### ${i + 1}. ${title} (${date}, ${r.agentId || 'default'})`);
-    if (ss.overview || r.summaryText) {
-      lines.push((ss.overview || r.summaryText).slice(0, 300));
-    }
-    if (r.matchedTurnText) {
-      lines.push(`Matched turn: ${r.matchedTurnText.slice(0, 200)}`);
-    }
-    lines.push(`Score: ${r.score?.toFixed(3) || '?'}\n`);
-  }
-  return lines.join('\n');
+  return formatRecallResults(results, { query, showScore: true });
 }
 
 // ---------------------------------------------------------------------------

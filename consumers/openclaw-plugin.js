@@ -16,6 +16,8 @@
  */
 
 const { createAquiferFromConfig } = require('./shared/factory');
+const { runIngest } = require('./shared/ingest');
+const { formatRecallResults: sharedFormatRecallResults } = require('./shared/recall-format');
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -80,30 +82,23 @@ function normalizeEntries(rawEntries) {
   };
 }
 
-function formatDate(value) {
-  if (!value) return 'unknown';
-  const parsed = new Date(value);
-  return isNaN(parsed.getTime()) ? 'unknown' : parsed.toISOString().slice(0, 10);
-}
-
-function formatRecallResults(results) {
-  if (results.length === 0) return 'No matching sessions found.';
-
-  return results.map((r, i) => {
-    const ss = r.structuredSummary || {};
-    const title = ss.title || r.summaryText?.slice(0, 60) || '(untitled)';
-    const date = formatDate(r.startedAt);
-
-    const lines = [`### ${i + 1}. ${title} (${date}, ${r.agentId || 'default'})`];
-    if (ss.overview || r.summaryText) {
-      lines.push((ss.overview || r.summaryText).slice(0, 300));
-    }
-    if (r.matchedTurnText) {
-      lines.push(`Matched: ${r.matchedTurnText.slice(0, 200)}`);
-    }
-    return lines.join('\n');
-  }).join('\n\n');
-}
+// Thin adapter over the shared formatter. OpenClaw's tool output historically
+// used "Matched:" instead of "Matched turn:" and joined with blank lines, so
+// we supply a pair of renderer overrides to preserve that shape.
+const formatRecallResults = (function () {
+  const { createRecallFormatter } = require('./shared/recall-format');
+  const _fmt = createRecallFormatter({
+    header: () => null,
+    matched: (r) => r.matchedTurnText ? `Matched: ${String(r.matchedTurnText).slice(0, 200)}` : null,
+    separator: () => '',
+  });
+  return (results) => {
+    if (!results || results.length === 0) return 'No matching sessions found.';
+    return _fmt(results);
+  };
+})();
+// Re-export the shared formatter too for callers that want the default shape.
+formatRecallResults.shared = sharedFormatRecallResults;
 
 // ---------------------------------------------------------------------------
 // Plugin
@@ -149,65 +144,35 @@ function register(api) {
       if ((sessionKey || '').includes('subagent')) return;
       if ((sessionKey || '').includes(':cron:')) return;
 
-      const dedupKey = `${agentId}:${sessionId}`;
-      if (recentlyProcessed.has(dedupKey) || inFlight.has(dedupKey)) return;
-
       const rawEntries = coerceRawEntries(event?.messages || []);
       if (rawEntries.length < 3) {
         api.logger.info(`[aquifer-memory] skip: ${sessionId} only ${rawEntries.length} msgs`);
         return;
       }
 
-      inFlight.add(dedupKey);
       api.logger.info(`[aquifer-memory] capturing ${sessionId} (${rawEntries.length} entries)`);
 
       (async () => {
         try {
+          // OpenClaw hands us flat {role, content} entries; normalizeEntries
+          // produces the commit-ready shape, which we feed to shared runIngest
+          // as 'preNormalized' so commit+enrich+dedup stays host-agnostic.
           const norm = normalizeEntries(rawEntries);
-          if (norm.userCount === 0) {
-            api.logger.info(`[aquifer-memory] skip: no user messages in ${sessionId}`);
-            return;
-          }
-
-          // Commit
-          await aquifer.commit(sessionId, norm.messages, {
+          await runIngest({
+            aquifer,
+            sessionId,
             agentId,
             source: 'openclaw',
             sessionKey,
-            model: norm.model,
-            tokensIn: norm.tokensIn,
-            tokensOut: norm.tokensOut,
-            startedAt: norm.startedAt,
-            lastMessageAt: norm.lastMessageAt,
+            adapter: 'preNormalized',
+            preNormalized: norm,
+            minUserMessages,
+            dedupMap: recentlyProcessed,
+            inFlight,
+            logger: api.logger,
           });
-          api.logger.info(`[aquifer-memory] committed ${sessionId}`);
-
-          // Enrich (if enough messages)
-          if (norm.userCount >= minUserMessages) {
-            try {
-              const result = await aquifer.enrich(sessionId, { agentId });
-              api.logger.info(`[aquifer-memory] enriched ${sessionId} (${result.turnsEmbedded} turns, ${result.entitiesFound} entities)`);
-            } catch (enrichErr) {
-              api.logger.warn(`[aquifer-memory] enrich failed for ${sessionId}: ${enrichErr.message}`);
-            }
-          } else {
-            try {
-              await aquifer.skip(sessionId, { agentId, reason: `user_count=${norm.userCount} < min=${minUserMessages}` });
-            } catch (e) { api.logger.warn(`[aquifer-memory] skip failed for ${sessionId}: ${e.message}`); }
-          }
-
-          recentlyProcessed.set(dedupKey, Date.now());
         } catch (err) {
           api.logger.warn(`[aquifer-memory] capture failed for ${sessionId}: ${err.message}`);
-        } finally {
-          inFlight.delete(dedupKey);
-          // Evict old entries
-          if (recentlyProcessed.size > 200) {
-            const cutoff = Date.now() - 30 * 60 * 1000;
-            for (const [k, ts] of recentlyProcessed) {
-              if (ts < cutoff) recentlyProcessed.delete(k);
-            }
-          }
         }
       })();
     });
