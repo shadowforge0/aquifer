@@ -270,6 +270,12 @@ function createAquifer(config = {}) {
           await pool.query(factsSql);
         }
 
+        // 5. Completion foundation (always, additive): narratives,
+        // consumer_profiles, sessions.consolidation_phases. Pure additive DDL
+        // with IF NOT EXISTS guards — safe on every migrate() call.
+        const completionSql = loadSql('004-completion.sql', schema);
+        await pool.query(completionSql);
+
         migrated = true;
       } finally {
         await pool.query('SELECT pg_advisory_unlock($1)', [lockKey]).catch((err) => {
@@ -1232,6 +1238,29 @@ function createAquifer(config = {}) {
       return structured;
     },
   };
+
+  // Completion-capability surfaces (P2). All methods return AqResult envelope;
+  // DDL materialised in schema/004-completion.sql (migrated unconditionally,
+  // additive only). See core/errors.js for envelope shape.
+  const { createNarratives } = require('./narratives');
+  const { createTimeline } = require('./timeline');
+  const { createState } = require('./state');
+  const { createHandoff } = require('./handoff');
+  const { createProfiles } = require('./profiles');
+  const { createDecisions } = require('./decisions');
+  const { createArtifacts } = require('./artifacts');
+  const { createConsolidation } = require('./consolidation');
+  const { createBundles } = require('./bundles');
+  const qSchema = qi(schema);
+  aquifer.narratives = createNarratives({ pool, schema: qSchema, defaultTenantId: tenantId });
+  aquifer.timeline = createTimeline({ pool, schema: qSchema, defaultTenantId: tenantId });
+  aquifer.state = createState({ pool, schema: qSchema, defaultTenantId: tenantId });
+  aquifer.handoff = createHandoff({ pool, schema: qSchema, defaultTenantId: tenantId });
+  aquifer.profiles = createProfiles({ pool, schema: qSchema, defaultTenantId: tenantId });
+  aquifer.decisions = createDecisions({ pool, schema: qSchema, defaultTenantId: tenantId });
+  aquifer.artifacts = createArtifacts({ pool, schema: qSchema, defaultTenantId: tenantId });
+  aquifer.consolidation = createConsolidation({ pool, schema: qSchema, defaultTenantId: tenantId });
+  aquifer.bundles = createBundles({ pool, schema: qSchema, defaultTenantId: tenantId });
 
   return aquifer;
 }

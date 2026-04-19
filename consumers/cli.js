@@ -43,7 +43,7 @@ function parsePositiveInt(value, fallback) {
 function parseArgs(argv) {
   const args = { _: [], flags: {} };
   // Flags that take a value (not boolean)
-  const VALUE_FLAGS = new Set(['limit', 'agent-id', 'source', 'date-from', 'date-to', 'output', 'format', 'config', 'status', 'concurrency', 'entities', 'entity-mode', 'session-id', 'verdict', 'note', 'db', 'since', 'min-messages', 'lookback-days', 'max-chars']);
+  const VALUE_FLAGS = new Set(['limit', 'agent-id', 'source', 'date-from', 'date-to', 'output', 'format', 'config', 'status', 'concurrency', 'entities', 'entity-mode', 'session-id', 'verdict', 'note', 'db', 'since', 'min-messages', 'lookback-days', 'max-chars', 'out']);
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--') { args._.push(...argv.slice(i + 1)); break; }
     if (argv[i].startsWith('--')) {
@@ -357,6 +357,16 @@ Options:
       console.error(`aquifer mcp: ${err.message}`);
       process.exit(1);
     });
+    return;
+  }
+
+  // mcp-contract: write canonical MCP tool manifest to disk. No Aquifer
+  // instance needed — manifest is static. Default path /tmp/aquifer-mcp-contract.json.
+  if (command === 'mcp-contract') {
+    const { writeMcpManifestFile } = require('../index');
+    const outPath = args.flags.out || '/tmp/aquifer-mcp-contract.json';
+    const written = writeMcpManifestFile(outPath);
+    console.log(`Wrote MCP manifest to ${written}`);
     return;
   }
 

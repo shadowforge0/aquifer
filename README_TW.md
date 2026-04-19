@@ -384,18 +384,17 @@ await aquifer.feedback('session-id', { verdict: 'unhelpful' });
 
 ## Benchmark：LongMemEval
 
-我們用 [LongMemEval_S](https://github.com/xiaowu0162/LongMemEval) 測試 Aquifer 的檢索管線——470 題、19,195 個 sessions（98,845 個 turn embeddings）。
+我們用 [LongMemEval_S](https://github.com/xiaowu0162/LongMemEval) 測試 Aquifer 的檢索管線——470 題、19,195 個 sessions，共 98,795 筆 turn embeddings。Per-question haystack 範圍與官方協議一致，bge-m3 embedding 走 OpenRouter。
 
-**設定：** Per-question haystack scoping（與官方方法一致）、bge-m3 embedding via OpenRouter、turn 級 user-only embedding。
+| Pipeline | R@1 | R@3 | R@5 | R@10 |
+|----------|-----|-----|-----|------|
+| Turn-only（單純 cosine） | 89.5% | 96.6% | 98.1% | 98.9% |
+| 三路混合（FTS + session_emb + turn_emb → RRF） | 79.2% | 94.0% | 97.7% | 98.9% |
+| **三路混合 + Cohere Rerank v3.5（top-30）** | **96.0%** | **98.5%** | **99.3%** | **99.8%** |
 
-| 指標 | Aquifer (bge-m3) |
-|------|-----------------|
-| R@1 | 89.6% |
-| R@3 | 96.6% |
-| R@5 | 98.1% |
-| R@10 | 98.9% |
+量測日期 2026-04-19、Aquifer 1.2.1。
 
-**重點發現：** Turn 級 embedding 是主力——從 session 級（R@1=26.8%）到 turn 級（R@1=89.6%）提升 3 倍。
+**重點觀察。** Turn 級 embedding 本身就是主力——從 session 級（R@1 26.8%）到 turn 級（R@1 89.5%）是 3 倍的落差。三路混合在 R@3-R@10 比較穩，但 R@1 會被 FTS 跟 session 級的訊號拉下來。把 hybrid 的 top-30 丟進 cross-encoder（Cohere Rerank v3.5）重排之後，top-1 就補回來了——R@1 比 hybrid baseline 高 16.9pt，比 turn-only cosine 也多 6.5pt。只要 Aquifer 配好 reranker，這就是預設會跑的 production 路徑。
 
 ### 多租戶
 

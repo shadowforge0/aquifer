@@ -4,6 +4,101 @@ All notable changes to `@shadowforge0/aquifer-memory` are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project uses semantic versioning.
 
+## [1.3.0] - 2026-04-19
+
+### Completion-capability API surface
+
+Introduces 12 new capability namespaces implementing the aquifer-completion
+spec. All new methods return the canonical `AqResult<T> = { ok, data } | { ok,
+error: AqError }` envelope. Legacy APIs (commit/enrich/recall/feedback/etc.)
+keep their throw semantics for BC — no breaking changes.
+
+#### Added — new schema (004-completion.sql)
+
+Pure-additive DDL, always migrated. All parameterised on `${schema}` for the
+future `miranda → aquifer` rename.
+
+- `sessions.consolidation_phases JSONB NOT NULL DEFAULT '{}'::jsonb` —
+  per-phase state map for orchestration.
+- `narratives` — cross-session state snapshots with scope-based addressing
+  and supersede chain. Partial unique index enforces one `active` row per
+  `(tenant, agent, scope, scope_key)`.
+- `consumer_profiles` — profile registry keyed by composite PK
+  `(tenant_id, consumer_id, version)` + `UNIQUE (consumer_id, version,
+  profile_hash)` catches silent drift.
+- `timeline_events` — append-only event log with idempotency_key UNIQUE,
+  category + occurred_at indexes, search_tsv.
+- `session_states` — latest-snapshot-per-scope with supersede chain via
+  `is_latest` partial unique.
+- `session_handoffs` — append-only handoff log.
+- `decisions` — append-only decision log with status
+  (proposed/committed/reversed) CHECK enum.
+- `artifacts` — producer-declared output records with lifecycle
+  `pending → produced|failed|discarded`.
+- Shared `set_updated_at()` trigger function reused across tables.
+
+#### Added — capability surfaces
+
+- `aq.narratives.{upsertSnapshot,getLatest,listHistory}` — supersede chain
+  atomic via transaction; idempotent replay.
+- `aq.timeline.{append,list}` — category/since/until filters.
+- `aq.state.{write,getLatest}` — goal/active_work/blockers/affect projected
+  to explicit columns, full payload in JSONB.
+- `aq.handoff.{write,getLatest}` — status enum enforced at API + DB.
+- `aq.profiles.{register,load}` — deep canonical JSON hash prevents silent
+  drift; `AQ_CONFLICT` returned on hash collision.
+- `aq.decisions.{append,list}` — ON CONFLICT DO NOTHING fallback SELECT.
+- `aq.artifacts.{record,list}` — upsert lifecycle, `produced_at` auto-set on
+  pending → produced transition.
+- `aq.consolidation.{claimNext,transitionPhase,getState}` — 10-phase state
+  machine with `pg_advisory_xact_lock` + claimToken; stale claim reclaim;
+  `forceReplay=true` for terminal → claimed.
+- `aq.bundles.{export,import,diff}` — cross-table session export across 7
+  buckets, import with `mode=dry-run|apply` + `conflictPolicy=skip|upsert|fail`.
+
+#### Added — error envelope
+
+- `core/errors.js`: `AqError` class with `code`/`retryable`/`details`/
+  `toJSON()`, `ok(data)` / `err(code, msg)` / `asResult(asyncFn)` factories.
+  13 known codes registered (`AQ_INVALID_INPUT`, `AQ_NOT_FOUND`,
+  `AQ_CONFLICT`, `AQ_PHASE_CLAIM_CONFLICT`, etc.).
+
+#### Added — consumer deliverables
+
+- `consumers/miranda/profile.json` — Miranda's canonical consumer profile
+  (session_state + handoff + decision_log + timeline v1 schemas, artifact
+  producers, extraction hints).
+- `consumers/miranda/render-daily-md.js` — reference implementation for the
+  artifact capability. Pure function: `(aquifer, date) → { markdown,
+  artifact }`. Renderable directly; artifact record ready for
+  `aq.artifacts.record()`.
+- `MCP_TOOL_MANIFEST` + `writeMcpManifestFile()` + `aquifer mcp-contract`
+  CLI — canonical 5-tool manifest for bi-directional registration. Gateway
+  imports in-process; CC MCP server reads
+  `/tmp/aquifer-mcp-contract.json`.
+
+### Benchmark
+
+Re-ingested full LongMemEval_S (19,195 sessions / 98,795 turn embeddings
+via OpenRouter bge-m3) and re-ran retrieval pipeline. Added
+`bench_production_rerank.js` exercising the Cohere Rerank v3.5 top-30
+pass. New baselines documented in README:
+
+| Pipeline | R@1 | R@3 | R@5 | R@10 |
+|----------|-----|-----|-----|------|
+| Turn-only cosine | 89.5% | 96.6% | 98.1% | 98.9% |
+| 3-way hybrid | 79.2% | 94.0% | 97.7% | 98.9% |
+| **Hybrid + Cohere Rerank v3.5** | **96.0%** | **98.5%** | **99.3%** | **99.8%** |
+
+Rerank lift: R@1 +16.9pt over hybrid baseline, +6.5pt over turn-only.
+
+### Tests
+
+891 → 900 (+9 for MCP manifest, plus 60+ new capability integration tests
+under `test/*.integration.test.js`). All green. Lint clean on new code (2
+pre-existing warnings in `consumers/shared/factory.js` and
+`consumers/shared/llm.js`).
+
 ## [1.2.1] - 2026-04-19
 
 ### Quick Start DX — zero-env try-it path

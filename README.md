@@ -333,18 +333,17 @@ Built-in entity extraction and relationship tracking:
 
 ## Benchmark: LongMemEval
 
-We tested Aquifer's retrieval pipeline on [LongMemEval_S](https://github.com/xiaowu0162/LongMemEval) — 470 questions across 19,195 sessions (98,845 turn embeddings).
+We tested Aquifer's retrieval pipeline on [LongMemEval_S](https://github.com/xiaowu0162/LongMemEval) — 470 questions across 19,195 sessions with 98,795 turn embeddings. Per-question haystack scoping (matching the official protocol), bge-m3 embeddings via OpenRouter.
 
-**Setup:** Per-question haystack scoping (matching official methodology), bge-m3 embeddings via OpenRouter, turn-level user-only embedding.
+| Pipeline | R@1 | R@3 | R@5 | R@10 |
+|----------|-----|-----|-----|------|
+| Turn-only (cosine) | 89.5% | 96.6% | 98.1% | 98.9% |
+| Three-way hybrid (FTS + session_emb + turn_emb → RRF) | 79.2% | 94.0% | 97.7% | 98.9% |
+| **Hybrid + Cohere Rerank v3.5 (top-30)** | **96.0%** | **98.5%** | **99.3%** | **99.8%** |
 
-| Metric | Aquifer (bge-m3) |
-|--------|-----------------|
-| R@1 | 89.6% |
-| R@3 | 96.6% |
-| R@5 | 98.1% |
-| R@10 | 98.9% |
+Measured 2026-04-19 on Aquifer 1.2.1.
 
-**Key finding:** Turn-level embedding is the main driver — going from session-level (R@1=26.8%) to turn-level (R@1=89.6%) is a 3x improvement.
+**Key findings.** Turn-level embedding alone beats session-level (26.8% → 89.5% R@1, a 3× improvement). Hybrid fusion adds robustness at R@3-R@10 but trades R@1 because FTS + session-level signals spread the top candidate across adjacent sessions. Re-ranking the hybrid top-30 with a cross-encoder (Cohere Rerank v3.5) wins back the top-1 precision and then some — +16.9pt R@1 over hybrid baseline, and 6.5pt above pure turn-level cosine. That's the production pipeline Aquifer ships by default when a reranker is configured.
 
 ### Multi-Tenant
 

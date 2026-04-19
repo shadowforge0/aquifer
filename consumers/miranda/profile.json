@@ -1,0 +1,145 @@
+{
+  "$schema": "https://aquifer.dev/schema/consumer-profile.v1.json",
+  "consumer_profile_id": "miranda",
+  "version": 1,
+  "description": "Miranda persona consumer profile — canonical shape for session state, handoff, decision log, timeline categories, and default artifact producers. Reference implementation shipped inside Aquifer; production deployments may register additional versions with schema changes.",
+  "defaults": {
+    "tenant_id": "default",
+    "agent_id": "main",
+    "time_zone": "Asia/Taipei"
+  },
+  "schemas": {
+    "default.session_state.v1": {
+      "kind": "default",
+      "target": "sessionState",
+      "description": "What Miranda is currently focused on — goal + active threads + affect tag.",
+      "json_schema": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "goal": { "type": ["string", "null"] },
+          "active_work": { "type": "array", "items": { "type": "string" } },
+          "blockers": { "type": "array", "items": { "type": "string" } },
+          "affect": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+              "mood": { "type": ["string", "null"] },
+              "energy": { "enum": ["low", "medium", "high", null] },
+              "confidence": { "enum": ["low", "medium", "high", null] },
+              "notes": { "type": ["string", "null"] }
+            }
+          }
+        },
+        "required": ["goal", "active_work", "blockers", "affect"]
+      }
+    },
+    "default.session_handoff.v1": {
+      "kind": "default",
+      "target": "sessionHandoff",
+      "description": "Session-end baton: what was the last step, where to pick up, what still blocks.",
+      "json_schema": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "last_step": { "type": "string" },
+          "status": { "enum": ["in_progress", "completed", "blocked"] },
+          "next": { "type": ["string", "null"] },
+          "blockers": { "type": "array", "items": { "type": "string" } },
+          "decided": { "type": "array", "items": { "type": "string" } },
+          "open_loops": { "type": "array", "items": { "type": "string" } }
+        },
+        "required": ["last_step", "status", "next", "blockers", "decided", "open_loops"]
+      }
+    },
+    "default.decision_log.v1": {
+      "kind": "default",
+      "target": "decisionLog",
+      "description": "Committed / proposed / reversed decisions with optional fact linkage.",
+      "json_schema": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "decision": { "type": "string" },
+          "reason": { "type": ["string", "null"] },
+          "status": { "enum": ["proposed", "committed", "reversed"] },
+          "related_fact_ids": {
+            "type": "array",
+            "items": { "type": "integer" }
+          }
+        },
+        "required": ["decision", "reason", "status"]
+      }
+    },
+    "default.timeline.v1": {
+      "kind": "default",
+      "target": "timeline",
+      "description": "Miranda daily timeline category vocabulary. Categories map to existing daily-log sections (focus/todo/mood/handoff) plus organisational tags Miranda uses in weekly/monthly rollups.",
+      "category_vocabulary": [
+        "cli",
+        "focus",
+        "todo",
+        "handoff",
+        "narrative",
+        "organized",
+        "weekly",
+        "monthly",
+        "stats",
+        "health",
+        "garmin",
+        "note"
+      ],
+      "json_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "occurred_at": { "type": "string", "format": "date-time" },
+          "source": { "type": "string" },
+          "session_ref": { "type": ["string", "null"] },
+          "category": { "type": "string" },
+          "text": { "type": "string" },
+          "metadata": { "type": "object" }
+        },
+        "required": ["occurred_at", "source", "session_ref", "category", "text", "metadata"]
+      }
+    }
+  },
+  "artifacts": {
+    "producers": [
+      {
+        "producer_id": "miranda.workspace.daily-log",
+        "type": "daily-log",
+        "trigger_phase": "timeline_write",
+        "format": "markdown",
+        "destination": "workspace://memory/{date}.md",
+        "description": "Renders the day's timeline events + state snapshot + handoff to a single markdown file under the Miranda workspace. Source of truth remains the DB; the .md is a rendered view."
+      },
+      {
+        "producer_id": "miranda.workspace.weekly-log",
+        "type": "weekly-log",
+        "trigger_phase": "artifact_dispatch",
+        "format": "markdown",
+        "destination": "workspace://memory/weekly/{week_start}.md",
+        "description": "Weekly rollup. Timeline events tagged [WEEKLY] plus cross-session narratives. Rendered from DB via rollupWeekly() helper."
+      },
+      {
+        "producer_id": "miranda.workspace.monthly-log",
+        "type": "monthly-log",
+        "trigger_phase": "artifact_dispatch",
+        "format": "markdown",
+        "destination": "workspace://memory/monthly/{month}.md",
+        "description": "Monthly rollup. Aggregates weekly entries + narrative supersede chain."
+      }
+    ]
+  },
+  "extraction_hints": {
+    "entities": {
+      "include_types": ["person", "project", "tool", "topic"],
+      "exclude_patterns": ["^/tmp/", "^/home/mingko/\\.", "^node_modules/"]
+    },
+    "facts": {
+      "prefer_subjects": ["MK", "Miranda", "Aquifer", "OpenClaw", "Jenny", "Evan", "Ivan"],
+      "avoid_ephemeral": true
+    }
+  }
+}
