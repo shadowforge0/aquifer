@@ -367,6 +367,23 @@ Options:
     process.env.AQUIFER_CONFIG = args.flags.config;
   }
 
+  // quickstart is the try-it path: autodetect docker-compose defaults so a
+  // fresh `docker compose up -d && npx aquifer quickstart` works with zero env.
+  // Production commands (migrate, mcp, recall, ...) stay strict — they expect
+  // the operator to have set env explicitly.
+  if (command === 'quickstart') {
+    const { autodetectForQuickstart } = require('./shared/autodetect');
+    const detected = await autodetectForQuickstart(process.env);
+    if (Object.keys(detected).length > 0) {
+      console.log('Autodetected localhost services (env not set):');
+      for (const [k, v] of Object.entries(detected)) {
+        console.log(`  ${k}=${v}`);
+        process.env[k] = v;
+      }
+      console.log('  Export these in your shell (or MCP client env) to make them permanent.\n');
+    }
+  }
+
   const aquifer = createAquiferFromConfig(configOverrides);
 
   try {

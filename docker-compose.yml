@@ -47,7 +47,6 @@ volumes:
   ollama:
 
 # After starting:
-#   export DATABASE_URL="postgresql://aquifer:aquifer@localhost:5432/aquifer"
-#   export AQUIFER_EMBED_BASE_URL="http://localhost:11434/v1"
-#   export AQUIFER_EMBED_MODEL="bge-m3"
+#   export DATABASE_URL=postgresql://aquifer:aquifer@localhost:5432/aquifer
+#   export EMBED_PROVIDER=ollama   # autodetects http://localhost:11434, model bge-m3
 #   npx aquifer quickstart

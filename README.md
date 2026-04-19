@@ -63,43 +63,52 @@ Sessions, summaries, turn-level embeddings, entity graph — all live in one dat
 
 ## Quick Start (MCP Server)
 
-This gets you from zero to a working MCP memory server. For library API usage, see [API Reference](#api-reference) below.
+Two commands from zero to a working MCP memory server — no env vars to set. For library API usage, see [API Reference](#api-reference) below.
 
 ### 1. Start the stack
 
 ```bash
 docker compose up -d
-# Starts PostgreSQL 16 + pgvector and Ollama with bge-m3 (auto-pulled).
-# First run takes a few minutes while Ollama downloads the model.
+# PostgreSQL 16 + pgvector and Ollama with bge-m3 (auto-pulled).
+# First run pulls the model — `docker compose logs -f ollama-pull` to watch.
 ```
 
-Already have PostgreSQL + pgvector and an embedding endpoint? Skip this step.
+Already running PostgreSQL + pgvector and an embedding endpoint? Skip this step — `quickstart` picks up `DATABASE_URL` / `EMBED_PROVIDER` from your environment if you've set them.
 
-### 2. Install
+### 2. Verify
 
 ```bash
-npm install @shadowforge0/aquifer-memory
+npx --yes @shadowforge0/aquifer-memory quickstart
 ```
 
-### 3. Configure + verify
+That's it. `quickstart` autodetects `localhost:5432` PostgreSQL and `localhost:11434` Ollama (from step 1 or your own), runs migrations, embeds a test session, recalls it, and cleans up. If it prints `✓ Aquifer is working`, you're done.
 
-```bash
-export DATABASE_URL="postgresql://aquifer:aquifer@localhost:5432/aquifer"
-export AQUIFER_EMBED_BASE_URL="http://localhost:11434/v1"
-export AQUIFER_EMBED_MODEL="bge-m3"
+For ongoing use, install it into your project so you skip the `npx` resolution cost: `npm install @shadowforge0/aquifer-memory` then `npx aquifer quickstart`.
 
-npx aquifer quickstart
+Using OpenAI instead of Ollama? `export EMBED_PROVIDER=openai` + `OPENAI_API_KEY=sk-...` before `quickstart` — model defaults to `text-embedding-3-small`.
+
+### 3. Wire into your MCP client
+
+Claude Code, Claude Desktop, or any MCP-capable client — drop this into `.mcp.json` (project-level) or `claude_desktop_config.json`:
+
+```jsonc
+{
+  "mcpServers": {
+    "aquifer": {
+      "command": "npx",
+      "args": ["--yes", "@shadowforge0/aquifer-memory", "mcp"],
+      "env": {
+        "DATABASE_URL": "postgresql://aquifer:aquifer@localhost:5432/aquifer",
+        "EMBED_PROVIDER": "ollama"
+      }
+    }
+  }
+}
 ```
 
-`quickstart` runs migrations, commits a test session, embeds it, recalls it, and cleans up. If it prints `✓ Aquifer is working`, you're done.
+Or run it directly: `DATABASE_URL=... EMBED_PROVIDER=ollama npx aquifer mcp`. (MCP server itself stays strict about env — `quickstart`'s autodetect is the try-it path, not the production one.)
 
-### 4. Start the MCP server
-
-```bash
-npx aquifer mcp
-```
-
-See [.env.example](.env.example) for all env vars, or [docs/setup.md](docs/setup.md) for the full setup guide.
+Need LLM summarization, the knowledge graph, OpenAI embeddings, or the reranker? See [Environment Variables](#environment-variables) below and [docs/setup.md](docs/setup.md).
 
 ---
 

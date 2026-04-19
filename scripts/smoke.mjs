@@ -99,8 +99,8 @@ try {
   const { Pool } = require('pg');
   const pool = new Pool({ connectionString: config.db.url });
   const schema = config.schema || 'aquifer';
-  await pool.query(`DELETE FROM ${schema}.turn_embeddings WHERE session_id IN (SELECT id FROM ${schema}.sessions WHERE session_id = $1)`, [SESSION_ID]);
-  await pool.query(`DELETE FROM ${schema}.session_summaries WHERE session_id IN (SELECT id FROM ${schema}.sessions WHERE session_id = $1)`, [SESSION_ID]);
+  await pool.query(`DELETE FROM ${schema}.turn_embeddings WHERE session_id = $1`, [SESSION_ID]);
+  await pool.query(`DELETE FROM ${schema}.session_summaries WHERE session_id = $1`, [SESSION_ID]);
   await pool.query(`DELETE FROM ${schema}.sessions WHERE session_id = $1`, [SESSION_ID]);
   await pool.end();
   console.log('   OK');
