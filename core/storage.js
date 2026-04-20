@@ -59,7 +59,7 @@ async function upsertSession(pool, {
       (tenant_id, session_id, session_key, agent_id, source, messages,
        msg_count, user_count, assistant_count, model, tokens_in, tokens_out,
        started_at, ended_at, last_message_at, processing_status)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$14,'pending')
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,COALESCE($13,now()),COALESCE($14,now()),$14,'pending')
     ON CONFLICT (tenant_id, agent_id, session_id) DO UPDATE SET
       session_key = EXCLUDED.session_key,
       source = COALESCE(EXCLUDED.source, ${qi(schema)}.sessions.source),

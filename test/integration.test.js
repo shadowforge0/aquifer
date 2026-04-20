@@ -51,14 +51,21 @@ function randomSchema() {
  *   - 不同 keyword（e.g. "unrelated"）產生正交 vector，不會干擾測試。
  */
 function makeFakeEmbed() {
-  // 預設的 keyword → 3-dim vector 對應表（都是單位向量）
+  // Schema locks embedding columns at vector(1024) since 1.5.2. Pad the
+  // 3 semantic dimensions into zero-filled 1024-vectors so tests exercise
+  // the real column width without losing per-keyword distinctness.
+  const DIM = 1024;
+  const seed = (positions) => {
+    const v = new Array(DIM).fill(0);
+    for (const [i, val] of positions) v[i] = val;
+    return v;
+  };
   const VECTORS = {
-    default:   [1, 0, 0],
-    keyword:   [0, 1, 0],
-    unrelated: [0, 0, 1],
+    default:   seed([[0, 1]]),
+    keyword:   seed([[1, 1]]),
+    unrelated: seed([[2, 1]]),
   };
 
-  // 依文字內容決定 vector：包含哪個 keyword 就用對應的
   function textToVec(text) {
     const t = text.toLowerCase();
     for (const [k, v] of Object.entries(VECTORS)) {
@@ -782,11 +789,10 @@ describe('4. recall() — hybrid search', () => {
     assert.ok(r.score >= 0 && r.score <= 1, `score out of range: ${r.score}`);
   });
 
-  it('recall 空 query 回傳 []', async () => {
-    // 驗什麼：空字串 guard
-    // 為什麼重要：避免 empty query 打到 DB 或拋錯
-    const results = await aq.recall('');
-    assert.deepEqual(results, []);
+  it('recall 空 query 拋錯（1.4.0 contract: must be non-empty string）', async () => {
+    // 驗什麼：空字串 guard — 1.4.0 改成 throw 而非 silent []，避免吃 caller bug
+    // 為什麼重要：contract 清楚才不會把上游錯打包成空結果
+    await assert.rejects(() => aq.recall(''), /must be a non-empty string/);
   });
 
   it('recall limit 參數生效', async () => {
@@ -1199,7 +1205,7 @@ describe('8. bootstrap() — session visibility contract', () => {
     // 讓 customSummaryFn 成功寫 summary，但強迫一條 warning（turn embed fail）
     const failingEmbedAq = createAquifer({
       db: DB_URL, schema, tenantId: 'test',
-      embed: { fn: async () => { throw new Error('mock embed fail'); }, dim: 3 },
+      embed: { fn: async () => { throw new Error('mock embed fail'); }, dim: 1024 },
     });
     try {
       await failingEmbedAq.enrich('sid-boot-partial', {

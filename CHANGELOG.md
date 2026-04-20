@@ -4,6 +4,57 @@ All notable changes to `@shadowforge0/aquifer-memory` are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project uses semantic versioning.
 
+## [1.5.8] - 2026-04-20
+
+Follow-up patch for two issues exposed while tidying the suite after
+1.5.7 shipped: (1) sessions committed without explicit timestamps
+disappeared from `bootstrap()` because the 1.5.5 ended_at treat-root-cause
+fix dropped the INSERT default; (2) `[aquifer] migration` post-flight
+notices on stdout corrupted CLI consumers that parse stdout as JSON.
+
+### Changed
+
+- **`core/storage.js`** — `upsertSession` INSERT defaults
+  `started_at = COALESCE($13, now())` and
+  `ended_at = COALESCE($14, now())`. `last_message_at` still passes
+  the raw `$14`: null from caller stays null in EXCLUDED so the
+  UPDATE path's `COALESCE(EXCLUDED.last_message_at, …)` preserves
+  prior values (1.5.5 regression lock holds). Net effect: fresh
+  commits without explicit timestamps now surface in bootstrap;
+  re-commits without `lastMessageAt` still do not overwrite
+  existing ended_at with now().
+- **`core/aquifer.js`** — migration post-flight logs
+  (`[aquifer] FTS post-flight: …`, warmup note,
+  `[aquifer] migration notice: …`) redirected from `console.info`
+  to `process.stderr.write`. Operator messages belong on stderr;
+  stdout stays clean for downstream JSON consumers (CLI / MCP).
+  `console.warn` paths for WARNING/ERROR notices and FTS probe
+  failure unchanged (already on stderr).
+
+### Test suite hygiene (not user-facing)
+
+- `test/integration.test.js` / `test/consumer-cli.integration.test.js` /
+  `test/consumer-mcp.integration.test.js` — embed mocks widened from
+  3-dim to 1024-dim to match the post-1.5.2 schema. Previous mocks
+  provoked PG `expected 1024 dimensions, not 3` at write time and
+  left ~11 integration tests red under `AQUIFER_TEST_DB_URL`.
+- `test/integration.test.js` — `recall 空 query 回傳 []` renamed and
+  flipped to assert `rejects(/must be a non-empty string/)` per the
+  1.4.0 contract change.
+- `test/hrr-feature-edge.test.js` — open-loop score equality assertion
+  loosened from `strictEqual` to `abs(diff) < 1e-6` to absorb the
+  ~1e-10 time-decay FP drift between back-to-back `hybridRank` calls.
+- Full suite with `AQUIFER_TEST_DB_URL`: 1065/1065 green (was
+  1013/1024/1035 before these fixes; 11 pre-existing collateral
+  failures + 41 cancelled children now all pass).
+
+### Migration notes
+
+- No schema change, no data rewrite.
+- Operators who parse aquifer's `stdout` for operator-log chatter will
+  need to switch to `stderr`. The `migrations.onEvent` callback is the
+  supported observability path and is unchanged.
+
 ## [1.5.7] - 2026-04-20
 
 C2 gateway migrate handshake — hosts now have a real startup contract.
@@ -201,6 +252,14 @@ evidence windows, state-change backfill) were all reading the wrong
   that row was polluted; repair with
   `UPDATE miranda.sessions SET ended_at = last_message_at WHERE ended_at > last_message_at + interval '1 minute'`
   (tune the grace interval to your ingest pattern).
+
+## [1.5.4] - 2026-04-20
+
+Internal patch bump — consolidates the 1.5.1-1.5.3 patch series under a
+single release marker before the 1.5.5 / 1.5.6 / 1.5.7 wave landed.
+No additional user-facing changes beyond 1.5.3. Semver-wise the 1.5.4
+tag is a no-op gate: keep operators' upgrade pins monotonic without
+forcing a rebuild cycle for a content-less release.
 
 ## [1.5.3] - 2026-04-20
 

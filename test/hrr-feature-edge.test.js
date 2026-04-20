@@ -274,7 +274,11 @@ describe('hybrid-rank.js edge cases', () => {
       );
 
       assert.equal(row._openLoopBoost, 0);
-      assert.equal(row._score, baseline[0]._score);
+      // hybridRank reads `now` inside the call; two sequential invocations
+      // with the same input can differ by ~1e-10 through time-decay rounding.
+      // Lock equality with a tolerance rather than strict eq.
+      assert.ok(Math.abs(row._score - baseline[0]._score) < 1e-6,
+        `score drift exceeds tolerance: ${row._score} vs ${baseline[0]._score}`);
     });
   });
 

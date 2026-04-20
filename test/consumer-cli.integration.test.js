@@ -64,7 +64,7 @@ describe('CLI consumer — aquifer <command> end-to-end', () => {
       db: DB_URL,
       schema,
       tenantId: 'test',
-      embed: { fn: async (texts) => texts.map(() => [1, 0, 0]), dim: 3 },
+      embed: { fn: async (texts) => texts.map(() => { const v = new Array(1024).fill(0); v[0] = 1; return v; }), dim: 1024 },
     });
     await aq.migrate();
     await aq.commit('cli-seed-001', [

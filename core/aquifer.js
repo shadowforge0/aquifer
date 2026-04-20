@@ -527,7 +527,7 @@ function createAquifer(config = {}) {
         if (sev === 'WARNING' || sev === 'ERROR') {
           console.warn(line);
         } else if (sev === 'NOTICE' && msg.startsWith('[aquifer]')) {
-          console.info(line);
+          process.stderr.write(line + '\n');
         }
       }
 
@@ -582,15 +582,15 @@ function createAquifer(config = {}) {
         }
 
         const warmupNote = warmupMs !== null ? ` warmup=${warmupMs}ms` : '';
-        console.info(
+        process.stderr.write(
           `[aquifer] FTS post-flight: backend=${backend} ` +
           `jieba=${row.have_jieba} zhparser=${row.have_zhparser} ` +
-          `selected=${ftsConfig}${warmupNote}`
+          `selected=${ftsConfig}${warmupNote}\n`
         );
         if (warmupMs !== null && warmupMs > 500) {
-          console.info(
+          process.stderr.write(
             `[aquifer] Note: first FTS call paid ~${warmupMs}ms for tokenizer init ` +
-            `(dictionary mmap). Subsequent calls on the same backend are cached.`
+            `(dictionary mmap). Subsequent calls on the same backend are cached.\n`
           );
         }
       } catch (err) {
