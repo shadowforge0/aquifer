@@ -59,7 +59,7 @@ async function upsertSession(pool, {
       (tenant_id, session_id, session_key, agent_id, source, messages,
        msg_count, user_count, assistant_count, model, tokens_in, tokens_out,
        started_at, ended_at, last_message_at, processing_status)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,now(),$14,'pending')
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$14,'pending')
     ON CONFLICT (tenant_id, agent_id, session_id) DO UPDATE SET
       session_key = EXCLUDED.session_key,
       source = COALESCE(EXCLUDED.source, ${qi(schema)}.sessions.source),
@@ -71,7 +71,7 @@ async function upsertSession(pool, {
       tokens_in = EXCLUDED.tokens_in,
       tokens_out = EXCLUDED.tokens_out,
       started_at = COALESCE(EXCLUDED.started_at, ${qi(schema)}.sessions.started_at),
-      ended_at = now(),
+      ended_at = COALESCE(EXCLUDED.last_message_at, ${qi(schema)}.sessions.ended_at),
       last_message_at = COALESCE(EXCLUDED.last_message_at, ${qi(schema)}.sessions.last_message_at),
       processing_status = 'pending',
       processing_error = NULL
@@ -223,8 +223,12 @@ async function searchSessions(pool, query, {
   dateFrom,
   dateTo,
   limit = 20,
+  ftsConfig = 'simple',
 } = {}) {
   const clampedLimit = Math.max(1, Math.min(100, limit));
+
+  // Whitelist tsconfig to prevent injection
+  const cfg = (ftsConfig === 'zhcfg' || ftsConfig === 'simple') ? ftsConfig : 'simple';
 
   // Normalize agentId/agentIds
   const agentIds = rawAgentIds && rawAgentIds.length > 0
@@ -237,7 +241,7 @@ async function searchSessions(pool, query, {
   // Primary: trigram ILIKE on search_text (works for CJK + Latin)
   // Fallback: tsvector FTS (for installations without search_text populated)
   const where = [
-    `(ss.search_text ILIKE '%' || $1 || '%' OR ss.search_tsv @@ plainto_tsquery('simple', $2))`,
+    `(ss.search_text ILIKE '%' || $1 || '%' OR ss.search_tsv @@ plainto_tsquery('${cfg}', $2))`,
     `s.tenant_id = $3`,
   ];
   const params = [likeQuery, query, tenantId];
@@ -276,10 +280,15 @@ async function searchSessions(pool, query, {
       ss.trust_score,
       CASE WHEN ss.search_text IS NOT NULL
         THEN similarity(ss.search_text, $2)
-        ELSE ts_rank(ss.search_tsv, plainto_tsquery('simple', $2))
+        ELSE ts_rank(ss.search_tsv, plainto_tsquery('${cfg}', $2))
       END AS fts_rank
     FROM ${qi(schema)}.sessions s
-    LEFT JOIN ${qi(schema)}.session_summaries ss ON ss.session_row_id = s.id
+    -- INNER JOIN: the WHERE clause references ss.search_text / ss.search_tsv,
+    -- which a LEFT JOIN would leave NULL for unenriched sessions — filtering
+    -- them out. Be explicit: FTS recall is a SUMMARIZED-sessions search. Raw
+    -- unenriched sessions don't participate. Named searchSessions for historic
+    -- reasons; semantically it is search-over-enriched-sessions.
+    JOIN ${qi(schema)}.session_summaries ss ON ss.session_row_id = s.id
     WHERE ${where.join(' AND ')}
     ORDER BY
       COALESCE(ss.search_text ILIKE '%' || $1 || '%', FALSE) DESC,
@@ -513,6 +522,73 @@ async function searchTurnEmbeddings(pool, {
 }
 
 // ---------------------------------------------------------------------------
+// searchSummaryEmbeddings — pgvector cosine search on session_summaries.embedding
+// ---------------------------------------------------------------------------
+
+async function searchSummaryEmbeddings(pool, {
+  schema,
+  tenantId,
+  queryVec,
+  agentId,
+  agentIds: rawAgentIds,
+  source,
+  dateFrom,
+  dateTo,
+  candidateSessionIds,
+  limit = 15,
+} = {}) {
+  const where = ['s.tenant_id = $1'];
+  const params = [tenantId];
+
+  params.push(`[${queryVec.join(',')}]`);
+  const vecPos = params.length;
+
+  const agentIds = rawAgentIds && rawAgentIds.length > 0
+    ? rawAgentIds
+    : (agentId ? [agentId] : null);
+
+  if (dateFrom) {
+    params.push(dateFrom);
+    where.push(`s.started_at::date >= $${params.length}::date`);
+  }
+  if (dateTo) {
+    params.push(dateTo);
+    where.push(`s.started_at::date <= $${params.length}::date`);
+  }
+  if (agentIds) {
+    params.push(agentIds);
+    where.push(`s.agent_id = ANY($${params.length})`);
+  }
+  if (source) {
+    params.push(source);
+    where.push(`s.source = $${params.length}`);
+  }
+  if (candidateSessionIds && candidateSessionIds.length > 0) {
+    params.push(candidateSessionIds);
+    where.push(`s.session_id = ANY($${params.length})`);
+  }
+
+  params.push(limit);
+
+  const result = await pool.query(
+    `SELECT
+      s.id, s.session_id, s.agent_id, s.source, s.started_at, s.last_message_at,
+      ss.summary_text, ss.structured_summary, ss.access_count, ss.last_accessed_at,
+      ss.trust_score,
+      (ss.embedding <=> $${vecPos}::vector) AS distance
+    FROM ${qi(schema)}.session_summaries ss
+    JOIN ${qi(schema)}.sessions s ON s.id = ss.session_row_id
+    WHERE ss.embedding IS NOT NULL
+      AND ${where.join(' AND ')}
+    ORDER BY distance ASC
+    LIMIT $${params.length}`,
+    params
+  );
+
+  return { rows: result.rows };
+}
+
+// ---------------------------------------------------------------------------
 // recordFeedback — explicit trust feedback with audit trail
 // ---------------------------------------------------------------------------
 
@@ -605,5 +681,6 @@ module.exports = {
   extractUserTurns,
   upsertTurnEmbeddings,
   searchTurnEmbeddings,
+  searchSummaryEmbeddings,
   recordFeedback,
 };

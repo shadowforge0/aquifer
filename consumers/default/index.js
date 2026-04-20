@@ -222,26 +222,39 @@ function createPersona(personaOpts = {}) {
       if ((ctx?.sessionKey || '').includes('subagent')) return null;
       return {
         name: 'session_recall',
-        description: 'Search stored sessions by keyword.',
+        description: 'Search stored sessions by keyword or natural language. Use entities when the user names specific people, projects, files, tools, or concepts; use entity_mode="all" when every named entity must co-occur (default "any" boosts). Use mode to force fts/vector/hybrid (default hybrid).',
         parameters: {
           type: 'object',
           properties: {
-            query: { type: 'string' },
+            query: { type: 'string', minLength: 1, description: 'Non-empty keyword or natural-language query' },
             limit: { type: 'number' },
             agent_id: { type: 'string' },
+            source: { type: 'string' },
             date_from: { type: 'string' },
             date_to: { type: 'string' },
+            entities: { type: 'array', items: { type: 'string' }, description: 'Named entities (person/project/tool/file)' },
+            entity_mode: { type: 'string', enum: ['any', 'all'], description: '"any" boosts; "all" hard-filters to sessions containing every entity' },
+            mode: { type: 'string', enum: ['fts', 'hybrid', 'vector'], description: 'Recall strategy, default hybrid' },
           },
         },
         async execute(_toolCallId, params) {
           try {
             const limit = Math.max(1, Math.min(20, parseInt(params?.limit ?? 5, 10) || 5));
-            const results = await aquifer.recall(String(params?.query || ''), {
+            const recallOpts = {
               agentId: params?.agent_id || ctx?.agentId || undefined,
+              source: params?.source || undefined,
               dateFrom: params?.date_from || undefined,
               dateTo: params?.date_to || undefined,
               limit,
-            });
+            };
+            if (Array.isArray(params?.entities) && params.entities.length > 0) {
+              recallOpts.entities = params.entities;
+              recallOpts.entityMode = params?.entity_mode || 'any';
+            }
+            if (params?.mode === 'fts' || params?.mode === 'hybrid' || params?.mode === 'vector') {
+              recallOpts.mode = params.mode;
+            }
+            const results = await aquifer.recall(String(params?.query || ''), recallOpts);
             const lines = results.map((r, i) =>
               `${i+1}. ${r.structuredSummary?.title || r.summaryText?.slice(0, 80) || '(untitled)'}`
             );

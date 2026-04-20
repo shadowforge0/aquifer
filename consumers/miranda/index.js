@@ -275,13 +275,16 @@ function registerRecallTool(api, opts = {}) {
         if ((ctx?.sessionKey || '').includes('subagent')) return null;
         return {
             name: 'session_recall',
-            description: '搜尋歷史 session 的摘要和對話記錄。可按關鍵字、日期範圍、agent 搜尋。',
+            description: '搜尋歷史 session 的摘要和對話記錄。當問題明確提到具體人名、專案、工具、檔名時，傳 entities；只想保留全部命中的 session 用 entity_mode="all"，否則 "any" 是 boost。mode 可選 "fts"/"vector"/"hybrid"，default hybrid。',
             parameters: {
                 type: 'object',
                 properties: {
-                    query: { type: 'string', description: '搜尋關鍵字（可空，空時按時間排序）' },
+                    query: { type: 'string', description: '搜尋關鍵字或自然語言描述（必填非空）', minLength: 1 },
                     date_from: { type: 'string' }, date_to: { type: 'string' },
                     agent_id: { type: 'string' }, source: { type: 'string' },
+                    entities: { type: 'array', items: { type: 'string' }, description: '具名 entity 清單（人/專案/工具/檔名）' },
+                    entity_mode: { type: 'string', enum: ['any', 'all'], description: '"any" boost / "all" 硬過濾必含全部 entity' },
+                    mode: { type: 'string', enum: ['fts', 'hybrid', 'vector'], description: 'recall 模式，default hybrid' },
                     detail: { type: 'string' },
                     limit: { type: 'number' },
                 },
@@ -289,13 +292,21 @@ function registerRecallTool(api, opts = {}) {
             async execute(_toolCallId, params) {
                 try {
                     const limit = Math.max(1, Math.min(20, parseInt(params?.limit ?? 5, 10) || 5));
-                    const results = await aquifer.recall(String(params?.query || ''), {
+                    const recallOpts = {
                         agentId: params?.agent_id || ctx?.agentId || undefined,
                         source: params?.source || undefined,
                         dateFrom: params?.date_from || undefined,
                         dateTo: params?.date_to || undefined,
                         limit,
-                    });
+                    };
+                    if (Array.isArray(params?.entities) && params.entities.length > 0) {
+                        recallOpts.entities = params.entities;
+                        recallOpts.entityMode = params?.entity_mode || 'any';
+                    }
+                    if (params?.mode === 'fts' || params?.mode === 'hybrid' || params?.mode === 'vector') {
+                        recallOpts.mode = params.mode;
+                    }
+                    const results = await aquifer.recall(String(params?.query || ''), recallOpts);
                     const text = mirandaRecallFormat.formatRecallResults(results.map(r => ({
                         sessionId: r.sessionId, agentId: r.agentId, source: r.source,
                         startedAt: r.startedAt, summaryText: r.summaryText,

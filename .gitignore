@@ -4,3 +4,5 @@ package-lock.json
 .review-run-*/
 .develop-runs/
 HANDOFF_*.md
+bench-report-*.json
+bench-report-*.md

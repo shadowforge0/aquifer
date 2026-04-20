@@ -58,10 +58,11 @@ function makePool(rows = []) {
 }
 
 // Minimal storage stub — only the functions recall() calls
-function makeStorageMock({ ftsRows = [], turnRows = [] } = {}) {
+function makeStorageMock({ ftsRows = [], turnRows = [], embRows = [] } = {}) {
   return {
     searchSessions: async () => ftsRows,
     searchTurnEmbeddings: async () => ({ rows: turnRows }),
+    searchSummaryEmbeddings: async () => ({ rows: embRows }),
     // Other storage functions used by non-recall paths (not needed for these tests)
     upsertSession: async () => ({ id: 1, sessionId: 'test', isNew: true }),
     upsertSummary: async () => {},
@@ -138,7 +139,7 @@ function makeAquifer({ embedFn = null, ftsRows = [], turnRows = [], embRows = []
     },
   };
 
-  const storageMock = { ...makeStorageMock({ ftsRows, turnRows }), ...storageOverrides };
+  const storageMock = { ...makeStorageMock({ ftsRows, turnRows, embRows }), ...storageOverrides };
   const entityMock = makeEntityMock();
   const hrMock = makeHybridRankMock();
 

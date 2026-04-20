@@ -23,7 +23,10 @@ CREATE TABLE IF NOT EXISTS ${schema}.entities (
   entity_scope    TEXT         NOT NULL DEFAULT 'default',
   created_by      TEXT,
   metadata        JSONB        NOT NULL DEFAULT '{}',
-  embedding       vector,
+  -- Sized so future HNSW index on entities.embedding builds cleanly. No HNSW
+  -- currently — entity lookup is name-trgm, not vector. Coerce block below
+  -- upgrades pre-1.5.2 installs.
+  embedding       vector(1024),
   first_seen_at   TIMESTAMPTZ  NOT NULL DEFAULT now(),
   last_seen_at    TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
@@ -47,6 +50,37 @@ BEGIN
   END IF;
 END$$;
 ALTER TABLE ${schema}.entities ALTER COLUMN entity_scope SET NOT NULL;
+
+-- Coerce pre-1.5.2 unsized `vector` column to sized for HNSW-ready shape.
+-- Mirrors the session_summaries / turn_embeddings / insights coerce blocks.
+DO $$
+DECLARE
+  is_unsized BOOLEAN;
+  existing_dim INT;
+  target_dim INT;
+BEGIN
+  SELECT format_type(atttypid, atttypmod) = 'vector'
+    INTO is_unsized
+    FROM pg_attribute
+    WHERE attrelid = '${schema}.entities'::regclass
+      AND attname = 'embedding';
+
+  IF is_unsized THEN
+    EXECUTE 'SELECT vector_dims(embedding) FROM ${schema}.entities WHERE embedding IS NOT NULL LIMIT 1'
+      INTO existing_dim;
+    target_dim := COALESCE(
+      existing_dim,
+      NULLIF(current_setting('aquifer.embedding_dim', true), '')::int,
+      1024
+    );
+    EXECUTE 'ALTER TABLE ${schema}.entities ALTER COLUMN embedding TYPE vector('
+         || target_dim::text
+         || ') USING embedding::vector('
+         || target_dim::text
+         || ')';
+    RAISE NOTICE '[aquifer] entities.embedding coerced from unsized vector to vector(%)', target_dim;
+  END IF;
+END$$;
 
 -- Unique constraint: entity identity is (tenant, name, scope)
 -- Drop legacy agent-based constraint if it exists

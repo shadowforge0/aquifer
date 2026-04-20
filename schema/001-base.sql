@@ -3,6 +3,95 @@
 
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+-- Chinese text search: prefer pg_jieba (dict.txt.big Traditional-aware, proper
+-- word segmentation via jiebaqry search-engine mode that expands compounds into
+-- multi-granularity tokens). Fall back to zhparser if jieba not installed; else
+-- migration silently uses the simple tokenizer (trigram primary path unaffected).
+-- Extension install errors (missing .so, non-superuser, OOM, etc.) are caught
+-- per-extension so one failure doesn't prevent the other from being tried.
+DO $$
+BEGIN
+  BEGIN
+    CREATE EXTENSION IF NOT EXISTS pg_jieba;
+  EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE '[aquifer] pg_jieba install skipped (%); trying zhparser', SQLERRM;
+  END;
+  BEGIN
+    CREATE EXTENSION IF NOT EXISTS zhparser;
+  EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE '[aquifer] zhparser install skipped (%); Chinese FTS will use simple tokenizer', SQLERRM;
+  END;
+END$$;
+
+-- Build/upgrade zhcfg in the public namespace (where Aquifer consumers resolve
+-- `to_tsvector('zhcfg', ...)` from). State machine:
+--   S1: jieba present, no zhcfg in public           -> CREATE zhcfg (COPY = jiebaqry)
+--   S2: jieba absent, zhparser present, no zhcfg    -> CREATE zhcfg zhparser + simple mapping
+--   S3: jieba present, zhcfg backed by zhparser     -> DROP + CREATE (COPY = jiebaqry)
+--   S4: zhcfg already jieba-backed                  -> noop
+--   S9: no backing extension but zhcfg still there  -> rebuild against best available, or drop
+--
+-- zhcfg is a database-wide object; acquire a transaction-scoped global advisory
+-- lock so concurrent migrate() calls on different Aquifer schemas in the same
+-- database don't race on the DROP/CREATE. The lock auto-releases at COMMIT.
+-- Key: hash of 'aquifer:zhcfg' truncated to PG advisory-lock int4 range.
+--
+-- Queries restrict to the public namespace to avoid ambiguity if operators have
+-- created same-named text search configs elsewhere.
+DO $$
+DECLARE
+  have_jieba boolean := EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_jieba');
+  have_zhparser boolean := EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'zhparser');
+  public_oid oid := (SELECT oid FROM pg_namespace WHERE nspname = 'public');
+  zhcfg_parser text := NULL;
+BEGIN
+  PERFORM pg_advisory_xact_lock(1434531247);  -- stable global key
+
+  IF public_oid IS NOT NULL THEN
+    SELECT p.prsname INTO zhcfg_parser
+    FROM pg_ts_config c JOIN pg_ts_parser p ON c.cfgparser = p.oid
+    WHERE c.cfgname = 'zhcfg' AND c.cfgnamespace = public_oid
+    LIMIT 1;
+  END IF;
+
+  BEGIN
+    IF have_jieba AND (zhcfg_parser IS NULL OR zhcfg_parser = 'zhparser') THEN
+      -- S1 / S3: promote to jieba
+      IF zhcfg_parser = 'zhparser' THEN
+        EXECUTE 'DROP TEXT SEARCH CONFIGURATION public.zhcfg';
+      END IF;
+      EXECUTE 'CREATE TEXT SEARCH CONFIGURATION public.zhcfg ( COPY = public.jiebaqry )';
+
+    ELSIF have_zhparser AND zhcfg_parser IS NULL THEN
+      -- S2: zhparser-only new install.  `eng` covers English tokens that zhparser
+      -- emits for Latin words in mixed-language text; without it they'd be dropped.
+      EXECUTE 'CREATE TEXT SEARCH CONFIGURATION public.zhcfg (PARSER = zhparser)';
+      EXECUTE 'ALTER TEXT SEARCH CONFIGURATION public.zhcfg
+        ADD MAPPING FOR n,v,a,i,e,l,j,nr,ns,nt,nz,vd,vn,m,r,t,c,p,u,d,o,y,w,x,q,b,k,s,f,h,g,eng WITH simple';
+
+    ELSIF NOT have_jieba AND NOT have_zhparser AND zhcfg_parser IS NOT NULL THEN
+      -- S9: backing extension dropped but zhcfg stayed; any `to_tsvector('zhcfg',...)`
+      -- would throw "parser does not exist" and break the FTS trigger.
+      -- Safer to remove zhcfg and let consumers fall back to 'simple'.
+      EXECUTE 'DROP TEXT SEARCH CONFIGURATION public.zhcfg';
+      RAISE WARNING '[aquifer] zhcfg removed: neither pg_jieba nor zhparser is installed; Chinese FTS falls back to simple';
+
+    ELSIF NOT have_jieba AND have_zhparser AND zhcfg_parser NOT IN ('zhparser') THEN
+      -- S9 partial: jieba gone but zhparser available; rebuild on zhparser.
+      EXECUTE 'DROP TEXT SEARCH CONFIGURATION public.zhcfg';
+      EXECUTE 'CREATE TEXT SEARCH CONFIGURATION public.zhcfg (PARSER = zhparser)';
+      EXECUTE 'ALTER TEXT SEARCH CONFIGURATION public.zhcfg
+        ADD MAPPING FOR n,v,a,i,e,l,j,nr,ns,nt,nz,vd,vn,m,r,t,c,p,u,d,o,y,w,x,q,b,k,s,f,h,g,eng WITH simple';
+      RAISE WARNING '[aquifer] zhcfg rebuilt on zhparser: pg_jieba no longer installed';
+    END IF;
+  EXCEPTION WHEN OTHERS THEN
+    -- Ownership mismatch, concurrent-modify race, dependency blocking DROP, etc.
+    -- Don't abort the entire migrate(); leave zhcfg as-is and warn.
+    RAISE WARNING '[aquifer] zhcfg (re)build skipped (%); existing config left untouched', SQLERRM;
+  END;
+END$$;
+
 CREATE SCHEMA IF NOT EXISTS ${schema};
 
 -- =========================================================================
@@ -61,7 +150,9 @@ CREATE TABLE IF NOT EXISTS ${schema}.session_summaries (
   ended_at                 TIMESTAMPTZ,
   summary_text             TEXT,
   structured_summary       JSONB        NOT NULL DEFAULT '{}',
-  embedding                vector,
+  -- Sized so HNSW can build at migrate time; 1024 matches ollama bge-m3 default.
+  -- Coerce DO block below upgrades pre-1.5.2 unsized columns.
+  embedding                vector(1024),
   search_tsv               TSVECTOR,
   search_text              TEXT,
   access_count             INT          NOT NULL DEFAULT 0,
@@ -99,18 +190,48 @@ CREATE INDEX IF NOT EXISTS idx_summaries_embedding
   ON ${schema}.session_summaries (session_row_id)
   WHERE embedding IS NOT NULL;
 
+-- Coerce pre-1.5.2 unsized `vector` column to sized so HNSW can be built.
+-- pgvector requires a dim on the COLUMN, not just the data. Dim priority:
+-- existing row dim > `aquifer.embedding_dim` GUC > 1024 default.
+DO $$
+DECLARE
+  is_unsized BOOLEAN;
+  existing_dim INT;
+  target_dim INT;
+BEGIN
+  SELECT format_type(atttypid, atttypmod) = 'vector'
+    INTO is_unsized
+    FROM pg_attribute
+    WHERE attrelid = '${schema}.session_summaries'::regclass
+      AND attname = 'embedding';
+
+  IF is_unsized THEN
+    EXECUTE 'SELECT vector_dims(embedding) FROM ${schema}.session_summaries WHERE embedding IS NOT NULL LIMIT 1'
+      INTO existing_dim;
+    target_dim := COALESCE(
+      existing_dim,
+      NULLIF(current_setting('aquifer.embedding_dim', true), '')::int,
+      1024
+    );
+    EXECUTE 'ALTER TABLE ${schema}.session_summaries ALTER COLUMN embedding TYPE vector('
+         || target_dim::text
+         || ') USING embedding::vector('
+         || target_dim::text
+         || ')';
+    RAISE NOTICE '[aquifer] session_summaries.embedding coerced from unsized vector to vector(%)', target_dim;
+  END IF;
+END$$;
+
 -- HNSW approximate nearest-neighbor index for cosine-distance vector search.
--- Without this, ORDER BY embedding <=> $vec degrades to seq scan at scale.
--- Requires pgvector >= 0.5.0. HNSW cannot build on an empty unsized `vector`
--- column (can't infer dim), so we defer on failure — re-running migrate()
--- after the first insert will finish the job.
+-- Column is sized via CREATE TABLE or the coerce block above, so the index
+-- builds on fresh installs too. Safety-net EXCEPTION handlers stay for the
+-- genuine recoverable failures; invalid_parameter_value is intentionally
+-- NOT caught — it used to mask the unsized-column schema bug.
 DO $$
 BEGIN
   BEGIN
     EXECUTE 'CREATE INDEX IF NOT EXISTS idx_summaries_embedding_hnsw ON ${schema}.session_summaries USING hnsw (embedding vector_cosine_ops)';
   EXCEPTION
-    WHEN invalid_parameter_value THEN
-      RAISE NOTICE '[aquifer] HNSW index on session_summaries.embedding deferred; re-run migrate() after the first embedded row';
     WHEN feature_not_supported THEN
       RAISE NOTICE '[aquifer] HNSW not available on this pgvector; upgrade to >= 0.5.0 for index-accelerated vector search';
     WHEN out_of_memory THEN
@@ -155,11 +276,28 @@ BEGIN
   INTO facts_text
   FROM jsonb_array_elements(COALESCE(ss->'important_facts', '[]'::jsonb)) AS elem;
 
-  NEW.search_tsv :=
-    setweight(to_tsvector('simple', title_text), 'A') ||
-    setweight(to_tsvector('simple', overview_text || ' ' || topics_text || ' ' || decisions_text), 'B') ||
-    setweight(to_tsvector('simple', COALESCE(NEW.summary_text, '')), 'C') ||
-    setweight(to_tsvector('simple', open_loops_text || ' ' || facts_text), 'D');
+  -- Use zhcfg if available (Chinese segmentation — pg_jieba jiebaqry on new
+  -- installs, zhparser as legacy fallback; zhcfg name is a stable indirection
+  -- managed by the DO block above). Else fall back to simple tokenizer.
+  -- The per-row IF EXISTS lookup hits a tiny fully-cached system catalog
+  -- (pg_ts_config, ~12 rows) — effectively free. Chose this over migrate-time
+  -- codegen because installing pg_jieba POST-install immediately benefits new
+  -- inserts without requiring a manual re-migrate.
+  IF EXISTS (SELECT 1 FROM pg_ts_config
+             WHERE cfgname = 'zhcfg'
+               AND cfgnamespace = 'public'::regnamespace) THEN
+    NEW.search_tsv :=
+      setweight(to_tsvector('zhcfg', title_text), 'A') ||
+      setweight(to_tsvector('zhcfg', overview_text || ' ' || topics_text || ' ' || decisions_text), 'B') ||
+      setweight(to_tsvector('zhcfg', COALESCE(NEW.summary_text, '')), 'C') ||
+      setweight(to_tsvector('zhcfg', open_loops_text || ' ' || facts_text), 'D');
+  ELSE
+    NEW.search_tsv :=
+      setweight(to_tsvector('simple', title_text), 'A') ||
+      setweight(to_tsvector('simple', overview_text || ' ' || topics_text || ' ' || decisions_text), 'B') ||
+      setweight(to_tsvector('simple', COALESCE(NEW.summary_text, '')), 'C') ||
+      setweight(to_tsvector('simple', open_loops_text || ' ' || facts_text), 'D');
+  END IF;
 
   NEW.search_text :=
     title_text || ' ' || overview_text || ' ' || topics_text || ' ' ||
@@ -198,7 +336,9 @@ CREATE TABLE IF NOT EXISTS ${schema}.turn_embeddings (
   role             TEXT         NOT NULL DEFAULT 'user' CHECK (role = 'user'),
   content_text     TEXT         NOT NULL,
   content_hash     TEXT         NOT NULL,
-  embedding        vector       NOT NULL,
+  -- Sized so HNSW can build at migrate time. Coerce DO block below upgrades
+  -- pre-1.5.2 unsized columns.
+  embedding        vector(1024) NOT NULL,
   created_at       TIMESTAMPTZ  NOT NULL DEFAULT now(),
   UNIQUE (session_row_id, message_index)
 );
@@ -209,15 +349,45 @@ CREATE INDEX IF NOT EXISTS idx_turn_emb_session_row
 CREATE INDEX IF NOT EXISTS idx_turn_emb_tenant_agent
   ON ${schema}.turn_embeddings (tenant_id, agent_id, source);
 
+-- Coerce pre-1.5.2 unsized `vector` column for turn_embeddings.
+-- NOT NULL so every row has a dim; existing_dim should always resolve.
+DO $$
+DECLARE
+  is_unsized BOOLEAN;
+  existing_dim INT;
+  target_dim INT;
+BEGIN
+  SELECT format_type(atttypid, atttypmod) = 'vector'
+    INTO is_unsized
+    FROM pg_attribute
+    WHERE attrelid = '${schema}.turn_embeddings'::regclass
+      AND attname = 'embedding';
+
+  IF is_unsized THEN
+    EXECUTE 'SELECT vector_dims(embedding) FROM ${schema}.turn_embeddings WHERE embedding IS NOT NULL LIMIT 1'
+      INTO existing_dim;
+    target_dim := COALESCE(
+      existing_dim,
+      NULLIF(current_setting('aquifer.embedding_dim', true), '')::int,
+      1024
+    );
+    EXECUTE 'ALTER TABLE ${schema}.turn_embeddings ALTER COLUMN embedding TYPE vector('
+         || target_dim::text
+         || ') USING embedding::vector('
+         || target_dim::text
+         || ')';
+    RAISE NOTICE '[aquifer] turn_embeddings.embedding coerced from unsized vector to vector(%)', target_dim;
+  END IF;
+END$$;
+
 -- HNSW approximate nearest-neighbor index for turn-level vector search.
--- See notes on session_summaries.embedding HNSW above.
+-- See notes on session_summaries.embedding HNSW above. invalid_parameter_value
+-- intentionally NOT caught — it used to mask the unsized-column schema bug.
 DO $$
 BEGIN
   BEGIN
     EXECUTE 'CREATE INDEX IF NOT EXISTS idx_turn_emb_embedding_hnsw ON ${schema}.turn_embeddings USING hnsw (embedding vector_cosine_ops)';
   EXCEPTION
-    WHEN invalid_parameter_value THEN
-      RAISE NOTICE '[aquifer] HNSW index on turn_embeddings.embedding deferred; re-run migrate() after the first embedded row';
     WHEN feature_not_supported THEN
       RAISE NOTICE '[aquifer] HNSW not available on this pgvector; upgrade to >= 0.5.0 for index-accelerated vector search';
     WHEN out_of_memory THEN

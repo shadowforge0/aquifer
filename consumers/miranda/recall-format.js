@@ -3,7 +3,7 @@
 // Miranda zh-TW recall formatter — overrides the shared default renderers
 // to produce narrative-style output instead of score-flavored markdown.
 
-const { createRecallFormatter, truncate, formatDateIso } = require('../shared/recall-format');
+const { createRecallFormatter, truncate, formatDateIso, formatRelativeZhTw } = require('../shared/recall-format');
 
 function formatTopicLines(topics) {
     if (!Array.isArray(topics) || topics.length === 0) return '- 無';
@@ -32,10 +32,12 @@ function coalesceTitle(structuredSummary, summaryText) {
 const mirandaRenderers = {
     empty: () => '找不到符合條件的 session。',
     header: () => null,
-    title: (r, i) => {
+    title: (r, i, ctx) => {
         const ss = r.structuredSummary || {};
         const title = coalesceTitle(ss, r.summaryText);
-        const date = formatDateIso(r.startedAt);
+        const iso = formatDateIso(r.startedAt);
+        const rel = formatRelativeZhTw(r.startedAt, ctx?.now);
+        const date = rel ? `${rel}（${iso}）` : iso;
         const agent = r.agentId || r.agent_id || 'main';
         return `### ${i + 1}. ${title}\n**Agent**: ${agent} | **Date**: ${date}`;
     },

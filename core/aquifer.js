@@ -42,15 +42,45 @@ function loadSql(filename, schema) {
 // ---------------------------------------------------------------------------
 
 function buildRerankDocument(row, maxChars) {
-  let text = (row.summary_text || row.summary_snippet || '').replace(/\s+/g, ' ').trim();
+  // Prefer structured_summary fields when available — title/overview carry
+  // more signal than summary_text for short Chinese recaps, and topics /
+  // decisions / open_loops give the cross-encoder substantive content.
+  // Fall back to summary_text / matched_turn_text when structured is absent.
+  const ss = row.structured_summary || null;
+  const parts = [];
+  if (ss) {
+    if (ss.title) parts.push(String(ss.title).trim());
+    if (ss.overview) parts.push(String(ss.overview).trim());
+    if (Array.isArray(ss.topics)) {
+      const topics = ss.topics
+        .map(t => typeof t === 'string' ? t : (t && t.name ? `${t.name}${t.summary ? ': ' + t.summary : ''}` : ''))
+        .filter(Boolean).join(' / ');
+      if (topics) parts.push(topics);
+    }
+    if (Array.isArray(ss.decisions)) {
+      const decisions = ss.decisions
+        .map(d => typeof d === 'string' ? d : (d && d.decision ? d.decision : ''))
+        .filter(Boolean).join(' / ');
+      if (decisions) parts.push(`Decisions: ${decisions}`);
+    }
+    if (Array.isArray(ss.open_loops)) {
+      const loops = ss.open_loops
+        .map(l => typeof l === 'string' ? l : (l && l.item ? l.item : ''))
+        .filter(Boolean).join(' / ');
+      if (loops) parts.push(`Open loops: ${loops}`);
+    }
+  }
+  if (!parts.length) {
+    const bare = (row.summary_text || row.summary_snippet || '').trim();
+    if (bare) parts.push(bare);
+  }
   const turn = (row.matched_turn_text || '').replace(/\s+/g, ' ').trim();
-
-  if (!text) {
-    text = turn;
-  } else if (turn && !text.includes(turn)) {
-    text = `${text}\n\nMatched turn:\n${turn}`;
+  if (turn) {
+    const joined = parts.join(' \n ');
+    if (!joined.includes(turn)) parts.push(`Matched turn: ${turn}`);
   }
 
+  let text = parts.join('\n\n').replace(/[ \t]+/g, ' ').trim();
   if (text.length > maxChars) text = text.slice(0, maxChars);
   return text;
 }
@@ -91,6 +121,48 @@ function resolveEmbedFn(embedConfig, env) {
 // ---------------------------------------------------------------------------
 // createAquifer
 // ---------------------------------------------------------------------------
+
+// Decide whether to invoke the optional reranker on this recall call.
+// Returns `{ apply: boolean, reason: string }`. Pure function — no side effects.
+function shouldAutoRerank({ query, mode, ranked, hasEntities, autoTrigger }) {
+  if (!autoTrigger.enabled) return { apply: false, reason: 'auto_disabled' };
+
+  if (hasEntities && autoTrigger.alwaysWhenEntities) {
+    return { apply: true, reason: 'entities_present' };
+  }
+
+  const len = ranked.length;
+  if (len < autoTrigger.minResults) return { apply: false, reason: 'too_few_results' };
+  if (len > autoTrigger.maxResults) return { apply: false, reason: 'too_many_results' };
+
+  const q = String(query || '').trim();
+  const tokenCount = q.split(/\s+/).filter(Boolean).length;
+  if (q.length < autoTrigger.minQueryChars && tokenCount < autoTrigger.minQueryTokens) {
+    return { apply: false, reason: 'query_too_short' };
+  }
+
+  // FTS-only path: rerank when results are wide enough that semantic narrowing
+  // is valuable. Cohere-style cross-encoders excel at re-ranking keyword hits.
+  if (mode === 'fts') {
+    if (len > autoTrigger.ftsMinResults) return { apply: true, reason: 'fts_wide_shortlist' };
+    return { apply: false, reason: 'fts_shortlist_too_narrow' };
+  }
+
+  if (!autoTrigger.modes.includes(mode)) {
+    return { apply: false, reason: 'mode_not_in_autotrigger_modes' };
+  }
+
+  // Hybrid: if top-1 and top-2 are close, signals are mixed enough to benefit.
+  if (len >= 2) {
+    const s0 = ranked[0]?._score ?? 0;
+    const s1 = ranked[1]?._score ?? 0;
+    if (s0 - s1 <= autoTrigger.maxTopScoreGap) {
+      return { apply: true, reason: 'top_score_gap_close' };
+    }
+  }
+
+  return { apply: false, reason: 'top_score_gap_wide' };
+}
 
 function createAquifer(config = {}) {
   // v1.2.0: db falls back to DATABASE_URL / AQUIFER_DB_URL env so hosts can
@@ -176,6 +248,24 @@ function createAquifer(config = {}) {
   const defaultRerankTopK = rerankConfig ? Math.max(1, rerankConfig.topK || 20) : 0;
   const rerankMaxChars = rerankConfig ? Math.max(200, rerankConfig.maxChars || 1600) : 0;
 
+  // Auto-trigger gate for rerank: when reranker is configured but caller didn't
+  // explicitly pass opts.rerank, decide per-call whether the cost is worth it.
+  // Defaults aim for "rerank when shortlist is dense enough to benefit, query
+  // is non-trivial, and either signals are mixed (hybrid) or FTS returned a
+  // wide candidate set worth narrowing semantically."
+  const autoTriggerCfg = (rerankConfig && rerankConfig.autoTrigger) || {};
+  const autoTrigger = {
+    enabled: autoTriggerCfg.enabled !== false,  // default true when reranker exists
+    modes: autoTriggerCfg.modes || ['hybrid'],
+    minQueryChars: autoTriggerCfg.minQueryChars ?? 6,
+    minQueryTokens: autoTriggerCfg.minQueryTokens ?? 2,
+    minResults: autoTriggerCfg.minResults ?? 2,
+    maxResults: autoTriggerCfg.maxResults ?? 12,
+    maxTopScoreGap: autoTriggerCfg.maxTopScoreGap ?? 0.08,
+    alwaysWhenEntities: autoTriggerCfg.alwaysWhenEntities !== false,  // default true
+    ftsMinResults: autoTriggerCfg.ftsMinResults ?? 5,  // FTS-only mode triggers when results > this
+  };
+
   // Source registry (in-memory)
   const sources = new Map();
 
@@ -183,57 +273,33 @@ function createAquifer(config = {}) {
   let migrated = false;
   let migratePromise = null;
 
+  // FTS tsconfig — auto-detected during migrate(). 'zhcfg' if zhparser is
+  // installed (better Chinese segmentation), otherwise 'simple' (legacy).
+  // Override via config.ftsConfig if you need to force one or the other.
+  let ftsConfig = config.ftsConfig || null;
+
+  // State-change extraction (Q3): off by default. When enabled, enrich() runs
+  // an extra LLM call to capture temporal state transitions on whitelisted
+  // entities. See pipeline/extract-state-changes.js + core/entity-state.js.
+  const stateChangesCfg = config.stateChanges || {};
+  const stateChangesEnabled = stateChangesCfg.enabled === true;
+  const stateChangesWhitelist = new Set(
+    (Array.isArray(stateChangesCfg.whitelist) ? stateChangesCfg.whitelist : [])
+      .map(s => String(s).toLowerCase())
+  );
+  const stateChangesPromptFn = stateChangesCfg.promptFn || null;
+  const stateChangesConfThreshold = Number.isFinite(stateChangesCfg.confidenceThreshold)
+    ? stateChangesCfg.confidenceThreshold : 0.7;
+  const stateChangesTimeoutMs = Number.isFinite(stateChangesCfg.timeoutMs)
+    ? stateChangesCfg.timeoutMs : 10000;
+  const stateChangesMaxOutputTokens = Number.isFinite(stateChangesCfg.maxOutputTokens)
+    ? stateChangesCfg.maxOutputTokens : 600;
+
   async function ensureMigrated() {
     if (migrated) return;
     if (migratePromise) return migratePromise;
     migratePromise = aquifer.migrate().finally(() => { migratePromise = null; });
     return migratePromise;
-  }
-
-  // --- Helper: embed search on summaries ---
-  async function embeddingSearchSummaries(queryVec, opts) {
-    const { agentIds, source, dateFrom, dateTo, limit = 20 } = opts;
-    const where = [`s.tenant_id = $1`];
-    const params = [tenantId];
-
-    params.push(`[${queryVec.join(',')}]`);
-    const vecPos = params.length;
-
-    if (dateFrom) {
-      params.push(dateFrom);
-      where.push(`($${params.length}::date IS NULL OR s.started_at::date >= $${params.length}::date)`);
-    }
-    if (dateTo) {
-      params.push(dateTo);
-      where.push(`($${params.length}::date IS NULL OR s.started_at::date <= $${params.length}::date)`);
-    }
-    if (agentIds && agentIds.length > 0) {
-      params.push(agentIds);
-      where.push(`s.agent_id = ANY($${params.length})`);
-    }
-    if (source) {
-      params.push(source);
-      where.push(`s.source = $${params.length}`);
-    }
-
-    params.push(limit);
-
-    const result = await pool.query(
-      `SELECT
-        s.id, s.session_id, s.agent_id, s.source, s.started_at, s.last_message_at,
-        ss.summary_text, ss.structured_summary, ss.access_count, ss.last_accessed_at,
-        ss.trust_score,
-        (ss.embedding <=> $${vecPos}::vector) AS distance
-      FROM ${qi(schema)}.session_summaries ss
-      JOIN ${qi(schema)}.sessions s ON s.id = ss.session_row_id
-      WHERE ss.embedding IS NOT NULL
-        AND ${where.join(' AND ')}
-      ORDER BY distance ASC
-      LIMIT $${params.length}`,
-      params
-    );
-
-    return result.rows;
   }
 
   // =========================================================================
@@ -248,39 +314,157 @@ function createAquifer(config = {}) {
       // Lock key is derived from schema name to allow parallel migration
       // of different schemas in the same database.
       const lockKey = Buffer.from(`aquifer:${schema}`).reduce((h, b) => (h * 31 + b) & 0x7fffffff, 0);
-      await pool.query('SELECT pg_advisory_lock($1)', [lockKey]);
+
+      // Run all migration DDL on a single checked-out client so we can
+      // capture RAISE NOTICE/WARNING emitted by the DO blocks. node-postgres
+      // swallows notices on pool.query(); attaching a 'notice' listener to a
+      // held client surfaces them. Fall back to pool.query() when the caller
+      // passed a bare mock (no connect/release) — tests using minimal pool
+      // stubs still exercise the migration shape, just without notice capture.
+      const supportsCheckout = typeof pool.connect === 'function';
+      const client = supportsCheckout ? await pool.connect() : pool;
+      const releasesClient = supportsCheckout && typeof client.release === 'function';
+      const notices = [];
+      const onNotice = (n) => {
+        notices.push({ severity: n.severity || 'NOTICE', message: n.message || String(n) });
+      };
+      const hasEvents = typeof client.on === 'function' && typeof client.off === 'function';
+      if (hasEvents) client.on('notice', onNotice);
+
       try {
-        // 1. Run base DDL
-        const baseSql = loadSql('001-base.sql', schema);
-        await pool.query(baseSql);
+        await client.query('SELECT pg_advisory_lock($1)', [lockKey]);
+        try {
+          // 1. Run base DDL
+          const baseSql = loadSql('001-base.sql', schema);
+          await client.query(baseSql);
 
-        // 2. If entities enabled, run entity DDL
-        if (entitiesEnabled) {
-          const entitySql = loadSql('002-entities.sql', schema);
-          await pool.query(entitySql);
+          // 2. If entities enabled, run entity DDL
+          if (entitiesEnabled) {
+            const entitySql = loadSql('002-entities.sql', schema);
+            await client.query(entitySql);
+          }
+
+          // 3. Trust + feedback (always, not gated by entities)
+          const trustSql = loadSql('003-trust-feedback.sql', schema);
+          await client.query(trustSql);
+
+          // 4. Facts / consolidation (opt-in)
+          if (factsEnabled) {
+            const factsSql = loadSql('004-facts.sql', schema);
+            await client.query(factsSql);
+          }
+
+          // 5. Completion foundation (always, additive): narratives,
+          // consumer_profiles, sessions.consolidation_phases. Pure additive DDL
+          // with IF NOT EXISTS guards — safe on every migrate() call.
+          const completionSql = loadSql('004-completion.sql', schema);
+          await client.query(completionSql);
+
+          // 6. Entity state history (always, gated by entitiesEnabled because
+          // it FK-references entities). Drop-clean — see scripts/drop-entity-state-history.sql.
+          if (entitiesEnabled) {
+            const stateHistorySql = loadSql('005-entity-state-history.sql', schema);
+            await client.query(stateHistorySql);
+          }
+
+          // 7. Insights (always, additive). No FK from anywhere into this table —
+          // safe to DROP CASCADE. See scripts/drop-insights.sql.
+          const insightsSql = loadSql('006-insights.sql', schema);
+          await client.query(insightsSql);
+
+          migrated = true;
+        } finally {
+          await client.query('SELECT pg_advisory_unlock($1)', [lockKey]).catch((err) => {
+            console.warn(`[aquifer] failed to release migration advisory lock for schema "${schema}": ${err.message}`);
+          });
         }
-
-        // 3. Trust + feedback (always, not gated by entities)
-        const trustSql = loadSql('003-trust-feedback.sql', schema);
-        await pool.query(trustSql);
-
-        // 4. Facts / consolidation (opt-in)
-        if (factsEnabled) {
-          const factsSql = loadSql('004-facts.sql', schema);
-          await pool.query(factsSql);
-        }
-
-        // 5. Completion foundation (always, additive): narratives,
-        // consumer_profiles, sessions.consolidation_phases. Pure additive DDL
-        // with IF NOT EXISTS guards — safe on every migrate() call.
-        const completionSql = loadSql('004-completion.sql', schema);
-        await pool.query(completionSql);
-
-        migrated = true;
       } finally {
-        await pool.query('SELECT pg_advisory_unlock($1)', [lockKey]).catch((err) => {
-          console.warn(`[aquifer] failed to release migration advisory lock for schema "${schema}": ${err.message}`);
-        });
+        if (hasEvents) client.off('notice', onNotice);
+        if (releasesClient) client.release();
+      }
+
+      // Surface captured migration notices that operators need to see:
+      //   - any WARNING/ERROR (zhcfg rebuild warnings, HNSW OOM, etc.)
+      //   - aquifer-authored NOTICE messages ('[aquifer] ...' prefix in the
+      //     migration DO blocks; these announce extension-install fallback,
+      //     HNSW deferral, and other operational decisions)
+      // Filtered out: PG's own "relation already exists, skipping" and
+      // similar idempotent-DDL chatter that floods a re-run.
+      for (const n of notices) {
+        const sev = (n.severity || 'NOTICE').toUpperCase();
+        const msg = n.message || '';
+        const line = `[aquifer] migration ${sev.toLowerCase()}: ${msg}`;
+        if (sev === 'WARNING' || sev === 'ERROR') {
+          console.warn(line);
+        } else if (sev === 'NOTICE' && msg.startsWith('[aquifer]')) {
+          console.info(line);
+        }
+      }
+
+      // Auto-detect FTS tsconfig if not forced by config. Restrict to the
+      // public namespace — same restriction the trigger function uses — so a
+      // same-named config in another schema doesn't fool the detection.
+      if (!ftsConfig) {
+        try {
+          const r = await pool.query(
+            `SELECT 1 FROM pg_ts_config
+               WHERE cfgname = 'zhcfg' AND cfgnamespace = 'public'::regnamespace
+               LIMIT 1`);
+          ftsConfig = r.rowCount > 0 ? 'zhcfg' : 'simple';
+        } catch {
+          ftsConfig = 'simple';
+        }
+      }
+
+      // Post-flight: surface which Chinese FTS backend the migration actually
+      // landed on, and warm the backend's tokenizer so the first live query
+      // doesn't pay cold-start cost unpredictably. RAISE NOTICE/WARNING from
+      // the migration DO blocks are swallowed by node-postgres unless a
+      // notice handler is attached, so without this operators can't tell if
+      // pg_jieba silently failed to install and FTS is degraded to 'simple'.
+      //
+      // pg_jieba first-backend load is ~60MB RAM + 0.5-1s to mmap the dict.
+      // Warming once inside migrate() amortizes that on the backend that runs
+      // migration; other pool backends still pay it on first use, but the
+      // timing surfaces the cost so operators who see unexpected latency
+      // know where to look.
+      try {
+        const f = await pool.query(`
+          SELECT
+            EXISTS(SELECT 1 FROM pg_extension WHERE extname='pg_jieba')   AS have_jieba,
+            EXISTS(SELECT 1 FROM pg_extension WHERE extname='zhparser')   AS have_zhparser,
+            (SELECT p.prsname FROM pg_ts_config c
+               JOIN pg_ts_parser p ON c.cfgparser = p.oid
+               WHERE c.cfgname='zhcfg' AND c.cfgnamespace='public'::regnamespace
+               LIMIT 1)                                                    AS zhcfg_parser
+        `);
+        const row = f.rows[0] || {};
+        const backend = row.zhcfg_parser
+          ? `zhcfg(parser=${row.zhcfg_parser})`
+          : `simple (no zhcfg in public namespace)`;
+
+        let warmupMs = null;
+        if (row.zhcfg_parser) {
+          const t0 = Date.now();
+          await pool.query(`SELECT to_tsvector('zhcfg', $1)`, ['warmup 記憶系統 aquifer'])
+            .catch(() => {});
+          warmupMs = Date.now() - t0;
+        }
+
+        const warmupNote = warmupMs !== null ? ` warmup=${warmupMs}ms` : '';
+        console.info(
+          `[aquifer] FTS post-flight: backend=${backend} ` +
+          `jieba=${row.have_jieba} zhparser=${row.have_zhparser} ` +
+          `selected=${ftsConfig}${warmupNote}`
+        );
+        if (warmupMs !== null && warmupMs > 500) {
+          console.info(
+            `[aquifer] Note: first FTS call paid ~${warmupMs}ms for tokenizer init ` +
+            `(dictionary mmap). Subsequent calls on the same backend are cached.`
+          );
+        }
+      } catch (err) {
+        console.warn(`[aquifer] FTS post-flight check failed: ${err.message}`);
       }
     },
 
@@ -504,6 +688,34 @@ function createAquifer(config = {}) {
         } catch (e) { warnings.push(`entity extraction failed: ${e.message}`); }
       }
 
+      // 4d. State-change extraction (Q3) — only if enabled, entities available,
+      // and at least one parsed entity matches whitelist. Returns changes with
+      // entity_name (not id); resolution happens in tx after entity upsert.
+      let parsedStateChanges = [];
+      if (stateChangesEnabled && entitiesEnabled && !skipEntities && parsedEntities.length > 0 && llmFn) {
+        const scopedEntities = stateChangesWhitelist.size === 0
+          ? parsedEntities  // empty whitelist == all parsed entities in scope
+          : parsedEntities.filter(e => stateChangesWhitelist.has(String(e.name).toLowerCase()));
+        if (scopedEntities.length > 0) {
+          try {
+            const { extractStateChanges } = require('../pipeline/extract-state-changes');
+            const result = await extractStateChanges(normalized, {
+              llmFn,
+              promptFn: stateChangesPromptFn,
+              entities: scopedEntities.map(e => ({ name: e.name, aliases: e.aliases || [] })),
+              sessionStartedAt: session.started_at ? new Date(session.started_at).toISOString() : null,
+              evidenceSessionId: sessionId,
+              confidenceThreshold: stateChangesConfThreshold,
+              timeoutMs: stateChangesTimeoutMs,
+              maxOutputTokens: stateChangesMaxOutputTokens,
+              logger: { warn: (m) => warnings.push(`state-change: ${m}`) },
+            });
+            parsedStateChanges = result.changes || [];
+            for (const w of (result.warnings || [])) warnings.push(`state-change: ${w}`);
+          } catch (e) { warnings.push(`state-change extraction failed: ${e.message}`); }
+        }
+      }
+
       // 5. Now open transaction — only DB writes, no external calls
       const client = await pool.connect();
       let turnsEmbedded = 0;
@@ -595,6 +807,49 @@ function createAquifer(config = {}) {
           }
 
           entitiesFound = entityIds.length;
+
+          // 5d. Apply state changes (Q3) inside SAVEPOINT so a CONFLICT or
+          // CHECK violation can't poison the parent transaction.
+          if (parsedStateChanges.length > 0) {
+            // Build name→id map from upserted entities (parsedEntities aligned
+            // with entityIds by index).
+            const nameToId = new Map();
+            for (let i = 0; i < parsedEntities.length && i < entityIds.length; i++) {
+              const ent = parsedEntities[i];
+              if (!ent || entityIds[i] === null || entityIds[i] === undefined) continue;
+              nameToId.set(String(ent.name).toLowerCase(), entityIds[i]);
+              for (const a of (ent.aliases || [])) {
+                if (typeof a === 'string') nameToId.set(a.toLowerCase(), entityIds[i]);
+              }
+            }
+            const resolved = [];
+            for (const ch of parsedStateChanges) {
+              const id = nameToId.get(String(ch.entityName || '').toLowerCase());
+              if (id === null || id === undefined) continue;
+              const { entityName: _drop, ...rest } = ch;
+              void _drop;
+              resolved.push({ ...rest, entityId: id, sessionRowId: session.id });
+            }
+            if (resolved.length > 0) {
+              try {
+                await client.query('SAVEPOINT state_changes');
+                const r = await aquifer.entityState.applyChanges(client, {
+                  agentId,
+                  sessionRowId: session.id,
+                  changes: resolved,
+                });
+                if (!r.ok) {
+                  warnings.push(`state-change apply failed: ${r.error.code} ${r.error.message}`);
+                  await client.query('ROLLBACK TO SAVEPOINT state_changes');
+                } else {
+                  await client.query('RELEASE SAVEPOINT state_changes');
+                }
+              } catch (e) {
+                warnings.push(`state-change savepoint error: ${e.message}`);
+                try { await client.query('ROLLBACK TO SAVEPOINT state_changes'); } catch { /* ignore */ }
+              }
+            }
+          }
         }
 
         // 8. Mark status + commit (M5: use 'partial' if warnings)
@@ -672,7 +927,13 @@ function createAquifer(config = {}) {
     // --- read path ---
 
     async recall(query, opts = {}) {
-      if (!query) return [];
+      // Contract (aligned across core / manifest / consumer tools): query must
+      // be a non-empty string. Empty strings previously short-circuited to []
+      // silently — that masks caller bugs. Callers wanting "recent sessions"
+      // should use a dedicated API, not pass empty to recall().
+      if (typeof query !== 'string' || query.trim().length === 0) {
+        throw new Error('aquifer.recall(query): query must be a non-empty string');
+      }
 
       const VALID_MODES = ['fts', 'hybrid', 'vector'];
       const mode = opts.mode !== undefined ? opts.mode : 'hybrid';
@@ -724,8 +985,12 @@ function createAquifer(config = {}) {
 
       await ensureMigrated();
 
-      const rerankEnabled = !!reranker && opts.rerank !== false;
-      const rerankTopK = rerankEnabled ? Math.max(limit, opts.rerankTopK || defaultRerankTopK) : limit;
+      // rerank gating: provider must be configured + caller didn't disable.
+      // Whether to actually invoke is decided after hybridRank, since the
+      // shortlist is needed for the auto-trigger heuristics.
+      const rerankProviderReady = !!reranker && opts.rerank !== false;
+      const rerankForced = opts.rerank === true;
+      const rerankTopK = rerankProviderReady ? Math.max(limit, opts.rerankTopK || defaultRerankTopK) : limit;
       const fetchLimit = rerankTopK * 4;
 
       // 1. Embed query (only needed for hybrid/vector modes)
@@ -769,14 +1034,24 @@ function createAquifer(config = {}) {
             entityScoreBySession.set(row.session_id, 1.0);
           }
         } else {
-          // 'any' mode with explicit entities: use resolved IDs for boost
+          // 'any' mode with explicit entities: use resolved IDs for boost.
+          // Filter by tenant_id + agentIds to prevent cross-tenant / cross-agent
+          // boost pollution (session_id is caller-supplied and not globally unique).
+          const esParams = [entityIds, tenantId];
+          let esAgentClause = '';
+          if (resolvedAgentIds && resolvedAgentIds.length > 0) {
+            esParams.push(resolvedAgentIds);
+            esAgentClause = `AND s.agent_id = ANY($${esParams.length})`;
+          }
           const esResult = await pool.query(
             `SELECT es.session_row_id, s.session_id, COUNT(*) AS entity_count
             FROM ${qi(schema)}.entity_sessions es
             JOIN ${qi(schema)}.sessions s ON s.id = es.session_row_id
             WHERE es.entity_id = ANY($1)
+              AND s.tenant_id = $2
+              ${esAgentClause}
             GROUP BY es.session_row_id, s.session_id`,
-            [entityIds]
+            esParams
           );
 
           const maxCount = Math.max(1, ...esResult.rows.map(r => parseInt(r.entity_count)));
@@ -793,13 +1068,21 @@ function createAquifer(config = {}) {
 
           if (matchedEntities.length > 0) {
             const entityIds = matchedEntities.map(e => e.id);
+            const esParams = [entityIds, tenantId];
+            let esAgentClause = '';
+            if (resolvedAgentIds && resolvedAgentIds.length > 0) {
+              esParams.push(resolvedAgentIds);
+              esAgentClause = `AND s.agent_id = ANY($${esParams.length})`;
+            }
             const esResult = await pool.query(
               `SELECT es.session_row_id, s.session_id, COUNT(*) AS entity_count
               FROM ${qi(schema)}.entity_sessions es
               JOIN ${qi(schema)}.sessions s ON s.id = es.session_row_id
               WHERE es.entity_id = ANY($1)
+                AND s.tenant_id = $2
+                ${esAgentClause}
               GROUP BY es.session_row_id, s.session_id`,
-              [entityIds]
+              esParams
             );
 
             const maxCount = Math.max(1, ...esResult.rows.map(r => parseInt(r.entity_count)));
@@ -814,23 +1097,25 @@ function createAquifer(config = {}) {
       const runFts = mode === 'fts' || mode === 'hybrid';
       const runVector = mode === 'vector' || mode === 'hybrid';
 
-      const [ftsRows, embRows, turnResult] = await Promise.all([
+      const [ftsRows, embResult, turnResult] = await Promise.all([
         runFts
           ? storage.searchSessions(pool, query, {
               schema, tenantId, agentIds: resolvedAgentIds, source, dateFrom, dateTo, limit: fetchLimit,
+              ftsConfig,
             }).catch((err) => {
               recordSearchError('fts', err);
               return [];
             })
           : Promise.resolve([]),
         runVector
-          ? embeddingSearchSummaries(queryVec, {
+          ? storage.searchSummaryEmbeddings(pool, {
+              schema, tenantId, queryVec,
               agentIds: resolvedAgentIds, source, dateFrom, dateTo, limit: fetchLimit,
             }).catch((err) => {
               recordSearchError('summary-vector', err);
-              return [];
+              return { rows: [] };
             })
-          : Promise.resolve([]),
+          : Promise.resolve({ rows: [] }),
         runVector
           ? storage.searchTurnEmbeddings(pool, {
               schema, tenantId, queryVec, dateFrom, dateTo, agentIds: resolvedAgentIds, source, limit: fetchLimit,
@@ -841,6 +1126,7 @@ function createAquifer(config = {}) {
           : Promise.resolve({ rows: [] }),
       ]);
 
+      const embRows = embResult.rows || [];
       const turnRows = turnResult.rows || [];
 
       // 3b. Apply candidate filter (entityMode 'all')
@@ -908,9 +1194,35 @@ function createAquifer(config = {}) {
         },
       );
 
-      // 6b. Rerank (optional)
+      // 6b. Rerank (optional, with auto-trigger gate)
       let finalRanked = ranked;
-      if (rerankEnabled && ranked.length > 1) {
+      let rerankDecision = { apply: false, reason: 'provider_not_ready' };
+      if (rerankProviderReady && ranked.length > 1) {
+        if (rerankForced) {
+          rerankDecision = { apply: true, reason: 'forced' };
+        } else {
+          // hasEntities = either caller passed entities explicitly OR the
+          // query-derived path found matching entities (non-empty boost map).
+          // shouldAutoRerank names the condition "entities present"; honour both.
+          rerankDecision = shouldAutoRerank({
+            query,
+            mode,
+            ranked,
+            hasEntities: (explicitEntities && explicitEntities.length > 0)
+              || entityScoreBySession.size > 0,
+            autoTrigger,
+          });
+        }
+      } else if (!rerankProviderReady) {
+        rerankDecision = {
+          apply: false,
+          reason: !reranker ? 'no_provider_configured' : 'caller_disabled',
+        };
+      } else {
+        rerankDecision = { apply: false, reason: 'shortlist_too_short' };
+      }
+
+      if (rerankDecision.apply) {
         try {
           const docs = ranked.map(r => buildRerankDocument(r, rerankMaxChars));
           const rerankResult = await reranker.rerank(query, docs, { topN: ranked.length });
@@ -920,6 +1232,7 @@ function createAquifer(config = {}) {
             ...r,
             _hybridScore: r._score,
             _rerankScore: scoreMap.has(i) ? scoreMap.get(i) : null,
+            _rerankReason: rerankDecision.reason,
           }));
 
           finalRanked.sort((a, b) => {
@@ -932,10 +1245,15 @@ function createAquifer(config = {}) {
         } catch (rerankErr) {
           // Fallback: use original hybrid-rank order, flag in debug
           if (process.env.AQUIFER_DEBUG) console.error('[aquifer] rerank error:', rerankErr.message);
-          finalRanked = ranked.slice(0, limit).map(r => ({ ...r, _rerankFallback: true }));
+          finalRanked = ranked.slice(0, limit).map(r => ({
+            ...r,
+            _rerankFallback: true,
+            _rerankReason: rerankDecision.reason,
+            _rerankErrorMessage: rerankErr.message,
+          }));
         }
       } else {
-        finalRanked = ranked.slice(0, limit);
+        finalRanked = ranked.slice(0, limit).map(r => ({ ...r, _rerankReason: rerankDecision.reason }));
       }
 
       // 7. Record access
@@ -972,6 +1290,9 @@ function createAquifer(config = {}) {
           hybridScore: r._hybridScore ?? r._score,
           rerankScore: r._rerankScore ?? null,
           rerankFallback: r._rerankFallback || false,
+          rerankApplied: rerankDecision.apply,
+          rerankReason: r._rerankReason || rerankDecision.reason,
+          rerankErrorMessage: r._rerankErrorMessage || null,
           searchErrors: searchErrors.slice(),
         },
       }));
@@ -1251,6 +1572,8 @@ function createAquifer(config = {}) {
   const { createArtifacts } = require('./artifacts');
   const { createConsolidation } = require('./consolidation');
   const { createBundles } = require('./bundles');
+  const { createEntityState } = require('./entity-state');
+  const { createInsights } = require('./insights');
   const qSchema = qi(schema);
   aquifer.narratives = createNarratives({ pool, schema: qSchema, defaultTenantId: tenantId });
   aquifer.timeline = createTimeline({ pool, schema: qSchema, defaultTenantId: tenantId });
@@ -1261,6 +1584,22 @@ function createAquifer(config = {}) {
   aquifer.artifacts = createArtifacts({ pool, schema: qSchema, defaultTenantId: tenantId });
   aquifer.consolidation = createConsolidation({ pool, schema: qSchema, defaultTenantId: tenantId });
   aquifer.bundles = createBundles({ pool, schema: qSchema, defaultTenantId: tenantId });
+  // entityState materialises in schema/005-entity-state-history.sql, gated on
+  // entitiesEnabled (it FK-references entities). Drop-clean — see
+  // scripts/drop-entity-state-history.sql.
+  aquifer.entityState = createEntityState({ pool, schema: qSchema, defaultTenantId: tenantId });
+  // insights materialises in schema/006-insights.sql. No FK from elsewhere
+  // into this table; DROP CASCADE is clean. See scripts/drop-insights.sql.
+  // Recall ranking weights configurable via config.insights.recallWeights.
+  aquifer.insights = createInsights({
+    pool,
+    schema: qSchema,
+    defaultTenantId: tenantId,
+    embedFn,
+    recallWeights: (config.insights && config.insights.recallWeights) || null,
+    recencyWindowDays: config.insights && Number.isFinite(config.insights.recencyWindowDays)
+      ? config.insights.recencyWindowDays : undefined,
+  });
 
   return aquifer;
 }
@@ -1320,4 +1659,4 @@ function formatBootstrapText(data, maxChars) {
 // Exports
 // ---------------------------------------------------------------------------
 
-module.exports = { createAquifer, formatBootstrapText };
+module.exports = { createAquifer, formatBootstrapText, shouldAutoRerank };

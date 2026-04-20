@@ -90,7 +90,11 @@ LANGUAGE plpgsql
 AS $$
 BEGIN
   NEW.search_text := COALESCE(NEW.text, '') || ' ' || COALESCE(NEW.metadata::text, '');
-  NEW.search_tsv  := setweight(to_tsvector('simple', COALESCE(NEW.text, '')), 'A');
+  IF EXISTS (SELECT 1 FROM pg_ts_config WHERE cfgname = 'zhcfg') THEN
+    NEW.search_tsv := setweight(to_tsvector('zhcfg', COALESCE(NEW.text, '')), 'A');
+  ELSE
+    NEW.search_tsv := setweight(to_tsvector('simple', COALESCE(NEW.text, '')), 'A');
+  END IF;
   RETURN NEW;
 END;
 $$;
@@ -184,9 +188,15 @@ BEGIN
     COALESCE(NEW.text, '') || ' ' ||
     COALESCE(NEW.metadata::text, '');
 
-  NEW.search_tsv :=
-    setweight(to_tsvector('simple', COALESCE(NEW.category, '')), 'B') ||
-    setweight(to_tsvector('simple', COALESCE(NEW.text, '')), 'A');
+  IF EXISTS (SELECT 1 FROM pg_ts_config WHERE cfgname = 'zhcfg') THEN
+    NEW.search_tsv :=
+      setweight(to_tsvector('zhcfg', COALESCE(NEW.category, '')), 'B') ||
+      setweight(to_tsvector('zhcfg', COALESCE(NEW.text, '')), 'A');
+  ELSE
+    NEW.search_tsv :=
+      setweight(to_tsvector('simple', COALESCE(NEW.category, '')), 'B') ||
+      setweight(to_tsvector('simple', COALESCE(NEW.text, '')), 'A');
+  END IF;
 
   RETURN NEW;
 END;
@@ -310,9 +320,15 @@ BEGIN
     COALESCE(NEW.reason_text, '') || ' ' ||
     COALESCE(NEW.metadata::text, '');
 
-  NEW.search_tsv :=
-    setweight(to_tsvector('simple', COALESCE(NEW.decision_text, '')), 'A') ||
-    setweight(to_tsvector('simple', COALESCE(NEW.reason_text, '')), 'B');
+  IF EXISTS (SELECT 1 FROM pg_ts_config WHERE cfgname = 'zhcfg') THEN
+    NEW.search_tsv :=
+      setweight(to_tsvector('zhcfg', COALESCE(NEW.decision_text, '')), 'A') ||
+      setweight(to_tsvector('zhcfg', COALESCE(NEW.reason_text, '')), 'B');
+  ELSE
+    NEW.search_tsv :=
+      setweight(to_tsvector('simple', COALESCE(NEW.decision_text, '')), 'A') ||
+      setweight(to_tsvector('simple', COALESCE(NEW.reason_text, '')), 'B');
+  END IF;
 
   RETURN NEW;
 END;

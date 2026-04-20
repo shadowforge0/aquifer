@@ -4,11 +4,15 @@
  * Aquifer FTS 中文診斷
  *
  * 測 aquifer 實際搜尋主路徑（trigram ILIKE on search_text + similarity ranking）
- * vs fallback 路徑（tsvector @@ plainto_tsquery('simple', q)）對中文 query 的表現。
+ * vs fallback 路徑（tsvector @@ plainto_tsquery(<cfg>, q)）對中文 query 的表現。
+ * tsconfig 自動偵測：public.zhcfg 已存在就用 'zhcfg'（1.5.0+ 底層是 pg_jieba
+ * jiebaqry，1.4.0 底層是 zhparser），否則退回 'simple'。腳本會印出 zhcfg 實際
+ * parser 名稱——看到 'zhparser' 代表繁體分詞會退化 char-level。
  *
  * env:
  *   DATABASE_URL       — required
  *   AQUIFER_SCHEMA     — default 'public'
+ *   AQUIFER_FTS_CONFIG — override auto-detect ('zhcfg' or 'simple')
  *   DIAGNOSE_QUERIES   — comma-separated, overrides built-in set
  */
 
@@ -41,8 +45,37 @@ function pct(n, d) {
   return `${Math.round((n / d) * 100)}%`;
 }
 
+async function detectFtsConfig() {
+  if (process.env.AQUIFER_FTS_CONFIG === 'zhcfg' || process.env.AQUIFER_FTS_CONFIG === 'simple') {
+    return { cfg: process.env.AQUIFER_FTS_CONFIG, parser: null };
+  }
+  try {
+    const r = await pool.query(`
+      SELECT p.prsname AS parser
+      FROM pg_ts_config c JOIN pg_ts_parser p ON c.cfgparser = p.oid
+      WHERE c.cfgname = 'zhcfg' AND c.cfgnamespace = 'public'::regnamespace
+      LIMIT 1`);
+    if (r.rowCount > 0) return { cfg: 'zhcfg', parser: r.rows[0].parser };
+    return { cfg: 'simple', parser: null };
+  } catch {
+    return { cfg: 'simple', parser: null };
+  }
+}
+
+let FTS_CFG = 'simple';
+
 async function main() {
-  console.log(`=== Aquifer FTS 中文診斷 (schema=${SCHEMA}) ===\n`);
+  const detected = await detectFtsConfig();
+  FTS_CFG = detected.cfg;
+  const parserLabel = detected.parser
+    ? ` parser=${detected.parser}`
+    : '';
+  console.log(`=== Aquifer FTS 中文診斷 (schema=${SCHEMA}, tsconfig=${FTS_CFG}${parserLabel}) ===\n`);
+  if (detected.parser === 'zhparser') {
+    console.log('[warn] zhcfg 目前是 zhparser-backed。scws 內建字典是簡體字為主，對');
+    console.log('       繁體字會全退 char-level 分詞（「記憶」→ 記/憶 單字，等於');
+    console.log('       simple tokenizer）。考慮換 pg_jieba，見 CHANGELOG 1.5.0。\n');
+  }
 
   // -------------------------------------------------------------------------
   // 0. 覆蓋率：search_text NULL 率 → 看 fallback 觸發比例
@@ -94,7 +127,7 @@ async function main() {
   //
   // Ground truth = search_text ILIKE '%q%'（所有源欄位拼出的純文字 superset）
   // 主路徑        = search_text ILIKE（GIN trgm 加速，語意等價 ILIKE）
-  // Fallback     = search_tsv @@ plainto_tsquery('simple', q)
+  // Fallback     = search_tsv @@ plainto_tsquery(<cfg>, q)
   // -------------------------------------------------------------------------
   console.log('--- 2. 主路徑（trigram）vs fallback（tsvector）binary match ---');
   console.log('  query               | truth | trgm  | tsv   | trgm% | tsv%  | tsv-extra');
@@ -114,7 +147,7 @@ async function main() {
         SELECT search_text,
                search_tsv,
                (search_text ILIKE '%' || $1 || '%')                                 AS trgm_hit,
-               (search_tsv  @@ plainto_tsquery('simple', $2))                       AS tsv_hit
+               (search_tsv  @@ plainto_tsquery('${FTS_CFG}', $2))                   AS tsv_hit
         FROM ${qi(SCHEMA)}.session_summaries
         WHERE search_text IS NOT NULL
       )

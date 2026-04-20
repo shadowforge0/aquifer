@@ -31,7 +31,7 @@ function httpRequest(url, options, body) {
         }
         try {
           finish(resolve, JSON.parse(raw));
-        } catch (e) {
+        } catch {
           finish(reject, new Error(`Invalid JSON from LLM (${raw.length} bytes)`));
         }
       });

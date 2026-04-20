@@ -20,7 +20,7 @@ const MCP_SERVER_NAME = 'aquifer-memory';
 const MCP_TOOL_MANIFEST = Object.freeze([
   {
     name: 'session_recall',
-    description: 'Search stored sessions by keyword. Supports entity intersection for precise multi-entity queries.',
+    description: 'Search stored sessions by keyword or natural language. Use entities when the user names specific people, projects, files, tools, or concepts; entityMode="all" hard-filters to sessions containing every entity (default "any" boosts). Use mode to force fts/vector/hybrid (default hybrid). Use dateFrom/dateTo for time-bounded recall.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,

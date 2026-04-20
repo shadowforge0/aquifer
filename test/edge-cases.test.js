@@ -876,11 +876,12 @@ describe('core/aquifer.js', () => {
     await assert.rejects(() => aquifer.commit('s1', {}), /messages must be an array/);
   });
 
-  it('recall returns [] for empty queries before embed validation', async () => {
+  it('recall rejects empty / null / undefined queries with a contract error', async () => {
     const aquifer = createAquifer({ db: {} });
-    assert.deepEqual(await aquifer.recall(''), []);
-    assert.deepEqual(await aquifer.recall(null), []);
-    assert.deepEqual(await aquifer.recall(undefined), []);
+    await assert.rejects(() => aquifer.recall(''), /query must be a non-empty string/);
+    await assert.rejects(() => aquifer.recall('   '), /query must be a non-empty string/);
+    await assert.rejects(() => aquifer.recall(null), /query must be a non-empty string/);
+    await assert.rejects(() => aquifer.recall(undefined), /query must be a non-empty string/);
   });
 
   it('recall rejects non-empty queries when embed config is missing', async () => {

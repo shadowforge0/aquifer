@@ -75,16 +75,41 @@ describe('storage.searchSessions trigram search', () => {
     assert.equal(captured[0].params[1], '100% done_ok');
   });
 
-  it('ftsConfig parameter is ignored (no longer used)', async () => {
+  it('ftsConfig=zhcfg routes plainto_tsquery to zhcfg parser', async () => {
     const captured = [];
-    // Should not throw or warn even if ftsConfig is passed
     await storage.searchSessions(makePool(captured), 'hello', {
       schema: 'aquifer',
       tenantId: 'default',
       ftsConfig: 'zhcfg',
     });
     assert.equal(captured.length, 1);
-    assert.ok(!captured[0].sql.includes('zhcfg'), 'zhcfg should not appear in SQL');
+    assert.ok(captured[0].sql.includes("plainto_tsquery('zhcfg'"),
+      'SQL should route to zhcfg tsconfig when ftsConfig=zhcfg');
+    assert.ok(!captured[0].sql.includes("plainto_tsquery('simple'"),
+      'simple tsconfig must not coexist when zhcfg is selected');
+  });
+
+  it('ftsConfig defaults to simple when omitted', async () => {
+    const captured = [];
+    await storage.searchSessions(makePool(captured), 'hello', {
+      schema: 'aquifer',
+      tenantId: 'default',
+    });
+    assert.ok(captured[0].sql.includes("plainto_tsquery('simple'"),
+      'default ftsConfig should be simple');
+  });
+
+  it('ftsConfig with unknown value falls back to simple (whitelist)', async () => {
+    const captured = [];
+    await storage.searchSessions(makePool(captured), 'hello', {
+      schema: 'aquifer',
+      tenantId: 'default',
+      ftsConfig: 'evil; DROP TABLE foo',
+    });
+    assert.ok(captured[0].sql.includes("plainto_tsquery('simple'"),
+      'unknown ftsConfig must whitelist down to simple');
+    assert.ok(!captured[0].sql.includes('DROP TABLE'),
+      'must not allow injection through ftsConfig');
   });
 
   it('passes agentIds filter correctly', async () => {

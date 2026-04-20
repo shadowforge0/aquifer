@@ -4,6 +4,506 @@ All notable changes to `@shadowforge0/aquifer-memory` are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project uses semantic versioning.
 
+## [1.5.6] - 2026-04-20
+
+C1 canonical revision model for `miranda.insights` — an insight now has
+a stable **canonical identity** (what it's about) and an unbounded chain
+of **revisions** (how our understanding of it has refined). Prior model
+conflated the two: title-hash idempotency meant a refined body under the
+same title was either a duplicate-skip (losing the refinement) or a
+write that diverged from every downstream reader holding the old row.
+Extractor runs over overlapping windows (daily 14/50 + weekly 60/200)
+kept producing near-identical insights that were either dropped as
+collisions or accumulated as parallel siblings with no lineage.
+
+### Added — `core/insights.js`
+
+- **Pure helpers** (zero DB) — `normalizeCanonicalClaim`,
+  `normalizeBody`, `normalizeEntitySet`, `defaultCanonicalKey`. Canonical
+  key = sha256(`type|agentId|normalize(canonicalClaim)|sorted(entities)`).
+  Whitespace / case / punctuation folding documented in-module; trailing
+  punctuation tolerated. Entity set participates so the same claim about
+  different subjects stays distinct.
+- **`revisionIdempotencyKey(canonicalKey, body, evidenceWindow)`** —
+  replaces title-hash idempotency. Rerun on same window returns the
+  existing row (Rule 4 stale replay). Different body on same canonical
+  opens a revision (Rule 2/3).
+- **`commitInsight` four rules**:
+  1. Idempotency hit → return existing (no DB write).
+  2. Canonical hit, different body, newer evidence → INSERT new row
+     with `canonical_key_v2 = <key>`, inline `UPDATE ... SET
+     superseded_by = NEW.id, stale = true WHERE canonical_key_v2 = <key>
+     AND id <> NEW.id AND stale = false`.
+  3. Canonical hit, different body, older/equal evidence → still
+     INSERT but do not supersede (back-fill revision).
+  4. Canonical hit, same body, stale replay → return existing row
+     without flipping stale.
+- Preflight is two bounded SELECTs: idempotency key first, then
+  canonical key. Neither holds a lock; the inline UPDATE in rule 2 does.
+- Title is now best-effort display text. Fallback generation tags
+  `metadata.title_source = 'fallback'` so downstream can tell.
+- `parseUpperFromRange` helper parses PG tstzrange upper bound for the
+  newer-evidence comparison.
+
+### Added — `schema/006-insights.sql`
+
+- **`canonical_key_v2 TEXT`** column — nullable (old rows have NULL, no
+  retrofit).
+- **`idx_insights_canonical_v2_active`** — non-unique partial index on
+  `(canonical_key_v2) WHERE canonical_key_v2 IS NOT NULL AND stale =
+  false`. Non-unique by design: rules 2 + inline UPDATE collapse the
+  active set to at-most-one per canonical key; a unique constraint would
+  require holding a lock across the INSERT/UPDATE pair.
+- Column `COMMENT` documents the canonical-identity contract.
+
+### Added — `scripts/extract-insights-from-recent-sessions.js`
+
+- Prompt JSON schema now requires `canonicalClaim` (short factual
+  predicate, the "what it's about") and `entities` array per insight.
+  Prompt explains the contract (canonical identity, revision opens when
+  body refines) with examples.
+- `commitInsight` call forwards `canonicalClaim` and `entities` through.
+
+### Migration notes
+
+- **Schema-only ALTER**, no data rewrite. Existing rows keep
+  `canonical_key_v2 = NULL`; revision rules only apply to rows with a
+  canonical key set. Next extractor run populates canonical keys on
+  newly-written rows.
+- **Old rows are NOT retrofitted** — by design. Canonical claim is
+  extractor-derived and we don't have it for rows written under the
+  title-hash model. Natural decay: as stale rules replay over time, old
+  insights supersede / age out and the active set migrates to the v2
+  model.
+- No index rebuild needed on large tables (new index is partial and
+  covers only canonical-key-set active rows).
+
+## [1.5.5] - 2026-04-20
+
+Treat-root-cause fix for `miranda.sessions.ended_at` pollution. The
+column was being overwritten to `now()` on every `upsertSession` /
+backfill commit, so backfilled-or-re-committed sessions lost their true
+last-message timestamp and collapsed to the time of the most recent
+batch. Downstream recency-aware features (recall windowing, insights
+evidence windows, state-change backfill) were all reading the wrong
+"when did this conversation end" from the pollution.
+
+### Changed
+
+- **`core/storage.js`** — `upsertSession` INSERT and UPDATE paths now
+  derive `ended_at = COALESCE(EXCLUDED.last_message_at, existing.ended_at)`
+  instead of `ended_at = now()`. Only advances when the caller supplies
+  a newer `lastMessageAt`; otherwise preserves the prior value.
+- External companion fix in `extensions/afterburn/bin/backfill-normalized.js`
+  (separate repo) mirrors the same COALESCE pattern so bulk backfills
+  cannot re-pollute.
+
+### Added
+
+- **`test/session-ended-at.integration.test.js`** — three regression
+  locks: (a) first commit sets ended_at from lastMessageAt, (b) re-commit
+  without new lastMessageAt preserves prior ended_at, (c) backfill
+  commit with older lastMessageAt does not roll ended_at backwards.
+  Guards against the specific 2026-04-20 pollution re-emerging.
+
+### Migration notes
+
+- **Historical pollution (203 rows) was repaired in-place** on
+  2026-04-20 via transactional UPDATE that recomputed `ended_at` from
+  `last_message_at`. Backup kept in `miranda._backup_ended_at_20260420`.
+  Fresh installs are unaffected.
+- If you operate a deployment that has been on pre-1.5.5 with regular
+  backfills, spot-check a few `(ended_at, last_message_at)` pairs —
+  if ended_at is newer than last_message_at by more than a few seconds,
+  that row was polluted; repair with
+  `UPDATE miranda.sessions SET ended_at = last_message_at WHERE ended_at > last_message_at + interval '1 minute'`
+  (tune the grace interval to your ingest pattern).
+
+## [1.5.3] - 2026-04-20
+
+Prompt-quality fix + optional Claude-CLI backend for
+`scripts/extract-insights-from-recent-sessions.js`.
+Real-world A/B on 181 sessions showed the prior prompt produced only 3
+shallow insights — all technical bug patterns (timeout, version drift,
+workflow). It consistently missed META-LEVEL behavioural signals
+(user preferences, discipline gaps, decision-style signatures) that are
+only visible when reading multiple sessions back-to-back.
+
+### Changed
+
+- **`buildExtractionPrompt`** — adds a "What to look for" section
+  steering the extractor toward behavioural preferences, discipline
+  gaps, decision-style signatures, and workflow scaffolding. Bumps
+  expected output to 6-12 insights for windows >50 sessions with >=3
+  distinct themes. Reframes 0 insights as the sparse-window exception,
+  not a safe fallback under uncertainty.
+- Importance guidance now spreads the scale: 0.85-0.95 reserved for
+  meta-level preferences + discipline gaps (highest leverage, directly
+  shape agent behaviour), 0.65-0.80 for stable technical patterns /
+  workflows, 0.45-0.60 for lower-leverage observations. Prior prompt
+  let everything cluster at 0.70-0.85 regardless of leverage.
+- Explicitly calls out that "only surfaced technical bug frustrations
+  and missed meta-level behavioural signal" = failed task.
+
+### Added
+
+- **Claude CLI adapter** — set `AQUIFER_INSIGHTS_CLI=claude` to spawn
+  `claude -p --model <m> --output-format text` instead of using a
+  provider API. Uses OAuth from the user's keychain (do NOT pass
+  `--bare`, which disables OAuth). Rationale: an empirical A/B on 181
+  sessions showed that mid-tier models (minimax-M2.5) miss
+  meta-level behavioural signals that Opus/Sonnet pick up readily. For
+  a once-a-day batch job, the cost delta is small and the quality
+  delta is large.
+- Env knobs: `AQUIFER_INSIGHTS_CLI_MODEL` (default `opus`, alias or
+  full name accepted), `AQUIFER_INSIGHTS_CLI_BIN` (default `claude`),
+  `AQUIFER_INSIGHTS_CLI_TIMEOUT_MS` (default 600000).
+- Script logs the active backend on start:
+  `[extract-insights] llm backend: claude cli (opus)` vs
+  `api provider`.
+
+### Migration notes
+
+- No schema change. Re-run the cron / script to re-distill with the
+  new prompt. `commitInsight` idempotency key includes title + sorted
+  session IDs, so new titles will write; matching old titles skip.
+- Consider `TRUNCATE miranda.insights RESTART IDENTITY` before
+  re-running if you want a clean baseline.
+- To opt into the CLI backend on a cron, set the env vars in the
+  service unit. The host running the cron must have `claude` on PATH
+  and an authenticated OAuth session. `--bare` mode is NOT used — it
+  would strip OAuth and force an API key, defeating the purpose.
+
+## [1.5.2] - 2026-04-20
+
+Extends the 1.5.1 insights-schema fix to every embedding column across
+`schema/001-base.sql` and `schema/002-entities.sql`. The unsized
+`vector` anti-pattern was present in four places; pgvector HNSW index
+creation was permanently impossible on all of them. On installs that
+migrated from a version with sized columns (e.g. miranda schema) this
+happened to work; fresh installs (e.g. jenny schema) silently degraded
+to sequential vector scans.
+
+### Changed
+
+- **`schema/001-base.sql`** — `session_summaries.embedding` and
+  `turn_embeddings.embedding` are now `vector(1024)`. Both HNSW `DO`
+  blocks no longer catch `invalid_parameter_value` (kept
+  `feature_not_supported` / `out_of_memory` / `program_limit_exceeded`
+  as safety nets).
+- **`schema/002-entities.sql`** — `entities.embedding` is now
+  `vector(1024)`. No HNSW yet (entity lookup is name-trgm), but the
+  sized declaration means future HNSW work drops in cleanly.
+
+### Added
+
+- Idempotent coerce `DO` blocks in `001-base.sql` (session_summaries,
+  turn_embeddings) and `002-entities.sql` (entities) that ALTER any
+  existing unsized `vector` column to `vector(N)`. Mirrors the 1.5.1
+  insights coerce. Dim priority: existing row dim → `aquifer.embedding_dim`
+  GUC → 1024 default. Logs `[aquifer] <table>.embedding coerced from
+  unsized vector to vector(N)` when triggered.
+- `test/schema-contract.test.js` — three new assertion groups for
+  001-base (`session_summaries` sized, `turn_embeddings` sized, coerce
+  blocks present) and 002-entities (sized + coerce). Regression guard
+  for the embedding-dim anti-pattern.
+
+### Migration notes
+
+- Re-run `aquifer.migrate()` on any deployment upgraded from pre-1.5.2.
+  Coerce blocks ALTER in-place — fast for small tables, O(n × dim) for
+  `turn_embeddings` at scale (each row rewritten). Plan a maintenance
+  window if `turn_embeddings` has >100k rows.
+- Non-1024 embedding providers: `SET LOCAL aquifer.embedding_dim =
+  <dim>` before migrate(), or manually `ALTER TABLE` after install.
+
+## [1.5.1] - 2026-04-20
+
+Schema fix — `miranda.insights.embedding` was declared as unsized `vector`
+which makes pgvector HNSW index creation permanently impossible. The
+previous "defer until first embedded row" pattern was a broken diagnosis:
+pgvector requires the COLUMN to have a dimension at index creation time,
+not the data. A fresh 1.5.0 install would write insights rows via
+`aquifer.insights.commitInsight()`, re-run migrate(), and still not get
+the vector index. Operators were silently doing linear scans.
+
+### Changed
+
+- **`schema/006-insights.sql`** — `embedding` column is now `vector(1024)`
+  (matches the ollama / bge-m3 autodetect default). Fresh installs build
+  `idx_insights_embedding` HNSW on first migrate. The HNSW `DO` block now
+  only catches `undefined_object` / `feature_not_supported` / OOM /
+  internal-limit conditions, not `invalid_parameter_value` (which was
+  masking the real schema bug).
+
+### Added
+
+- **`schema/006-insights.sql`** — idempotent coerce block ALTERs any
+  existing unsized `vector` column to `vector(<dim>)` before HNSW build.
+  Dim priority: existing row dim → `aquifer.embedding_dim` GUC → 1024.
+  Logs `[aquifer] insights.embedding coerced from unsized vector to
+  vector(N)` when triggered. No-op if column already sized.
+
+### Migration notes
+
+- Existing 1.5.0 deployments: re-run `aquifer.migrate()`. The coerce block
+  will ALTER in-place (fast; table is small) and build the HNSW index.
+- Non-1024 embedding providers (openai 1536, etc.): `SET LOCAL
+  aquifer.embedding_dim = 1536` before `migrate()`, or manually
+  `ALTER TABLE` after install. Future 1.6.x will wire this from
+  `createAquifer` config.
+
+## [1.5.0] - 2026-04-19
+
+Chinese FTS rework — the zhcfg tsconfig was silently degrading to
+char-level tokenization on Traditional-Chinese corpora because zhparser's
+scws dictionary is Simplified-only and every Traditional character fell
+out of vocabulary. Indexed text looked segmented (v/n tags present) but
+lexemes were single chars, and `ts_rank_cd` carried no real signal — a
+retro-recall-bench comparing fts-simple vs fts-zhcfg would produce a
+null result on this corpus.
+
+### Changed
+
+- **`schema/001-base.sql`** — migration now prefers `pg_jieba` over
+  `zhparser`. When `pg_jieba` is available, `zhcfg` is (re)created as a
+  `COPY = public.jiebaqry` alias — search-engine mode, which indexes both
+  the full compound (`記憶系統`) and its sub-components (`記憶`, `系統`)
+  so a user query at any granularity matches. The trigger function's
+  `to_tsvector('zhcfg', ...)` calls route to jieba without code change.
+- **Cross-schema safety**: `zhcfg` is a database-wide object, but
+  `migrate()`'s advisory lock is per-schema. The DO block now acquires
+  a transaction-scoped global advisory lock (`pg_advisory_xact_lock`)
+  around the DROP/CREATE so concurrent `migrate()` calls on different
+  Aquifer schemas in the same DB don't race on the tsconfig.
+- **Namespace-qualified lookups**: every `pg_ts_config` query now filters
+  on `cfgnamespace = 'public'::regnamespace`, and DROP/CREATE use
+  `public.zhcfg` explicitly — stops a same-named config elsewhere in
+  `search_path` from confusing detection or getting overwritten.
+- **Idempotent upgrade path**: an existing zhparser-backed `zhcfg` is
+  DROPped and rebuilt as a jiebaqry alias on the next `migrate()` if
+  `pg_jieba` is now installed. Already-jieba-backed configs are left
+  alone (noop).
+- **Recovery branch (S9)**: if an operator has dropped `pg_jieba` but
+  `zhcfg` still points at the jieba parser, future `session_summaries`
+  writes would throw `parser "jiebaqry" does not exist`. The DO block
+  now detects this and either rebuilds `zhcfg` on zhparser (if
+  available) or drops it so consumers fall back to `simple`.
+- **Defensive EXCEPTION handler**: the entire zhcfg DO block is wrapped
+  — ownership mismatches, blocked DROPs, concurrent races now
+  `RAISE WARNING` and leave the existing config intact instead of
+  aborting the whole `migrate()`.
+- **Fallback order**: jieba → zhparser → simple. Pure Simplified
+  deployments that still want zhparser keep working unchanged; the
+  zhparser branch now only fires when jieba is unavailable *and* zhcfg
+  hasn't been created yet. Added `eng` token type to zhparser mapping
+  so English words in mixed-language text are no longer silently
+  dropped (was a 1.4.0 bug, carried over and now fixed).
+- **Post-flight visibility**: `migrate()` now prints a one-line summary
+  after completion (`[aquifer] FTS post-flight: backend=... jieba=...
+  zhparser=... selected=...`) so operators can tell whether `pg_jieba`
+  actually installed or whether it silently degraded to simple —
+  `RAISE NOTICE` from migration DDL is swallowed by node-postgres by
+  default.
+
+### Operator notes
+
+- **Installing `pg_jieba`** (not in official postgres images). PG 16 example:
+
+  ```bash
+  apt-get install -y build-essential cmake git \
+    libpq-dev postgresql-server-dev-16
+  git clone --recursive https://github.com/jaiminpan/pg_jieba /tmp/pg_jieba
+  cd /tmp/pg_jieba && mkdir build && cd build
+  cmake .. && make -j"$(nproc)" && make install
+  ```
+
+  Then replace the dictionary with a Traditional-aware one:
+
+  ```bash
+  DICT=/usr/share/postgresql/16/tsearch_data/jieba_base.dict
+  cp "$DICT" "$DICT.bak"
+  curl -fsSL -o "$DICT" \
+    https://raw.githubusercontent.com/fxsjy/jieba/master/extra_dict/dict.txt.big
+  ```
+
+  `dict.txt.big` is the jieba project's official Traditional Chinese
+  dictionary (~584k entries, Traditional + Simplified). Pin a specific
+  commit SHA via `https://raw.githubusercontent.com/fxsjy/jieba/<sha>/extra_dict/dict.txt.big`
+  if reproducibility matters. After replacing the dict, existing
+  backends keep the old one cached in memory — restart your app
+  (so backends reconnect) or run `SELECT pg_terminate_backend(pid)`
+  against idle connections.
+
+- **Docker users**: after the `apt install + make install + dict swap`,
+  snapshot the container:
+
+  ```bash
+  docker commit <db_container> pg-jieba:local
+  ```
+
+  Without this, a `docker compose down && up` on the stock
+  `postgres:16` image loses the extension. Contributors welcome to
+  upstream a Dockerfile — see issue template.
+
+- **Re-baseline after pg_jieba updates**: `zhcfg (COPY = jiebaqry)` is a
+  one-time snapshot of jiebaqry's mapping when the config was created.
+  Dictionary changes propagate automatically (they live in the parser
+  layer, not the config layer), but if you upgrade `pg_jieba` and its
+  new version changes the *mapping* (token type → dictionary), you'll
+  want to rebuild `zhcfg`: `DROP TEXT SEARCH CONFIGURATION public.zhcfg`
+  then re-run `migrate()`.
+
+- **Existing rows** keep their old (possibly char-level) `search_tsv`
+  until the row is re-touched. Force a bulk reindex with
+  `UPDATE <schema>.session_summaries SET summary_text = summary_text;`
+  — the trigger recomputes tsv on UPDATE. On 19k+ rows this takes
+  tens of seconds and holds row-level locks for the duration; run
+  during a low-traffic window, or batch with
+  `WHERE session_row_id % 20 = 0` (and similar offsets) if you need to
+  interleave with live writes.
+
+## [1.4.0] - 2026-04-19
+
+Same-day double release after a full /develop pass (Discover → Define →
+Develop → Deliver). Wave 1 hardens the existing recall path; Wave 2 adds two
+new capability tables (entity_state_history, insights) for temporal
+state-change tracking and reflection-style higher-order observations.
+
+### Added
+
+- **`aquifer.entityState`** — temporal state-change tracking on entities.
+  - Schema: `005-entity-state-history.sql` (single table, no triggers, partial
+    UNIQUE on current row, partial UNIQUE on idempotency_key).
+  - API: `applyChanges(client, ...)`, `applyChangesStandalone(input)`,
+    `getEntityCurrentState(...)`, `getEntityStateHistory(...)`.
+  - Out-of-order backfill safe: predecessor / successor overlap check before
+    inserting a closed-interval historical row, equal-timestamp rejected as
+    `AQ_CONFLICT`.
+  - Source-conflict (current row written by a different `source`) returns
+    `AQ_CONFLICT` instead of overriding — caller decides priority.
+  - Default idempotency key includes source + canonical_json(value) +
+    evidenceSessionId.
+- **`pipeline/extract-state-changes.js`** — opt-in LLM extraction of state
+  changes from session content. Strict prompt rejects tentative language and
+  requires explicit time anchors. Configured via
+  `createAquifer({ stateChanges: { enabled, whitelist, promptFn,
+  confidenceThreshold, timeoutMs, maxOutputTokens } })`. Default OFF.
+- **enrich() integration** — when stateChanges.enabled and parsedEntities
+  match the whitelist, runs extract pre-tx and applies in-tx via SAVEPOINT so
+  conflicts can't poison the parent transaction.
+- **`aquifer.insights`** — higher-order reflection / pattern memory.
+  - Schema: `006-insights.sql` (TSTZRANGE evidence_window, unsized vector
+    with HNSW deferred until first embedded row, GIN on source_session_ids).
+  - API: `commitInsight(...)`, `recallInsights(query, opts)`,
+    `markStale(id)`, `supersede(oldId, newId)`.
+  - Insight types: `preference | pattern | frustration | workflow`.
+  - Recall blends semantic × importance × recency (linear decay over
+    `recencyWindowDays`, default 90, configurable).
+  - Empty-query recall returns importance-blended results with linear recency
+    decay (not just `ORDER BY importance DESC`).
+  - `supersede` verifies tenant + agent consistency and rejects self-cycles.
+  - `defaultIdempotencyKey` includes body + evidenceWindow so legitimate
+    revisions aren't swallowed as duplicates.
+- **`scripts/extract-insights-from-recent-sessions.js`** — standalone
+  cron-runnable extractor (Route B). Reads recent sessions, single LLM call,
+  commits via API. Bypasses cron-prompt JSON parsing fragility.
+- **`scripts/retro-recall-bench.js`** + **`scripts/sample-bench-queries.sql`**
+  — six-pipeline retro evaluation harness (fts-simple / fts-zhcfg /
+  summary-vector / turn-only / hybrid / hybrid-rerank) with nDCG@5, MRR,
+  p50/p95 latency, empty/judgeable rates. JSON + Markdown output.
+- **`scripts/drop-entity-state-history.sql`**, **`scripts/drop-insights.sql`**
+  — bitter-lesson escape hatches; both new tables are DROP CASCADE clean.
+- **Selective rerank gate** — `shouldAutoRerank({query, mode, ranked,
+  hasEntities, autoTrigger})` pure helper. Three-stage gate `provider ready
+  + (force OR auto)`. Configurable via `createAquifer({rerank: {autoTrigger:
+  {modes, minQueryChars, minQueryTokens, minResults, maxResults,
+  maxTopScoreGap, alwaysWhenEntities, ftsMinResults}}})`.
+  `_debug.{rerankApplied, rerankReason, rerankErrorMessage}` surfaced.
+- **`storage.searchSummaryEmbeddings(pool, opts)`** — extracted from
+  `core/aquifer.js` private closure into reusable export, matches
+  `searchTurnEmbeddings` style.
+- **`storage.searchSessions(pool, query, { ftsConfig })`** — accepts
+  `'simple'` (default, BC) or `'zhcfg'` (whitelist enforced; injection-safe).
+- **Consumer surface** — Miranda persona + default persona `session_recall`
+  MCP tools now expose `entities`, `entity_mode`, and `mode` parameters
+  (previously only available on the core API). Descriptions rewritten with
+  usage guidance.
+
+### Changed
+
+- **`recall(query)` empty/null/undefined now THROWS** — previously returned
+  `[]` silently, masking caller bugs. Throws `'aquifer.recall(query): query
+  must be a non-empty string'`. Manifest + consumer tools also enforce
+  `minLength: 1`. **Breaking** for callers that relied on silent empty
+  return; trim and validate before calling.
+- **`buildRerankDocument(row, maxChars)`** — now prefers
+  `structured_summary` fields (title, overview, topics, decisions,
+  open_loops) over bare `summary_text`; cross-encoder gets substantive
+  Chinese content instead of short recap text.
+- **zhparser FTS regression revert** — v0.6.0 had upgraded FTS from `simple`
+  → zhparser; the 1.x open-source rewrite reverted to `simple`. 1.4.0
+  restores zhparser. `schema/001-base.sql` migrate now creates the extension
+  and `zhcfg` text search configuration (DO block with EXCEPTION fallback so
+  installs without zhparser still succeed). Trigger functions in
+  `001-base.sql` and `004-completion.sql` use `IF EXISTS pg_ts_config WHERE
+  cfgname='zhcfg' THEN to_tsvector('zhcfg',...) ELSE to_tsvector('simple',
+  ...)` runtime branch — enabling zhparser POST-install benefits new inserts
+  without manual re-migrate.
+- **`core/aquifer.js` migrate()** — auto-detects `ftsConfig` from
+  `pg_ts_config` and threads it to `storage.searchSessions` so FTS recall
+  uses zhparser when available.
+- **entity boost cross-tenant safety** — `entity_sessions` boost queries
+  now filter by `tenant_id` and `agentIds`. Previously the boost map was
+  keyed by `session_id` alone, allowing cross-tenant pollution if multiple
+  tenants emitted the same `session_id`.
+- **`shouldAutoRerank.hasEntities`** — also true when query-derived entity
+  matching produced a non-empty `entityScoreBySession` (not just when caller
+  passed `entities` explicitly).
+- **`searchSessions` LEFT JOIN → INNER JOIN** — `WHERE` already referenced
+  `ss.search_text` / `ss.search_tsv`, making the LEFT semantically INNER.
+  Made explicit; documented as "search-over-enriched-sessions".
+- **`scripts/sample-bench-queries.sql`** — actually parametrised by
+  `:"schema"` (previously `\set schema 'miranda'` was set but all `FROM
+  miranda.sessions` lines hardcoded the literal). Use `psql -v
+  schema=aquifer -f ...` to override.
+- **`createAquifer({ insights: { recencyWindowDays } })`** — new config,
+  default 90, replaces previously-hardcoded 90-day recency window in
+  `recallInsights` ranking.
+
+### Fixed
+
+- entity_state_history out-of-order backfill no longer creates overlapping
+  intervals; predecessor/successor neighbour check before insert.
+- entity_state_history equal-timestamp historical conflict now rejected with
+  `AQ_CONFLICT` (previously could create duplicate interval starts).
+- entity_state_history `resolveEntity({entityId})` now enforces
+  `entityScope` when the caller passes one (closes cross-scope read leak).
+- insights `supersede(old, new)` verifies tenant + agent consistency and
+  rejects self-cycle (FK alone allowed cross-tenant supersession chains).
+- insights idempotency key includes body + evidenceWindow (revisions
+  previously swallowed as duplicates when only body / window changed).
+
+### Internal
+
+- `core/entity-state.js` and `core/insights.js` follow the
+  `state.js`/`narratives.js` factory + AqResult envelope conventions.
+- 87 new unit tests (entity-state 27, extract-state-changes 24, insights 22,
+  should-auto-rerank 12, search-summary-embeddings + fts-config 8). 862
+  total tests pass; ESLint 0 errors / 0 warnings; `npm pack --dry-run` and
+  `publint` clean; `npm audit` zero vulnerabilities.
+
+### Deployment notes
+
+- Gateways do NOT auto-migrate. After upgrading, run
+  `node -e "require('@shadowforge0/aquifer-memory').createAquifer({schema:
+  'miranda', entities:{enabled:true}}).migrate()"` once to land 005/006 +
+  the new zhparser-aware trigger functions.
+- For existing rows to benefit from zhparser segmentation, backfill
+  `search_tsv` with a no-op UPDATE (`UPDATE schema.session_summaries SET
+  summary_text = summary_text WHERE id BETWEEN ...`). 19355 rows in 33
+  seconds in production; row-level locks only, no downtime.
+
 ## [1.3.0] - 2026-04-19
 
 ### Completion-capability API surface

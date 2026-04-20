@@ -7,6 +7,7 @@ const {
     formatRecallResults,
     truncate,
     formatDateIso,
+    formatRelativeZhTw,
 } = require('../consumers/shared/recall-format');
 
 const sampleResult = {
@@ -46,6 +47,50 @@ describe('formatDateIso', () => {
     });
     it('returns "unknown" for invalid', () => {
         assert.equal(formatDateIso('not a date'), 'unknown');
+    });
+});
+
+describe('formatRelativeZhTw', () => {
+    const now = new Date('2026-04-20T12:00:00Z').getTime();
+    const h = 3600000;
+    const d = 86400000;
+
+    it('今天 for < 24h', () => {
+        assert.equal(formatRelativeZhTw(now - 2 * h, now), '今天');
+        assert.equal(formatRelativeZhTw(now - 23 * h, now), '今天');
+    });
+    it('昨天 for 24-48h', () => {
+        assert.equal(formatRelativeZhTw(now - 25 * h, now), '昨天');
+        assert.equal(formatRelativeZhTw(now - 47 * h, now), '昨天');
+    });
+    it('N 天前 for 2-6 days', () => {
+        assert.equal(formatRelativeZhTw(now - 3 * d, now), '3 天前');
+        assert.equal(formatRelativeZhTw(now - 6 * d - h, now), '6 天前');
+    });
+    it('N 週前 for 7-29 days', () => {
+        assert.equal(formatRelativeZhTw(now - 7 * d, now), '1 週前');
+        assert.equal(formatRelativeZhTw(now - 14 * d, now), '2 週前');
+        assert.equal(formatRelativeZhTw(now - 29 * d, now), '4 週前');
+    });
+    it('N 個月前 for 30-364 days', () => {
+        assert.equal(formatRelativeZhTw(now - 30 * d, now), '1 個月前');
+        assert.equal(formatRelativeZhTw(now - 90 * d, now), '3 個月前');
+    });
+    it('N 年前 for >= 365 days', () => {
+        assert.equal(formatRelativeZhTw(now - 365 * d, now), '1 年前');
+        assert.equal(formatRelativeZhTw(now - 800 * d, now), '2 年前');
+    });
+    it('returns null for null/invalid', () => {
+        assert.equal(formatRelativeZhTw(null, now), null);
+        assert.equal(formatRelativeZhTw('not a date', now), null);
+    });
+    it('returns null for future timestamps', () => {
+        assert.equal(formatRelativeZhTw(now + d, now), null);
+    });
+    it('defaults to Date.now() when now omitted', () => {
+        // Should not throw, and produce some valid string for an old date
+        const result = formatRelativeZhTw('2020-01-01T00:00:00Z');
+        assert.ok(result && result.endsWith('年前'));
     });
 });
 

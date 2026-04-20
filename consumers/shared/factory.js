@@ -1,7 +1,7 @@
 'use strict';
 
 const { Pool } = require('pg');
-const { createAquifer, createEmbedder, createReranker } = require('../../index');
+const { createAquifer, createEmbedder } = require('../../index');
 const { loadConfig } = require('./config');
 const { createLlmFn } = require('./llm');
 

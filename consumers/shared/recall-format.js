@@ -18,6 +18,25 @@ function formatDateIso(value) {
     return Number.isNaN(d.getTime()) ? 'unknown' : d.toISOString().slice(0, 10);
 }
 
+// Humanize a past timestamp into zh-TW relative form (e.g. "3 天前", "昨天").
+// Bucketed on raw ms-diff — good enough for model intuition, not calendar-precise.
+// Returns null for invalid / future timestamps so callers can fall back.
+function formatRelativeZhTw(value, now) {
+    if (!value) return null;
+    const t = new Date(value).getTime();
+    if (Number.isNaN(t)) return null;
+    const nowMs = typeof now === 'number' ? now : Date.now();
+    const diffMs = nowMs - t;
+    if (diffMs < 0) return null;
+    const day = 86400000;
+    if (diffMs < day) return '今天';
+    if (diffMs < 2 * day) return '昨天';
+    if (diffMs < 7 * day) return `${Math.floor(diffMs / day)} 天前`;
+    if (diffMs < 30 * day) return `${Math.floor(diffMs / (7 * day))} 週前`;
+    if (diffMs < 365 * day) return `${Math.floor(diffMs / (30 * day))} 個月前`;
+    return `${Math.floor(diffMs / (365 * day))} 年前`;
+}
+
 // Default English renderers --------------------------------------------------
 
 const defaultRenderers = {
@@ -63,7 +82,7 @@ function createRecallFormatter(overrides = {}) {
 
     return function format(results, opts = {}) {
         const safeResults = Array.isArray(results) ? results : [];
-        const ctx = { query: opts.query || null, results: safeResults };
+        const ctx = { query: opts.query || null, results: safeResults, now: opts.now };
 
         if (safeResults.length === 0) {
             return r.empty(ctx);
@@ -106,5 +125,6 @@ module.exports = {
     formatRecallResults,
     truncate,
     formatDateIso,
+    formatRelativeZhTw,
     defaultRenderers,
 };
