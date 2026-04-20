@@ -42,6 +42,12 @@ const DEFAULTS = {
     timeoutMs: 2000,
     maxRetries: 1,
   },
+  migrations: {
+    mode: 'apply',         // 'apply' | 'check' | 'off'
+    lockTimeoutMs: 30000,
+    startupTimeoutMs: 60000,
+    onEvent: null,         // (event) => void, optional observability hook
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -77,6 +83,8 @@ const ENV_MAP = [
   ['AQUIFER_RERANK_TOP_K',     'rerank.topK',       Number],
   ['AQUIFER_RERANK_MAX_CHARS', 'rerank.maxChars',   Number],
   ['AQUIFER_RERANK_TIMEOUT_MS','rerank.timeoutMs',   Number],
+  ['AQUIFER_MIGRATIONS_MODE',           'migrations.mode'],
+  ['AQUIFER_MIGRATION_LOCK_TIMEOUT_MS', 'migrations.lockTimeoutMs',   Number],
 ];
 
 // ---------------------------------------------------------------------------

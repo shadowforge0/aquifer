@@ -225,6 +225,27 @@ async function main() {
   process.on('SIGINT', cleanup);
   process.on('SIGTERM', cleanup);
 
+  // Startup handshake: instantiate aquifer + drive init() before MCP transport
+  // so schema state is resolved before the first tool call. apply-mode failure
+  // is fatal (exit non-zero) — an MCP instance with pending DDL would serve
+  // tool traffic against a stale schema and surface confusing errors later.
+  const aquifer = getAquifer();
+  const envelope = await aquifer.init();
+  if (!envelope.ready) {
+    const err = envelope.error || { code: 'AQ_MIGRATION_NOT_READY', message: 'aquifer.init() did not reach ready state' };
+    process.stderr.write(
+      `[aquifer-mcp] startup aborted: migrationMode=${envelope.migrationMode} ` +
+      `memoryMode=${envelope.memoryMode} pending=${envelope.pendingMigrations.length} ` +
+      `error=${err.code || 'unknown'}: ${err.message}\n`
+    );
+    await aquifer.close().catch(() => {});
+    process.exit(1);
+  }
+  process.stderr.write(
+    `[aquifer-mcp] init ok: mode=${envelope.migrationMode} applied=${envelope.appliedMigrations.length} ` +
+    `pending=${envelope.pendingMigrations.length} durationMs=${envelope.durationMs}\n`
+  );
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
 

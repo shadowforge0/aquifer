@@ -4,6 +4,89 @@ All notable changes to `@shadowforge0/aquifer-memory` are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project uses semantic versioning.
 
+## [1.5.7] - 2026-04-20
+
+C2 gateway migrate handshake — hosts now have a real startup contract.
+Previous flow relied on lazy `ensureMigrated()` inside the first tool
+call, which meant: (1) the first caller paid unpredictable latency
+while the migration ran, (2) a migration failure surfaced as a
+cryptic error from inside `recall()`/`commit()` instead of at
+startup, (3) a consumer that wanted to fail fast on pending DDL had
+no hook to do so, and (4) the blocking `pg_advisory_lock()` could
+hang forever if another process crashed holding the lock.
+
+### Added — `core/aquifer.js`
+
+- **`aquifer.init()`** — async startup handshake that returns a
+  StartupEnvelope `{ ready, memoryMode: 'rw' | 'ro' | 'off',
+  migrationMode, pendingMigrations, appliedMigrations, error,
+  durationMs }`. Wraps the migrate() path for `apply` mode, or a
+  read-only plan probe for `check` mode, or a noop for `off` mode.
+- **`aquifer.listPendingMigrations()`** / **`getMigrationStatus()`** —
+  returns `{ required, applied, pending, lastRunAt }` without
+  executing any DDL. Uses `pg_tables` signature-probe for O(1) status.
+- **Try-lock with poll + timeout** — `pg_advisory_lock()` replaced by
+  `pg_try_advisory_lock()` in a poll loop (250ms poll, default 30s
+  timeout). On timeout, throws `AQ_MIGRATION_LOCK_TIMEOUT` instead of
+  blocking indefinitely. Defensive against test mocks: only polls when
+  PG explicitly returns `ok=false`; a missing response (mock pools that
+  don't model the function) is treated as acquired so suites don't hang
+  on the deadline.
+- **`onEvent` observability hook** — `config.migrations.onEvent` fires
+  at `init_started`, `check_completed`, `apply_started`,
+  `apply_succeeded`, `apply_failed` with payload
+  `{ schema, mode, required, applied, pending, ddlExecuted, durationMs,
+  error, notices }`. No listener → no cost.
+- **`migrate()` signature widened** — still throws on failure (no
+  breaking change for existing callers), but on success returns
+  `{ ok: true, durationMs, notices, ddlExecuted }`.
+- **`ensureMigrated()` now public** on the aquifer object as an alias
+  for the internal lazy-ensure path; respects `migrations.mode`.
+
+### Added — `consumers/shared/config.js`
+
+- `config.migrations` section: `{ mode: 'apply' | 'check' | 'off',
+  lockTimeoutMs: 30000, startupTimeoutMs: 60000, onEvent: null }`.
+- Env mapping: `AQUIFER_MIGRATIONS_MODE`,
+  `AQUIFER_MIGRATION_LOCK_TIMEOUT_MS`.
+
+### Added — `consumers/shared/factory.js`
+
+- `createAquiferFromConfig()` forwards `config.migrations` to the
+  core library.
+
+### Changed — `consumers/mcp.js`
+
+- `main()` now calls `aquifer.init()` before `server.connect()`.
+  When `migrationMode=apply` and init returns `ready=false`, the
+  process aborts with a non-zero exit and a single-line structured
+  error to stderr. Success prints a one-line summary.
+
+### Added — `test/migration-handshake.integration.test.js`
+
+- 8 integration tests gated on `AQUIFER_TEST_DB_URL`: apply mode
+  drains pending, check mode reports without DDL, off mode no-op,
+  `listPendingMigrations`/`getMigrationStatus` consistency,
+  `AQ_MIGRATION_LOCK_TIMEOUT` surfacing under held advisory lock,
+  `onEvent` lifecycle sequence.
+
+### Migration notes
+
+- **Default behaviour unchanged for existing code paths**. `migrate()`
+  on its own still runs end-to-end DDL; the only difference is it now
+  returns an envelope (old callers that `await aquifer.migrate()`
+  without using the return value are unaffected).
+- **MCP startup contract changed**: the process now exits non-zero if
+  `migrations.mode=apply` and init() cannot reach ready. Operators who
+  depend on the old lazy-migrate-on-first-tool-call behaviour should
+  set `AQUIFER_MIGRATIONS_MODE=off` (plus run `migrate()` out of band)
+  or `=check` (run out of band and let init() verify).
+- **Phase 2 MVP scope**: only `consumers/mcp.js` is wired. The
+  persona consumers (`consumers/miranda`, `consumers/default`) and
+  the openclaw-plugin path still rely on lazy ensureMigrated; Phase 3
+  will propagate the handshake there once the MCP path has burn-in.
+- No schema change, no column rewrite.
+
 ## [1.5.6] - 2026-04-20
 
 C1 canonical revision model for `miranda.insights` — an insight now has

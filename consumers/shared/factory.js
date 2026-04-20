@@ -90,6 +90,7 @@ function createAquiferFromConfig(overrides) {
     entities: config.entities,
     rank: config.rank,
     rerank: rerankOpts,
+    migrations: config.migrations,
   });
 
   return aquifer;

@@ -295,9 +295,80 @@ function createAquifer(config = {}) {
   const stateChangesMaxOutputTokens = Number.isFinite(stateChangesCfg.maxOutputTokens)
     ? stateChangesCfg.maxOutputTokens : 600;
 
+  const migrationsCfg = config.migrations || {};
+  const migrationsMode = (() => {
+    const raw = migrationsCfg.mode;
+    if (raw === 'apply' || raw === 'check' || raw === 'off') return raw;
+    if (raw === undefined || raw === null) return 'apply';
+    throw new Error(`config.migrations.mode must be 'apply' | 'check' | 'off' (got ${JSON.stringify(raw)})`);
+  })();
+  const migrationLockTimeoutMs = Number.isFinite(migrationsCfg.lockTimeoutMs)
+    ? Math.max(0, migrationsCfg.lockTimeoutMs) : 30000;
+  const migrationStartupTimeoutMs = Number.isFinite(migrationsCfg.startupTimeoutMs)
+    ? Math.max(0, migrationsCfg.startupTimeoutMs) : 60000;
+  const migrationOnEvent = typeof migrationsCfg.onEvent === 'function' ? migrationsCfg.onEvent : null;
+
+  function emitMigrationEvent(name, payload) {
+    if (!migrationOnEvent) return;
+    try { migrationOnEvent({ name, schema, ...payload }); } catch (err) {
+      console.warn(`[aquifer] migrations.onEvent handler threw: ${err.message}`);
+    }
+  }
+
+  // Expected migration set — used for lazy plan introspection. `always: true`
+  // runs every migrate(); others are gated by feature flags. Signature tables
+  // let listPendingMigrations() probe pg_tables without executing DDL.
+  const MIGRATION_PLAN = [
+    { id: '001-base',                file: '001-base.sql',                always: true, signature: 'sessions' },
+    { id: '002-entities',            file: '002-entities.sql',            gate: 'entities', signature: 'entities' },
+    { id: '003-trust-feedback',      file: '003-trust-feedback.sql',      always: true, signature: 'session_feedback' },
+    { id: '004-facts',               file: '004-facts.sql',               gate: 'facts', signature: 'facts' },
+    { id: '004-completion',          file: '004-completion.sql',          always: true, signature: 'narratives' },
+    { id: '005-entity-state-history',file: '005-entity-state-history.sql',gate: 'entities', signature: 'entity_state_history' },
+    { id: '006-insights',            file: '006-insights.sql',            always: true, signature: 'insights' },
+  ];
+
+  function requiredMigrations() {
+    return MIGRATION_PLAN
+      .filter(m => m.always
+        || (m.gate === 'entities' && entitiesEnabled)
+        || (m.gate === 'facts' && factsEnabled))
+      .map(m => m.id);
+  }
+
+  async function readAppliedMigrations(queryRunner) {
+    const required = MIGRATION_PLAN.filter(m => m.always
+      || (m.gate === 'entities' && entitiesEnabled)
+      || (m.gate === 'facts' && factsEnabled));
+    const signatures = required.map(m => m.signature);
+    if (signatures.length === 0) return [];
+    const r = await queryRunner.query(
+      `SELECT tablename FROM pg_tables
+         WHERE schemaname = $1 AND tablename = ANY($2::text[])`,
+      [schema, signatures]
+    );
+    const present = new Set(r.rows.map(row => row.tablename));
+    return required.filter(m => present.has(m.signature)).map(m => m.id);
+  }
+
+  async function buildMigrationPlan(queryRunner) {
+    const required = requiredMigrations();
+    const applied = await readAppliedMigrations(queryRunner);
+    const appliedSet = new Set(applied);
+    const pending = required.filter(id => !appliedSet.has(id));
+    return { required, applied, pending };
+  }
+
   async function ensureMigrated() {
     if (migrated) return;
     if (migratePromise) return migratePromise;
+    if (migrationsMode === 'off') { migrated = true; return; }
+    if (migrationsMode === 'check') {
+      // Lazy compare only — don't execute DDL implicitly.
+      const plan = await buildMigrationPlan(pool).catch(() => null);
+      if (plan && plan.pending.length === 0) migrated = true;
+      return;
+    }
     migratePromise = aquifer.migrate().finally(() => { migratePromise = null; });
     return migratePromise;
   }
@@ -309,11 +380,18 @@ function createAquifer(config = {}) {
   const aquifer = {
     // --- lifecycle ---
 
+    async ensureMigrated() {
+      return ensureMigrated();
+    },
+
     async migrate() {
+      const t0 = Date.now();
       // Advisory lock prevents concurrent migrations across processes.
       // Lock key is derived from schema name to allow parallel migration
       // of different schemas in the same database.
       const lockKey = Buffer.from(`aquifer:${schema}`).reduce((h, b) => (h * 31 + b) & 0x7fffffff, 0);
+
+      emitMigrationEvent('init_started', { mode: migrationsMode });
 
       // Run all migration DDL on a single checked-out client so we can
       // capture RAISE NOTICE/WARNING emitted by the DO blocks. node-postgres
@@ -331,46 +409,88 @@ function createAquifer(config = {}) {
       const hasEvents = typeof client.on === 'function' && typeof client.off === 'function';
       if (hasEvents) client.on('notice', onNotice);
 
+      const ddlExecuted = [];
+      let lockAcquired = false;
+
       try {
-        await client.query('SELECT pg_advisory_lock($1)', [lockKey]);
+        // Plan probe before lock: lets consumers see pending list and lets
+        // us emit an accurate check_completed event even when the DDL is a
+        // no-op on an already-migrated schema.
+        const planBefore = await buildMigrationPlan(client).catch(() => null);
+        emitMigrationEvent('check_completed', {
+          required: planBefore ? planBefore.required : requiredMigrations(),
+          applied:  planBefore ? planBefore.applied  : [],
+          pending:  planBefore ? planBefore.pending  : requiredMigrations(),
+        });
+
+        // Try-lock with poll + timeout. Replaces the old blocking
+        // pg_advisory_lock() which could hang indefinitely if another
+        // process crashed holding the lock. Defensive against mock pools:
+        // only poll when PG explicitly returns ok=false; a missing/empty
+        // response (test mocks that don't model pg_try_advisory_lock) is
+        // treated as acquired so suite doesn't hang on the deadline.
+        const lockDeadline = Date.now() + migrationLockTimeoutMs;
+        const pollMs = 250;
+        while (true) {
+          const r = await client.query('SELECT pg_try_advisory_lock($1) AS ok', [lockKey]);
+          const row = r && r.rows ? r.rows[0] : null;
+          if (row && row.ok === false) {
+            if (Date.now() >= lockDeadline) break;
+            await new Promise(res => setTimeout(res, pollMs));
+            continue;
+          }
+          lockAcquired = true;
+          break;
+        }
+        if (!lockAcquired) {
+          const err = new Error(`aquifer: failed to acquire migration advisory lock within ${migrationLockTimeoutMs}ms for schema "${schema}"`);
+          err.code = 'AQ_MIGRATION_LOCK_TIMEOUT';
+          err.failedAt = 'acquire_lock';
+          throw err;
+        }
+
+        emitMigrationEvent('apply_started', {
+          pending: planBefore ? planBefore.pending : requiredMigrations(),
+        });
+
         try {
           // 1. Run base DDL
           const baseSql = loadSql('001-base.sql', schema);
-          await client.query(baseSql);
+          await client.query(baseSql); ddlExecuted.push('001-base');
 
           // 2. If entities enabled, run entity DDL
           if (entitiesEnabled) {
             const entitySql = loadSql('002-entities.sql', schema);
-            await client.query(entitySql);
+            await client.query(entitySql); ddlExecuted.push('002-entities');
           }
 
           // 3. Trust + feedback (always, not gated by entities)
           const trustSql = loadSql('003-trust-feedback.sql', schema);
-          await client.query(trustSql);
+          await client.query(trustSql); ddlExecuted.push('003-trust-feedback');
 
           // 4. Facts / consolidation (opt-in)
           if (factsEnabled) {
             const factsSql = loadSql('004-facts.sql', schema);
-            await client.query(factsSql);
+            await client.query(factsSql); ddlExecuted.push('004-facts');
           }
 
           // 5. Completion foundation (always, additive): narratives,
           // consumer_profiles, sessions.consolidation_phases. Pure additive DDL
           // with IF NOT EXISTS guards — safe on every migrate() call.
           const completionSql = loadSql('004-completion.sql', schema);
-          await client.query(completionSql);
+          await client.query(completionSql); ddlExecuted.push('004-completion');
 
           // 6. Entity state history (always, gated by entitiesEnabled because
           // it FK-references entities). Drop-clean — see scripts/drop-entity-state-history.sql.
           if (entitiesEnabled) {
             const stateHistorySql = loadSql('005-entity-state-history.sql', schema);
-            await client.query(stateHistorySql);
+            await client.query(stateHistorySql); ddlExecuted.push('005-entity-state-history');
           }
 
           // 7. Insights (always, additive). No FK from anywhere into this table —
           // safe to DROP CASCADE. See scripts/drop-insights.sql.
           const insightsSql = loadSql('006-insights.sql', schema);
-          await client.query(insightsSql);
+          await client.query(insightsSql); ddlExecuted.push('006-insights');
 
           migrated = true;
         } finally {
@@ -378,6 +498,16 @@ function createAquifer(config = {}) {
             console.warn(`[aquifer] failed to release migration advisory lock for schema "${schema}": ${err.message}`);
           });
         }
+      } catch (err) {
+        err.notices = Array.isArray(err.notices) ? err.notices : notices.slice();
+        err.failedAt = err.failedAt || 'apply_ddl';
+        emitMigrationEvent('apply_failed', {
+          error: { code: err.code || null, message: err.message },
+          failedAt: err.failedAt,
+          notices: err.notices,
+          durationMs: Date.now() - t0,
+        });
+        throw err;
       } finally {
         if (hasEvents) client.off('notice', onNotice);
         if (releasesClient) client.release();
@@ -465,6 +595,114 @@ function createAquifer(config = {}) {
         }
       } catch (err) {
         console.warn(`[aquifer] FTS post-flight check failed: ${err.message}`);
+      }
+
+      const durationMs = Date.now() - t0;
+      emitMigrationEvent('apply_succeeded', {
+        ddlExecuted,
+        durationMs,
+        notices: notices.slice(),
+      });
+      return { ok: true, durationMs, notices: notices.slice(), ddlExecuted };
+    },
+
+    async listPendingMigrations() {
+      const plan = await buildMigrationPlan(pool);
+      return { ...plan, lastRunAt: null };
+    },
+
+    async getMigrationStatus() {
+      return this.listPendingMigrations();
+    },
+
+    async init() {
+      const t0 = Date.now();
+      const mode = migrationsMode;
+
+      let deadlineTimer = null;
+      const startupDeadline = migrationStartupTimeoutMs > 0
+        ? new Promise((_, reject) => {
+            deadlineTimer = setTimeout(() => {
+              const err = new Error(`aquifer: init() exceeded startupTimeoutMs=${migrationStartupTimeoutMs}ms`);
+              err.code = 'AQ_MIGRATION_STARTUP_TIMEOUT';
+              reject(err);
+            }, migrationStartupTimeoutMs);
+            if (typeof deadlineTimer.unref === 'function') deadlineTimer.unref();
+          })
+        : null;
+      const withDeadline = (p) => startupDeadline ? Promise.race([p, startupDeadline]) : p;
+      const clearDeadline = () => { if (deadlineTimer) { clearTimeout(deadlineTimer); deadlineTimer = null; } };
+
+      try {
+        let plan;
+        try {
+          plan = await withDeadline(buildMigrationPlan(pool));
+        } catch (err) {
+          const durationMs = Date.now() - t0;
+          emitMigrationEvent('apply_failed', {
+            error: { code: err.code || null, message: err.message },
+            failedAt: 'plan_probe',
+            notices: [],
+            durationMs,
+          });
+          return {
+            ready: false,
+            memoryMode: 'off',
+            migrationMode: mode,
+            pendingMigrations: [],
+            appliedMigrations: [],
+            error: { code: err.code || 'AQ_MIGRATION_PROBE_FAILED', message: err.message },
+            durationMs,
+          };
+        }
+
+        if (mode === 'off') {
+          return {
+            ready: true, memoryMode: 'rw', migrationMode: mode,
+            pendingMigrations: plan.pending, appliedMigrations: plan.applied,
+            error: null, durationMs: Date.now() - t0,
+          };
+        }
+
+        if (mode === 'check') {
+          const ready = plan.pending.length === 0;
+          if (ready) migrated = true;
+          return {
+            ready, memoryMode: ready ? 'rw' : 'ro', migrationMode: mode,
+            pendingMigrations: plan.pending, appliedMigrations: plan.applied,
+            error: null, durationMs: Date.now() - t0,
+          };
+        }
+
+        // mode === 'apply'
+        if (plan.pending.length === 0) {
+          migrated = true;
+          return {
+            ready: true, memoryMode: 'rw', migrationMode: mode,
+            pendingMigrations: [], appliedMigrations: plan.applied,
+            error: null, durationMs: Date.now() - t0,
+          };
+        }
+
+        try {
+          const result = await withDeadline(this.migrate());
+          const planAfter = await buildMigrationPlan(pool).catch(() => null);
+          return {
+            ready: true, memoryMode: 'rw', migrationMode: mode,
+            pendingMigrations: planAfter ? planAfter.pending : [],
+            appliedMigrations: planAfter ? planAfter.applied : plan.required,
+            error: null, durationMs: result.durationMs || (Date.now() - t0),
+          };
+        } catch (err) {
+          return {
+            ready: false, memoryMode: 'ro', migrationMode: mode,
+            pendingMigrations: plan.pending, appliedMigrations: plan.applied,
+            error: { code: err.code || 'AQ_MIGRATION_FAILED', message: err.message },
+            durationMs: Date.now() - t0,
+          };
+        }
+      } finally {
+        clearDeadline();
       }
     },
 
