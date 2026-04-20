@@ -4,6 +4,62 @@ All notable changes to `@shadowforge0/aquifer-memory` are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project uses semantic versioning.
 
+## [1.5.11] - 2026-04-21
+
+Removes a dead legacy helper from `core/insights`. No runtime or schema
+change for the supported top-level API (`require('@shadowforge0/aquifer-memory')`).
+The removal affects only unsupported deep-import paths and the
+`createInsights()._internal` escape hatch — neither is a semver-stable
+surface.
+
+### Removed
+
+- `defaultIdempotencyKey` has been deleted from `core/insights.js`
+  (function body, `module.exports` entry, and `_internal` field on the
+  factory return). `commitInsight` has used the canonical-aware
+  `revisionIdempotencyKey` (module-private) since the 1.5.x
+  canonical-key work; `defaultIdempotencyKey` had a divergent formula
+  (`tenantId|agentId|type|title|body|sessions|window`) that never
+  matched what landed in `idempotency_key`. Keeping it importable was a
+  reliability trap for any consumer reaching into unsupported paths and
+  pre-computing keys — those keys would never have matched a real row.
+- The `defaultIdempotencyKey` describe block in `test/insights.test.js`
+  (four cases covering the legacy helper) has been removed. Real
+  idempotency contract coverage now lives in a new unit test covering
+  `commitInsight`'s auto-generated key stability, the existing
+  `commitInsight` input validation block, and the 11-case
+  semantic-dedup integration suite added in 1.5.10.
+
+### Added
+
+- `test/insights.test.js` — one unit test exercising `commitInsight`'s
+  auto-generated idempotency key: identical inputs produce identical
+  keys (replay returns the existing row); mutating `body` or the
+  evidence window produces distinct keys. Guards against accidental
+  formula drift in `revisionIdempotencyKey` without exposing the helper.
+
+### Reviewed — unchanged
+
+- `defaultCanonicalKey` stays exported. It is a real public API used by
+  `scripts/backfill-canonical-key.js` and represents the stable claim
+  identity (`canonical_key_v2`) that `commitInsight` depends on.
+- `idx_insights_source_sessions` (partial GIN on `status='active'`)
+  stays. The partial filter caps overhead to the active working set and
+  the intent comment (`who-references-which-session, for audit /
+  re-extraction`) matches ad-hoc audit SQL used during shadow-mode
+  debugging.
+
+### Surface note for unsupported imports
+
+`package.json` declares an explicit `exports` map that does NOT include
+`./core/insights`, so `require('@shadowforge0/aquifer-memory/core/insights')`
+is not a supported entry point and will fail with
+`ERR_PACKAGE_PATH_NOT_EXPORTED` under Node 16.9+ defaults. Likewise the
+`_internal` field on `createInsights(...)` is named that way
+deliberately — its members are not covered by semver. Callers reaching
+past the top-level `index.js` should expect shape changes without
+warning.
+
 ## [1.5.10] - 2026-04-21
 
 Adds a semantic-dedup layer to `insights.commitInsight`, closes a

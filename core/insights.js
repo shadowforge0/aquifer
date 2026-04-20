@@ -40,20 +40,6 @@ const VALID_DEDUP_MODES = new Set(['off', 'shadow', 'enforce']);
 // via createAquifer({ insights: { recencyWindowDays } }).
 const DEFAULT_RECENCY_WINDOW_DAYS = 90;
 
-function defaultIdempotencyKey({
-  tenantId, agentId, type, title, body, sourceSessionIds, evidenceWindow,
-}) {
-  const sorted = (sourceSessionIds || []).slice().sort().join('|');
-  const winFrom = evidenceWindow && evidenceWindow.from ? new Date(evidenceWindow.from).toISOString() : '';
-  const winTo = evidenceWindow && evidenceWindow.to ? new Date(evidenceWindow.to).toISOString() : '';
-  // Hash must include body + window so legitimate revisions (same sessions but
-  // tightened body, or extended window) get a new key and replace the old row
-  // via supersede, not get swallowed as a duplicate.
-  return crypto.createHash('sha256')
-    .update(`${tenantId}|${agentId}|${type}|${title}|${body || ''}|${sorted}|${winFrom}|${winTo}`)
-    .digest('hex');
-}
-
 // ---------------------------------------------------------------------------
 // Canonical identity helpers (Phase 2 C1)
 //
@@ -652,13 +638,12 @@ function createInsights({ pool, schema, defaultTenantId, embedFn, recallWeights,
     recallInsights,
     markStale,
     supersede,
-    _internal: { defaultIdempotencyKey, vecToPgLiteral, mapRow, weights, dedup: dedupConfig },
+    _internal: { vecToPgLiteral, mapRow, weights, dedup: dedupConfig },
   };
 }
 
 module.exports = {
   createInsights,
-  defaultIdempotencyKey,
   defaultCanonicalKey,
   normalizeCanonicalClaim,
   normalizeBody,

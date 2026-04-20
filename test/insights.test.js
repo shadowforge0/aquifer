@@ -3,7 +3,7 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { createInsights, defaultIdempotencyKey, defaultCanonicalKey, normalizeCanonicalClaim, normalizeBody, normalizeEntitySet } = require('../core/insights');
+const { createInsights, defaultCanonicalKey, normalizeCanonicalClaim, normalizeBody, normalizeEntitySet } = require('../core/insights');
 
 // Mock pool recording queries and replying with programmable rows.
 function makePool(replies = []) {
@@ -19,43 +19,52 @@ function makePool(replies = []) {
   };
 }
 
-describe('insights.defaultIdempotencyKey', () => {
-  const base = {
-    tenantId: 't', agentId: 'main', type: 'pattern',
-    title: 'x', body: 'body',
-    sourceSessionIds: ['s1'],
+describe('insights.commitInsight auto-generated idempotency key', () => {
+  const baseInput = {
+    agentId: 'main', type: 'pattern', title: 't', body: 'body-x',
+    sourceSessionIds: ['s2', 's1'],
     evidenceWindow: { from: '2026-04-01T00:00:00Z', to: '2026-04-19T00:00:00Z' },
   };
+  const stubRow = {
+    id: 42, tenant_id: 'default', agent_id: 'main', insight_type: 'pattern',
+    title: 't', body: 'b', importance: 0.5, status: 'active',
+    idempotency_key: 'stub', metadata: {}, created_at: '2026-04-01', updated_at: '2026-04-01',
+    source_session_ids: [], evidence_window: '[2026-04-01,2026-04-19)',
+  };
 
-  it('sorts session ids so order does not change the key', () => {
-    const a = defaultIdempotencyKey({ ...base, sourceSessionIds: ['s2', 's1', 's3'] });
-    const b = defaultIdempotencyKey({ ...base, sourceSessionIds: ['s3', 's1', 's2'] });
-    assert.equal(a, b);
+  async function capturedKey(input) {
+    const pool = makePool([{ rowCount: 1, rows: [stubRow] }]);
+    const api = createInsights({ pool, schema: '"aq"', defaultTenantId: 'default' });
+    await api.commitInsight(input);
+    return pool.queries[0].params[0];
+  }
+
+  it('identical inputs produce identical auto keys across separate calls', async () => {
+    const k1 = await capturedKey(baseInput);
+    const k2 = await capturedKey(baseInput);
+    assert.equal(k1, k2);
+    assert.match(k1, /^[0-9a-f]{64}$/);
   });
 
-  it('is sensitive to title and type', () => {
-    assert.notEqual(
-      defaultIdempotencyKey({ ...base, title: 'a' }),
-      defaultIdempotencyKey({ ...base, title: 'b' })
-    );
-    assert.notEqual(
-      defaultIdempotencyKey({ ...base, type: 'pattern' }),
-      defaultIdempotencyKey({ ...base, type: 'preference' })
-    );
+  it('session id order does not affect the auto key (sorted internally)', async () => {
+    const k1 = await capturedKey(baseInput);
+    const k2 = await capturedKey({ ...baseInput, sourceSessionIds: ['s1', 's2'] });
+    assert.equal(k1, k2);
   });
 
-  it('differs when body changes (legitimate revision gets new key)', () => {
-    assert.notEqual(
-      defaultIdempotencyKey({ ...base, body: 'original wording' }),
-      defaultIdempotencyKey({ ...base, body: 'tightened wording' })
-    );
+  it('mutating body produces a distinct auto key (legitimate revision)', async () => {
+    const k1 = await capturedKey(baseInput);
+    const k2 = await capturedKey({ ...baseInput, body: 'body-y' });
+    assert.notEqual(k1, k2);
   });
 
-  it('differs when evidenceWindow extends (new evidence gets new key)', () => {
-    assert.notEqual(
-      defaultIdempotencyKey({ ...base, evidenceWindow: { from: '2026-04-01T00:00:00Z', to: '2026-04-19T00:00:00Z' } }),
-      defaultIdempotencyKey({ ...base, evidenceWindow: { from: '2026-04-01T00:00:00Z', to: '2026-04-25T00:00:00Z' } })
-    );
+  it('extending the evidence window produces a distinct auto key', async () => {
+    const k1 = await capturedKey(baseInput);
+    const k2 = await capturedKey({
+      ...baseInput,
+      evidenceWindow: { from: '2026-04-01T00:00:00Z', to: '2026-04-25T00:00:00Z' },
+    });
+    assert.notEqual(k1, k2);
   });
 });
 
