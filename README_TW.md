@@ -259,6 +259,8 @@ OpenClaw plugin（`consumers/openclaw-plugin.js`）保留用於 `before_reset` s
 | `AQUIFER_RERANK_PROVIDER` | 否 | Reranker 供應商：`tei`、`jina`、`openrouter` | `tei` |
 | `AQUIFER_RERANK_BASE_URL` | 否 | Reranker 端點 | `http://localhost:8080` |
 | `AQUIFER_AGENT_ID` | 否 | 預設 agent ID | `main` |
+| `AQUIFER_MIGRATIONS_MODE` | 否 | 啟動 handshake 模式：`apply`（預設）、`check`、`off` | `apply` |
+| `AQUIFER_MIGRATION_LOCK_TIMEOUT_MS` | 否 | advisory lock 等待上限，逾時拋 `AQ_MIGRATION_LOCK_TIMEOUT`（預設 30000） | `30000` |
 
 完整的環境變數對應設定在 [consumers/shared/config.js](consumers/shared/config.js)。
 
@@ -428,9 +430,29 @@ await aquifer.feedback('session-id', { verdict: 'unhelpful' });
 }
 ```
 
+#### `aquifer.init()`
+
+啟動 handshake——收斂所有 pending migration 並回 StartupEnvelope。Host 應在接客前 `await` 這個。`apply` 模式下 `ready=false` 就是叫上層中止 startup 的訊號。
+
+```javascript
+const envelope = await aquifer.init();
+// { ready, memoryMode: 'rw'|'ro'|'off', migrationMode, pendingMigrations,
+//   appliedMigrations, error, durationMs }
+```
+
+MCP consumer（`consumers/mcp.js`）已經把 `aquifer.init()` 串進 `server.connect()` 之前，`apply` 模式拿到 `ready=false` 就 non-zero exit。
+
+#### `aquifer.listPendingMigrations()` / `aquifer.getMigrationStatus()`
+
+靠 `pg_tables` signature probe 回 `{ required, applied, pending, lastRunAt }`，完全不跑 DDL。適合 health check 或 consumer 在 `init()` 之前想先知道 drift 狀態。
+
 #### `aquifer.migrate()`
 
-執行 SQL migration（冪等）。建立表、索引、trigger 和擴充套件。
+執行 SQL migration（冪等）。建立表、索引、trigger 和擴充套件。進階：advisory lock 從 blocking 改成 `pg_try_advisory_lock` + 250ms poll + `lockTimeoutMs`（預設 30s），逾時拋 `AQ_MIGRATION_LOCK_TIMEOUT`。成功回 `{ ok: true, durationMs, notices, ddlExecuted }`；失敗拋 error 帶 `err.notices` / `err.failedAt`。大多數 caller 應該走 `aquifer.init()`。
+
+#### `aquifer.ensureMigrated()`
+
+Lazy idempotent wrapper——第一次呼叫觸發 `migrate()`，之後 no-op。尊重 `migrations.mode`：`check` 只 probe、`off` 直接標 migrated 不碰 DB。
 
 #### `aquifer.commit(sessionId, messages, opts)`
 
@@ -484,6 +506,26 @@ const context = await aquifer.bootstrap({
 
 此方法對應 MCP 工具 `session_bootstrap`。
 
+#### `aquifer.insights.commitInsight(opts)` / `recallInsights(query, opts)` / `markStale(id)` / `supersede(oldId, newId)`
+
+從 session 視窗蒸餾出來的高階觀察（preference / pattern / frustration / workflow）。用兩層 identity 拆身份：**canonical key** 描述這個觀察是關於什麼（claim identity，跨 LLM 用詞飄不動），**idempotency key** 描述 canonical claim 的哪一個 revision（body + evidenceWindow）。
+
+```javascript
+await aquifer.insights.commitInsight({
+  agentId:        'main',
+  type:           'preference',
+  canonicalClaim: 'mk 在寫 code 前先看 context',   // required，短、穩定、不含修辭與例子
+  title:          '先看 context 再動手',           // best-effort display
+  body:           '…',
+  entities:       ['mk', 'claude code'],
+  sourceSessionIds: ['sess-a', 'sess-b'],
+  evidenceWindow:  { from: isoString, to: isoString },
+  importance:     0.9,
+});
+```
+
+寫入規則：idempotency 命中就回 existing；同 canonical + 更新 evidence → INSERT 新 row + 內聯 UPDATE supersede 前一 active；同 canonical + 舊/同 window → INSERT 但不 supersede（back-fill revision）；同 canonical + 同 body → stale replay 回 existing。1.5.6 前的舊 rows `canonical_key_v2` 保持 NULL 不 retrofit，自然老去。
+
 #### `aquifer.close()`
 
 關閉 PostgreSQL 連線池（僅限 Aquifer 自行建立的 pool）。
@@ -512,8 +554,18 @@ createAquifer({
     mergeCall: true,
   },
   rank: { rrf: 0.65, timeDecay: 0.25, access: 0.10, entityBoost: 0.18 },
+  migrations: {
+    mode: 'apply',             // 'apply' | 'check' | 'off'
+    lockTimeoutMs: 30000,      // advisory lock 等待上限，逾時拋 AQ_MIGRATION_LOCK_TIMEOUT
+    startupTimeoutMs: 60000,   // init() 整體 deadline
+    onEvent: null,             // (e) => void — lifecycle 觀察 hook
+  },
 });
 ```
+
+### Startup 可觀察性
+
+掛 `migrations.onEvent` 可以不解析 log 就拿到 lifecycle。事件名稱：`init_started`、`check_completed`、`apply_started`、`apply_succeeded`、`apply_failed`。payload 帶 `schema` / `mode` / 計畫 / `ddlExecuted` / `durationMs`，失敗時多 `error` / `failedAt` / `notices`。沒掛 listener 就是零成本。
 
 ### 實體作用域（Entity Scope）
 
@@ -552,6 +604,22 @@ createAquifer({
 
 另在 `session_summaries` 新增 `trust_score` 欄位（預設 0.5，範圍 0–1）。
 
+### 005-entity-state-history.sql *(entities 啟用時)*
+
+| 表 | 用途 |
+|----|------|
+| `entity_state_history` | 時序 state-change 追蹤，partial `UNIQUE (tenant, agent, entity, attribute) WHERE valid_to IS NULL` 強制 at-most-one-current。out-of-order backfill 用 predecessor/successor overlap 檢查 |
+
+opt-in pipeline（`createAquifer({stateChanges: {enabled, whitelist, confidenceThreshold, timeoutMs, ...}})`）在 `enrich()` 裡跑 LLM 抽 temporal state 變化；預設 OFF 控 LLM cost。
+
+### 006-insights.sql
+
+| 表 | 用途 |
+|----|------|
+| `insights` | 高階反思：TSTZRANGE evidence window、importance、GIN on source_session_ids、HNSW on 1024-dim embedding，以及 `canonical_key_v2` 非 unique partial index 撐 canonical/revision dedup contract |
+
+重要索引：`idx_insights_canonical_v2_active`（active rows + canonical key 非 null）、`idx_insights_idempotency_key`（revision key unique）。
+
 ---
 
 ## 疑難排解
@@ -565,6 +633,10 @@ createAquifer({
 **OpenClaw 看不到工具** — 請在 `openclaw.json` 使用 `mcp.servers.aquifer`，不要用 plugin。工具會以 `aquifer__session_recall` 等名稱出現。Plugin（`consumers/openclaw-plugin.js`）僅用於 session 擷取。
 
 **Embedding 供應商連線被拒** — 確認 `AQUIFER_EMBED_BASE_URL` 可以連通。若使用本地 Ollama，確保伺服器正在執行且模型已下載（`ollama pull bge-m3`）。
+
+**啟動拋 `AQ_MIGRATION_LOCK_TIMEOUT`** — 有其他 process 持著 `aquifer:<schema>` 的 migration advisory lock。可能是另一個 `aquifer.init()` 在競爭（正常；贏家跑完輸家下一次會拿到 `pending=[]`），也可能是某個 crash 掉的 worker 把 lock 留下來。調高 `migrations.lockTimeoutMs`，或確認是哪個 pid 死了之後用 `SELECT pg_terminate_backend(pid) FROM pg_locks WHERE locktype='advisory'` 踢掉。
+
+**MCP process 啟動就 non-zero exit** — 預期行為：`migrations.mode=apply` 而 `aquifer.init()` 回 `ready=false` 就會 abort。看 stderr 那行 `[aquifer-mcp] startup aborted` 拿 `error.code` / `failedAt`。如果想回到舊的「lazy migrate 等第一個 tool call」行為，設 `AQUIFER_MIGRATIONS_MODE=check`（自己跑 `migrate()`）或 `=off`。
 
 ---
 

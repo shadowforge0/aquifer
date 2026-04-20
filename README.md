@@ -132,6 +132,8 @@ Need LLM summarization, the knowledge graph, OpenAI embeddings, or the reranker?
 | `AQUIFER_RERANK_PROVIDER` | No | Reranker provider: `tei`, `jina`, `openrouter` | `tei` |
 | `AQUIFER_RERANK_BASE_URL` | No | Reranker endpoint | `http://localhost:8080` |
 | `AQUIFER_AGENT_ID` | No | Default agent ID | `main` |
+| `AQUIFER_MIGRATIONS_MODE` | No | Startup handshake mode: `apply` (default), `check`, `off` | `apply` |
+| `AQUIFER_MIGRATION_LOCK_TIMEOUT_MS` | No | Advisory-lock wait before `AQ_MIGRATION_LOCK_TIMEOUT` (default 30000) | `30000` |
 
 Full env-to-config mapping is in [consumers/shared/config.js](consumers/shared/config.js).
 
@@ -377,9 +379,36 @@ Returns an Aquifer instance. Config:
 }
 ```
 
+#### `aquifer.init()`
+
+Startup handshake — resolves pending migrations and returns a StartupEnvelope. Hosts should `await` this before accepting traffic. In `apply` mode a `ready=false` envelope is the signal to abort startup.
+
+```javascript
+const envelope = await aquifer.init();
+// {
+//   ready:             true,
+//   memoryMode:        'rw',        // 'rw' | 'ro' | 'off'
+//   migrationMode:     'apply',     // 'apply' | 'check' | 'off'
+//   pendingMigrations: [],          // migration ids still outstanding
+//   appliedMigrations: ['001-base', '003-trust-feedback', '004-completion', '006-insights'],
+//   error:             null,        // { code, message } on failure
+//   durationMs:        1035,
+// }
+```
+
+The MCP consumer (`consumers/mcp.js`) already wires `aquifer.init()` before `server.connect()` and exits non-zero if `ready=false` under `apply` mode.
+
+#### `aquifer.listPendingMigrations()` / `aquifer.getMigrationStatus()`
+
+Returns `{ required, applied, pending, lastRunAt }` via a `pg_tables` signature probe. No DDL runs. Use it from a health check or from a consumer that wants to surface drift before calling `init()`.
+
 #### `aquifer.migrate()`
 
-Runs SQL migrations (idempotent). Creates tables, indexes, triggers, and extensions.
+Runs SQL migrations (idempotent). Creates tables, indexes, triggers, and extensions. Uses `pg_try_advisory_lock` with a 250 ms poll and a `lockTimeoutMs` deadline (30 s default); on exhaustion throws with `code: 'AQ_MIGRATION_LOCK_TIMEOUT'`. On success returns `{ ok: true, durationMs, notices, ddlExecuted }`; on failure throws an error whose `err.notices` / `err.failedAt` describe the stage that blew up. Most callers should go through `aquifer.init()` instead.
+
+#### `aquifer.ensureMigrated()`
+
+Lazy idempotent wrapper — fires `migrate()` once on first call, no-ops afterwards. Honors `migrations.mode`: `check` only probes, `off` marks the instance migrated without touching the DB.
 
 #### `aquifer.commit(sessionId, messages, opts)`
 
@@ -463,6 +492,26 @@ const result = await aquifer.bootstrap({
 
 Cross-session dedup on open loops and decisions, sentinel filtering (removes 無/none/n/a), and maxChars truncation.
 
+#### `aquifer.insights.commitInsight(opts)` / `recallInsights(query, opts)` / `markStale(id)` / `supersede(oldId, newId)`
+
+Higher-order reflections distilled from session windows (preferences, patterns, frustrations, workflows). Split into two identities: a **canonical key** that describes what the insight is *about* (stable across rewordings), and an **idempotency key** that describes which revision of that claim was written.
+
+```javascript
+await aquifer.insights.commitInsight({
+  agentId:        'main',
+  type:           'preference',
+  canonicalClaim: 'mk prefers checking context before coding',  // required — short declarative claim
+  title:          'Context-first discipline',                    // best-effort display
+  body:           '…',
+  entities:       ['mk', 'claude code'],
+  sourceSessionIds: ['sess-a', 'sess-b'],
+  evidenceWindow:  { from: isoString, to: isoString },
+  importance:     0.9,
+});
+```
+
+Write rules: **duplicate** (same idempotency key → return existing), **revision** (same canonical key + newer evidence → INSERT + inline supersede of prior active), **back-fill revision** (same canonical key + older evidence → INSERT without supersede), **stale replay** (same canonical + same body → return existing). Old pre-1.5.6 rows are not retrofitted; their `canonical_key_v2` stays `NULL` and they age out naturally.
+
 #### `aquifer.close()`
 
 Closes the PostgreSQL connection pool (only if Aquifer created it).
@@ -498,8 +547,18 @@ createAquifer({
     access: 0.10,              // access frequency weight
     entityBoost: 0.18,         // entity match boost
   },
+  migrations: {
+    mode: 'apply',             // 'apply' | 'check' | 'off'
+    lockTimeoutMs: 30000,      // abort init() if advisory lock held this long
+    startupTimeoutMs: 60000,   // overall init() deadline (plan probe + DDL combined)
+    onEvent: null,             // (e) => void — lifecycle hook, see below
+  },
 });
 ```
+
+### Startup observability
+
+Set `migrations.onEvent` to observe the lifecycle without parsing logs. Event names: `init_started`, `check_completed`, `apply_started`, `apply_succeeded`, `apply_failed`. Each payload carries `schema`, `mode`, the plan, `ddlExecuted`, `durationMs`, and on failure the `error` / `failedAt` / `notices`. No listener → zero cost.
 
 ### Entity Scope
 
@@ -542,6 +601,22 @@ Key indexes: trigram on entity names, GiST on embeddings, unique on `(tenant_id,
 
 Also adds `trust_score` column to `session_summaries` (default 0.5, range 0–1).
 
+### 005-entity-state-history.sql *(entities enabled)*
+
+| Table | Purpose |
+|-------|---------|
+| `entity_state_history` | Temporal state-change log with partial `UNIQUE (tenant, agent, entity, attribute) WHERE valid_to IS NULL` to enforce at-most-one-current. Out-of-order backfill is supported via predecessor/successor overlap checks |
+
+Opt-in pipeline (`createAquifer({stateChanges: {enabled, whitelist, confidenceThreshold, timeoutMs, ...}})`) extracts temporal state transitions from session text during `enrich()`; off by default to control LLM cost.
+
+### 006-insights.sql
+
+| Table | Purpose |
+|-------|---------|
+| `insights` | Higher-order reflections with TSTZRANGE evidence window, importance, GIN on source_session_ids, HNSW on 1024-dim embedding, and a non-unique partial index on `canonical_key_v2` for the canonical/revision dedup contract |
+
+Key indexes: `idx_insights_canonical_v2_active` (partial on active rows with canonical key set), `idx_insights_idempotency_key` (unique on revision key).
+
 ---
 
 ## Troubleshooting
@@ -555,6 +630,10 @@ Also adds `trust_score` column to `session_summaries` (default 0.5, range 0–1)
 **OpenClaw tools not visible** — Use `mcp.servers.aquifer` in `openclaw.json`, not the plugin. Tools appear as `aquifer__session_recall` etc. The plugin (`consumers/openclaw-plugin.js`) is for session capture only.
 
 **Embedding provider connection refused** — Verify your `AQUIFER_EMBED_BASE_URL` is reachable. For local Ollama, make sure the server is running and the model is pulled (`ollama pull bge-m3`).
+
+**`AQ_MIGRATION_LOCK_TIMEOUT` on startup** — another process holds the migration advisory lock for `aquifer:<schema>`. Either it is a concurrent `aquifer.init()` racing yours (expected; one will win, the other re-runs and finds `pending=[]`) or a crashed worker left the lock held. Raise `migrations.lockTimeoutMs`, or drop the stale backend via `SELECT pg_terminate_backend(pid) FROM pg_locks WHERE locktype='advisory'` after you have confirmed which pid is dead.
+
+**MCP process exits non-zero at startup** — expected when `migrations.mode=apply` and `aquifer.init()` returns `ready=false`. Read the `[aquifer-mcp] startup aborted` line on stderr for the `error.code` / `failedAt`. If you need the old lazy-migrate-on-first-tool-call behaviour instead, set `AQUIFER_MIGRATIONS_MODE=check` (and run `migrate()` out of band) or `=off`.
 
 ---
 
