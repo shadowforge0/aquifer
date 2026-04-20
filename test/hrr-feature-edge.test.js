@@ -182,7 +182,8 @@ describe('hybrid-rank.js edge cases', () => {
 
   describe('open-loop handling', () => {
     it('applies no boost when openLoopSet is an empty Set', () => {
-      const now = new Date().toISOString();
+      const nowMs = Date.now();
+      const now = new Date(nowMs).toISOString();
       const baseline = hybridRank(
         [
           { session_id: 'a', started_at: now },
@@ -193,6 +194,7 @@ describe('hybrid-rank.js edge cases', () => {
         {
           weights: { rrf: 0, timeDecay: 1, access: 0, entityBoost: 0, openLoop: 0.08 },
           limit: 2,
+          nowMs,
         }
       );
 
@@ -207,6 +209,7 @@ describe('hybrid-rank.js edge cases', () => {
           weights: { rrf: 0, timeDecay: 1, access: 0, entityBoost: 0, openLoop: 0.08 },
           openLoopSet: new Set(),
           limit: 2,
+          nowMs,
         }
       );
 
