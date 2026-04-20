@@ -71,11 +71,11 @@ function baseInput(overrides = {}) {
   };
 }
 
-function makeAquifer({ mode, embedFn, cosineThreshold = 0.88, closeBandFrom = 0.85 }) {
+function makeAquifer({ mode, embedFn, cosineThreshold = 0.88, closeBandFrom = 0.85, tenantId = 'default' }) {
   return createAquifer({
     db: pool,
     schema,
-    tenantId: 'default',
+    tenantId,
     embed: { fn: embedFn, dim: 1024 },
     insights: {
       dedup: { mode, cosineThreshold, closeBandFrom },
@@ -464,6 +464,85 @@ describe('insights semantic dedup integration (real PG)', () => {
       assert.equal(newRow.metadata.dedupVia, 'semantic');
       assert.equal(newRow.metadata.dedupCandidate.id, 6);
       assert.ok(Math.abs(newRow.metadata.dedupCandidate.cosine - 1) < 0.001);
+    } finally {
+      await aq.close?.().catch(() => {});
+    }
+  });
+
+  it('T10 enforce: cross-tenant rows stay isolated even on exact cosine match', async () => {
+    await resetSeedData();
+
+    await seedRow(pool, {
+      id: 11,
+      tenantId: 'tenant-a',
+      title: 'Tenant A seed title',
+      body: 'Tenant A seed body',
+      canonicalKey: 'canon-tenant-a',
+      embedding: makeVec(0, 0),
+    });
+
+    const preA = await fetchInsight(11);
+
+    const aq = makeAquifer({
+      mode: 'enforce',
+      tenantId: 'tenant-b',
+      embedFn: async () => [makeVec(0, 0)],
+    });
+    try {
+      const r = await aq.insights.commitInsight(baseInput({
+        title: 'Tenant B incoming title',
+        body: 'Tenant B incoming body content',
+      }));
+      assert.equal(r.ok, true);
+      assert.equal(r.data.duplicate, false);
+
+      const newRow = await fetchInsight(r.data.insight.id);
+      const postA = await fetchInsight(11);
+
+      assert.equal(newRow.tenant_id, 'tenant-b');
+      assert.deepEqual(newRow.metadata, { dedupQuality: 'title_fallback' });
+      assert.equal(postA.status, 'active');
+      assert.equal(postA.superseded_by, null);
+      assert.equal(postA.tenant_id, preA.tenant_id);
+      assert.equal(postA.updated_at.toISOString(), preA.updated_at.toISOString());
+    } finally {
+      await aq.close?.().catch(() => {});
+    }
+  });
+
+  it('T11 shadow: cross-tenant seed must not produce shadowMatch', async () => {
+    await resetSeedData();
+
+    await seedRow(pool, {
+      id: 12,
+      tenantId: 'tenant-a',
+      title: 'Tenant A shadow seed title',
+      body: 'Tenant A shadow seed body',
+      canonicalKey: 'canon-tenant-a-shadow',
+      embedding: makeVec(0, 0),
+    });
+
+    const aq = makeAquifer({
+      mode: 'shadow',
+      tenantId: 'tenant-b',
+      embedFn: async () => [makeVec(0, 0)],
+    });
+    try {
+      const r = await aq.insights.commitInsight(baseInput({
+        title: 'Tenant B shadow incoming title',
+        body: 'Tenant B shadow incoming body content',
+      }));
+      assert.ok(r.ok && !r.data.duplicate);
+
+      const newRow = await fetchInsight(r.data.insight.id);
+      assert.equal(newRow.tenant_id, 'tenant-b');
+      assert.equal(newRow.metadata.shadowMatch, undefined,
+        'shadowMatch must be undefined when no same-tenant candidate exists');
+      assert.equal(newRow.metadata.dedupQuality, 'title_fallback');
+
+      const tenantARow = await fetchInsight(12);
+      assert.equal(tenantARow.status, 'active');
+      assert.equal(tenantARow.superseded_by, null);
     } finally {
       await aq.close?.().catch(() => {});
     }
