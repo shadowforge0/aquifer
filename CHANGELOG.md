@@ -4,6 +4,18 @@ All notable changes to `@shadowforge0/aquifer-memory` are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project uses semantic versioning.
 
+## [1.5.9] - 2026-04-20
+
+Docs-only patch. The 1.5.8 tarball shipped with a pre-1.5.6 README
+and three new public surfaces (`aquifer.init()`, the canonical/revision
+`insights.commitInsight` contract, the `migrations` config block) were
+invisible to anyone reading the npm registry page. This release
+republishes with the already-landed triple-language README updates so
+the registry matches the repo.
+
+No code change. Tarball layout, exports, and runtime behaviour are
+byte-identical to 1.5.8 aside from the README files.
+
 ## [1.5.8] - 2026-04-20
 
 Follow-up patch for two issues exposed while tidying the suite after
