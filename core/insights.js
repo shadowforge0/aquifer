@@ -26,50 +26,19 @@ const DEFAULT_RECALL_WEIGHTS = Object.freeze({
   recency: 0.10,
 });
 
+const DEFAULT_DEDUP = Object.freeze({
+  mode: 'off',
+  cosineThreshold: 0.88,
+  closeBandFrom: 0.85,
+});
+
+const VALID_DEDUP_MODES = new Set(['off', 'shadow', 'enforce']);
+
 // Recency linear decay horizon — an insight is treated as "fully recent" at
 // creation (age=0) and "zero recency" at age >= recencyWindowDays. Beyond,
 // recency contribution is clamped to 0 rather than going negative. Configurable
 // via createAquifer({ insights: { recencyWindowDays } }).
 const DEFAULT_RECENCY_WINDOW_DAYS = 90;
-
-const LEADING_PUNCT_RE = /^[\s\-_.,;:!?'"()\[\]{}@#]+/;
-const TRAILING_PUNCT_RE = /[\s\-_.,;:!?'"()\[\]{}@#]+$/;
-
-function _normalizeText(input) {
-  if (typeof input !== 'string' || !input) return '';
-  let s = input.normalize('NFKC');
-  s = s.toLowerCase();
-  s = s.replace(/\s+/g, ' ');
-  s = s.replace(LEADING_PUNCT_RE, '');
-  s = s.replace(TRAILING_PUNCT_RE, '');
-  return s;
-}
-
-function normalizeCanonicalClaim(text) {
-  return _normalizeText(text);
-}
-
-function normalizeBody(text) {
-  return _normalizeText(text);
-}
-
-function normalizeEntitySet(entities) {
-  if (!entities || !Array.isArray(entities)) return '';
-  const { normalizeEntityName } = require('./entity');
-  const normalized = entities
-    .map(e => normalizeEntityName(e))
-    .filter(Boolean);
-  const deduped = [...new Set(normalized)];
-  deduped.sort();
-  return deduped.join('|');
-}
-
-function defaultCanonicalKey({ tenantId, agentId, type, canonicalClaim, entities }) {
-  const normClaim = normalizeCanonicalClaim(canonicalClaim);
-  const normEntities = normalizeEntitySet(entities);
-  const input = `${tenantId || ''}|${agentId || ''}|${type || ''}|${normClaim}|${normEntities}`;
-  return crypto.createHash('sha256').update(input).digest('hex');
-}
 
 function defaultIdempotencyKey({
   tenantId, agentId, type, title, body, sourceSessionIds, evidenceWindow,
@@ -160,6 +129,94 @@ function vecToPgLiteral(v) {
   return `[${v.join(',')}]`;
 }
 
+function truncate(input, limit) {
+  if (typeof input !== 'string') return '';
+  if (!Number.isFinite(limit) || limit < 0) return '';
+  return input.length <= limit ? input : input.slice(0, limit);
+}
+
+function truncateNormalized(input, limit) {
+  return truncate(normalizeBody(input), limit);
+}
+
+function resolveDedupConfig(dedup, embedFn) {
+  let resolved;
+  if (dedup === true) {
+    resolved = { ...DEFAULT_DEDUP, mode: 'enforce' };
+  } else if (dedup === false || dedup === undefined) {
+    resolved = { ...DEFAULT_DEDUP };
+  } else if (dedup && typeof dedup === 'object') {
+    resolved = { ...DEFAULT_DEDUP, ...dedup };
+  } else {
+    resolved = { ...DEFAULT_DEDUP };
+  }
+
+  const rawMode = typeof resolved.mode === 'string' ? resolved.mode.trim().toLowerCase() : resolved.mode;
+  if (!VALID_DEDUP_MODES.has(rawMode)) {
+    console.warn(`[aquifer] insights dedup: invalid mode ${JSON.stringify(resolved.mode)}; coercing to 'off'`);
+    resolved.mode = 'off';
+  } else {
+    resolved.mode = rawMode;
+  }
+
+  const envMode = process.env.AQUIFER_INSIGHTS_DEDUP_MODE;
+  if (typeof envMode === 'string') {
+    const normalizedEnvMode = envMode.trim().toLowerCase();
+    if (VALID_DEDUP_MODES.has(normalizedEnvMode)) {
+      resolved.mode = normalizedEnvMode;
+    }
+  }
+
+  // Reject non-numeric sentinels (null, bool, objects) BEFORE Number()
+  // coerces them to 0 — 0 would silently become a "merge everything"
+  // threshold in enforce mode.
+  let cosineThreshold;
+  if (resolved.cosineThreshold === null || resolved.cosineThreshold === undefined
+      || typeof resolved.cosineThreshold === 'boolean') {
+    console.warn(`[aquifer] insights dedup: invalid cosineThreshold ${JSON.stringify(resolved.cosineThreshold)}; defaulting to 0.88`);
+    cosineThreshold = DEFAULT_DEDUP.cosineThreshold;
+  } else {
+    cosineThreshold = Number(resolved.cosineThreshold);
+    if (!Number.isFinite(cosineThreshold)) {
+      console.warn('[aquifer] insights dedup: invalid cosineThreshold; defaulting to 0.88');
+      cosineThreshold = DEFAULT_DEDUP.cosineThreshold;
+    } else if (cosineThreshold < 0.75 || cosineThreshold > 0.95) {
+      const clamped = Math.max(0, Math.min(1, cosineThreshold));
+      console.warn(`[aquifer] insights dedup: cosineThreshold ${cosineThreshold} outside recommended [0.75,0.95]; using ${clamped}`);
+      cosineThreshold = (cosineThreshold >= 0 && cosineThreshold <= 1) ? cosineThreshold : clamped;
+    }
+  }
+  resolved.cosineThreshold = cosineThreshold;
+
+  let closeBandFrom;
+  if (resolved.closeBandFrom === null || resolved.closeBandFrom === undefined
+      || typeof resolved.closeBandFrom === 'boolean') {
+    console.warn(`[aquifer] insights dedup: invalid closeBandFrom ${JSON.stringify(resolved.closeBandFrom)}; defaulting to 0.85`);
+    closeBandFrom = DEFAULT_DEDUP.closeBandFrom;
+  } else {
+    closeBandFrom = Number(resolved.closeBandFrom);
+    if (!Number.isFinite(closeBandFrom)) {
+      console.warn('[aquifer] insights dedup: invalid closeBandFrom; defaulting to 0.85');
+      closeBandFrom = DEFAULT_DEDUP.closeBandFrom;
+    }
+  }
+  if (closeBandFrom >= resolved.cosineThreshold) {
+    const adjusted = Math.max(0, resolved.cosineThreshold - 0.03);
+    console.warn(`[aquifer] insights dedup: closeBandFrom ${closeBandFrom} must be below cosineThreshold ${resolved.cosineThreshold}; using ${adjusted}`);
+    closeBandFrom = adjusted;
+  }
+  resolved.closeBandFrom = closeBandFrom;
+
+  if (resolved.mode !== 'off') {
+    console.log(`[aquifer] insights dedup: mode=${resolved.mode} threshold=${resolved.cosineThreshold} close_band_from=${resolved.closeBandFrom}`);
+    if (!embedFn) {
+      console.warn('[aquifer] insights dedup: embedFn unavailable; semantic dedup disabled at runtime');
+    }
+  }
+
+  return Object.freeze(resolved);
+}
+
 function mapRow(row) {
   if (!row) return null;
   return {
@@ -184,7 +241,7 @@ function mapRow(row) {
   };
 }
 
-function createInsights({ pool, schema, defaultTenantId, embedFn, recallWeights, recencyWindowDays }) {
+function createInsights({ pool, schema, defaultTenantId, embedFn, recallWeights, recencyWindowDays, dedup }) {
   if (!pool) throw new Error('createInsights: pool is required');
   if (!schema) throw new Error('createInsights: schema is required');
 
@@ -192,6 +249,24 @@ function createInsights({ pool, schema, defaultTenantId, embedFn, recallWeights,
   const recencyWindow = Number.isFinite(recencyWindowDays) && recencyWindowDays > 0
     ? recencyWindowDays : DEFAULT_RECENCY_WINDOW_DAYS;
   const tbl = `${schema}.insights`;
+  const dedupConfig = resolveDedupConfig(dedup, embedFn);
+
+  if (dedupConfig.mode !== 'off') {
+    pool.query(
+      `SELECT count(*)::int AS n FROM ${tbl}
+        WHERE canonical_key_v2 IS NULL AND status = 'active'`
+    ).then(r => {
+      const n = r && r.rows && r.rows[0] ? Number(r.rows[0].n) : 0;
+      if (n > 0) {
+        console.warn(
+          `[aquifer] insights: ${n} active rows with canonical_key_v2 IS NULL. `
+          + 'Run scripts/backfill-canonical-key.js to include them in canonical dedup.'
+        );
+      }
+    }).catch(() => {
+      // non-fatal
+    });
+  }
 
   // -------------------------------------------------------------------------
   // commitInsight
@@ -283,9 +358,101 @@ function createInsights({ pool, schema, defaultTenantId, embedFn, recallWeights,
         toSupersede = Number(activeRow.id);
       }
 
-      // Optional embedding.
       let embedding = null;
-      if (embedFn) {
+      let embeddingReady = false;
+
+      if (dedupConfig.mode !== 'off' && !toSupersede && embedFn) {
+        // Embed the incoming title+body once. If this throws, the label
+        // is genuinely 'embed_failed' — the candidate SELECT never ran.
+        let embedFailed = false;
+        try {
+          const v = await embedFn([`${title}\n\n${body}`]);
+          if (Array.isArray(v) && Array.isArray(v[0])) {
+            embedding = vecToPgLiteral(v[0]);
+          }
+          embeddingReady = true;
+        } catch {
+          embedFailed = true;
+          embeddingReady = true;
+          metadata = { ...metadata, dedupSkipped: 'embed_failed' };
+        }
+
+        if (!embedFailed && embedding) {
+          // Candidate lookup. If this throws (DB error), let it bubble
+          // to the outer commitInsight try/catch → AQ_INTERNAL. Do NOT
+          // mislabel it as embed_failed.
+          const semanticLookup = await pool.query(
+            `SELECT *, 1.0 - (embedding <=> $4::vector) AS cos_sim
+               FROM ${tbl}
+              WHERE tenant_id = $1
+                AND agent_id = $2
+                AND insight_type = $3
+                AND status = 'active'
+                AND embedding IS NOT NULL
+              ORDER BY embedding <=> $4::vector
+              LIMIT 1`,
+            [tenantId, agentId, type, embedding]
+          );
+
+          if (semanticLookup.rowCount > 0) {
+            const candidate = semanticLookup.rows[0];
+            const cosine = Number(candidate.cos_sim);
+
+            if (cosine >= dedupConfig.cosineThreshold) {
+              const candidateUpper = parseUpperFromRange(candidate.evidence_window);
+              const isStaleReplay = candidateUpper
+                && new Date(toIso).getTime() < candidateUpper.getTime();
+
+              if (dedupConfig.mode === 'enforce') {
+                // Enforce path: stale-replay returns the candidate as
+                // duplicate; otherwise supersede.
+                if (isStaleReplay) {
+                  return ok({ insight: mapRow(candidate), duplicate: true });
+                }
+                toSupersede = Number(candidate.id);
+                metadata = {
+                  ...metadata,
+                  dedupVia: 'semantic',
+                  dedupCandidate: { id: Number(candidate.id), cosine },
+                };
+              } else {
+                // Shadow path: always insert the new row, always record
+                // shadowMatch metadata. staleReplay flag tells reviewers
+                // the enforce-mode twin would have returned duplicate
+                // instead of superseding.
+                metadata = {
+                  ...metadata,
+                  shadowMatch: {
+                    candidateId: Number(candidate.id),
+                    cosine,
+                    threshold: dedupConfig.cosineThreshold,
+                    candidateTitle: truncate(candidate.title, 200),
+                    candidateBody: truncateNormalized(candidate.body, 200),
+                    wouldSupersede: !isStaleReplay,
+                    staleReplay: Boolean(isStaleReplay),
+                    ranAt: new Date().toISOString(),
+                  },
+                };
+              }
+            } else if (cosine >= dedupConfig.closeBandFrom) {
+              metadata = {
+                ...metadata,
+                dedupNear: {
+                  candidateId: Number(candidate.id),
+                  cosine,
+                  threshold: dedupConfig.cosineThreshold,
+                  closeBandFrom: dedupConfig.closeBandFrom,
+                  candidateTitle: truncate(candidate.title, 200),
+                  candidateBody: truncateNormalized(candidate.body, 200),
+                },
+              };
+            }
+          }
+        }
+      }
+
+      // Optional embedding.
+      if (embedFn && !embeddingReady) {
         try {
           const v = await embedFn([`${title}\n\n${body}`]);
           if (Array.isArray(v) && Array.isArray(v[0])) embedding = vecToPgLiteral(v[0]);
@@ -485,7 +652,7 @@ function createInsights({ pool, schema, defaultTenantId, embedFn, recallWeights,
     recallInsights,
     markStale,
     supersede,
-    _internal: { defaultIdempotencyKey, vecToPgLiteral, mapRow, weights },
+    _internal: { defaultIdempotencyKey, vecToPgLiteral, mapRow, weights, dedup: dedupConfig },
   };
 }
 

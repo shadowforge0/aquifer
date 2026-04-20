@@ -30,6 +30,15 @@ const DEFAULTS = {
     temperature: 0,
   },
   entities: { enabled: false, mergeCall: true, scope: 'default' },
+  insights: {
+    recallWeights: null,
+    recencyWindowDays: null,
+    dedup: {
+      mode: 'off',
+      cosineThreshold: 0.88,
+      closeBandFrom: 0.85,
+    },
+  },
   rank: { rrf: 0.65, timeDecay: 0.25, access: 0.10, entityBoost: 0.18 },
   rerank: {
     enabled: false,
@@ -75,6 +84,9 @@ const ENV_MAP = [
   ['AQUIFER_LLM_TEMPERATURE',   'llm.temperature',   Number],
   ['AQUIFER_ENTITIES_ENABLED',  'entities.enabled',  Boolean],
   ['AQUIFER_ENTITY_SCOPE',     'entities.scope'],
+  ['AQUIFER_INSIGHTS_DEDUP_MODE',             'insights.dedup.mode'],
+  ['AQUIFER_INSIGHTS_DEDUP_COSINE',           'insights.dedup.cosineThreshold', Number],
+  ['AQUIFER_INSIGHTS_DEDUP_CLOSE_BAND_FROM',  'insights.dedup.closeBandFrom',   Number],
   ['AQUIFER_RERANK_ENABLED',   'rerank.enabled',    Boolean],
   ['AQUIFER_RERANK_PROVIDER',  'rerank.provider'],
   ['AQUIFER_RERANK_BASE_URL',  'rerank.baseUrl'],
@@ -163,6 +175,14 @@ function loadConfig(opts = {}) {
   // 3. Programmatic overrides
   if (opts.overrides) {
     config = deepMerge(config, opts.overrides);
+  }
+
+  // insights.dedup shorthand: true → enforce, false → off
+  if (config.insights && typeof config.insights.dedup === 'boolean') {
+    config.insights.dedup = {
+      ...DEFAULTS.insights.dedup,
+      mode: config.insights.dedup ? 'enforce' : 'off',
+    };
   }
 
   return config;

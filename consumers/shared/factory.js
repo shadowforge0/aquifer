@@ -91,6 +91,7 @@ function createAquiferFromConfig(overrides) {
     rank: config.rank,
     rerank: rerankOpts,
     migrations: config.migrations,
+    insights: config.insights,
   });
 
   return aquifer;

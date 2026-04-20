@@ -1,6 +1,6 @@
 {
   "name": "@shadowforge0/aquifer-memory",
-  "version": "1.5.9",
+  "version": "1.5.10",
   "description": "PG-native long-term memory for AI agents. Turn-level embedding, hybrid RRF ranking, optional knowledge graph. MCP server, CLI, and library API.",
   "main": "index.js",
   "files": [
@@ -13,7 +13,15 @@
     "consumers/default/",
     "consumers/openclaw-ext/",
     "docs/",
-    "scripts/"
+    "scripts/backfill-canonical-key.js",
+    "scripts/diagnose-fts-zh.js",
+    "scripts/diagnose-vector.js",
+    "scripts/drop-entity-state-history.sql",
+    "scripts/drop-insights.sql",
+    "scripts/extract-insights-from-recent-sessions.js",
+    "scripts/find-dburl-hints.js",
+    "scripts/install-openclaw.sh",
+    "scripts/smoke.mjs"
   ],
   "bin": {
     "aquifer": "./consumers/cli.js"

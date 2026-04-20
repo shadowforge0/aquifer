@@ -261,8 +261,26 @@ OpenClaw plugin（`consumers/openclaw-plugin.js`）保留用於 `before_reset` s
 | `AQUIFER_AGENT_ID` | 否 | 預設 agent ID | `main` |
 | `AQUIFER_MIGRATIONS_MODE` | 否 | 啟動 handshake 模式：`apply`（預設）、`check`、`off` | `apply` |
 | `AQUIFER_MIGRATION_LOCK_TIMEOUT_MS` | 否 | advisory lock 等待上限，逾時拋 `AQ_MIGRATION_LOCK_TIMEOUT`（預設 30000） | `30000` |
+| `AQUIFER_INSIGHTS_DEDUP_MODE` | 否 | insights 語意去重模式：`off`（預設）、`shadow`、`enforce`——此欄位 env 蓋過程式碼設定，讓 operator 不用重部署就能緊急關閉 | `shadow` |
+| `AQUIFER_INSIGHTS_DEDUP_COSINE` | 否 | 語意合併的 cosine 閾值（預設 `0.88`，在 `[0.75, 0.95]` 外會發出警告） | `0.90` |
+| `AQUIFER_INSIGHTS_DEDUP_CLOSE_BAND_FROM` | 否 | close-band（`dedupNear` metadata）下界，必須嚴格小於閾值（預設 `0.85`） | `0.82` |
 
 完整的環境變數對應設定在 [consumers/shared/config.js](consumers/shared/config.js)。
+
+### Insights 語意去重（1.5.10）
+
+當 cron extractor（`scripts/extract-insights-from-recent-sessions.js`）或其他呼叫者透過 `commitInsight` 寫 insights 時，canonical-key 層（1.5.3+）會對 `canonicalClaim + entities` 雜湊相同的 row 做去重。但 LLM 跨次產出的 `canonicalClaim` 不一定穩定，所以 1.5.10 加上第二層：`title + body` 做 embedding，對 `(tenant, agent, type)` 範圍內的 active row 做比對，top cosine 超過 `AQUIFER_INSIGHTS_DEDUP_COSINE` 就觸發 supersede（enforce 模式）或只記 would-merge metadata（shadow 模式）。落在 close band（`closeBandFrom ≤ cos < threshold`）的寫 `metadata.dedupNear`，不 supersede，讓 operator 調閾值前先觀察。
+
+推薦部署順序：`shadow` 跑一個 weekly cycle，檢查 `SELECT metadata->>'shadowMatch' FROM insights WHERE metadata ? 'shadowMatch'` 看有沒有錯誤合併候選，確認沒問題再切 `enforce`。Kill-switch：`AQUIFER_INSIGHTS_DEDUP_MODE=off` + 重啟。
+
+1.5.3 前的歷史 row（`canonical_key_v2 IS NULL`）會被語意層直接抓到，但不會走 canonical 路徑；啟動時的警告會提示跑一次性的 backfill：
+
+```bash
+DATABASE_URL=... \
+  node scripts/backfill-canonical-key.js --schema <schema> --agent <id>
+```
+
+Script 是 idempotent（`WHERE canonical_key_v2 IS NULL` 保護），可以多次重跑，與 live writer 並存也安全。
 
 ---
 

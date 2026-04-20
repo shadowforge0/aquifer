@@ -1,0 +1,14 @@
+# Benchmark artifacts — local-only, not shipped in the npm tarball.
+# retro-recall-bench was retired per feedback_no_fts_simple_bench.md
+# (fts-simple vs fts-zhcfg produces null results for Chinese input
+# because the tokenizer splits characters singly; no useful bench output).
+scripts/retro-recall-bench.js
+scripts/queries.json
+scripts/sample-bench-queries.sql
+bench/
+
+# Dev-only run artifacts
+/.claude/
+/.env
+/.env.local
+/node_modules/

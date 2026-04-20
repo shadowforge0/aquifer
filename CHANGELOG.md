@@ -4,6 +4,201 @@ All notable changes to `@shadowforge0/aquifer-memory` are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project uses semantic versioning.
 
+## [1.5.10] - 2026-04-21
+
+Adds a semantic-dedup layer to `insights.commitInsight`, closes a
+silent-dead-config bug in the CLI/MCP consumer factory, and ships a
+one-shot backfill script for legacy rows that predate
+`canonical_key_v2`. Opt-in via `insights.dedup.mode`; default `off`,
+so existing consumers see no behaviour change until they flip the
+switch.
+
+Motivation: the 1.5.3 canonical-identity layer depends on the
+extractor LLM emitting a stable `canonicalClaim`. Empirical data from
+the first weekly distill (11 baseline + 10 new insights on
+2026-04-20) showed ~7/10 of the new rows were semantic duplicates of
+baseline rows, but all had distinct `canonical_key_v2` because the
+LLM produced different phrasings of the same claim. Canonical dedup
+is necessary but not sufficient; a semantic tier catches what title
+drift leaks through.
+
+### Added — `core/insights.js`
+
+- **Step B' semantic dedup** inside `commitInsight`, between the
+  existing canonical lookup (Step B) and the INSERT. Triggers only
+  when canonical lookup missed AND `dedup.mode !== 'off'` AND an
+  `embedFn` is available. Candidate selection is
+  `ORDER BY embedding <=> $vec LIMIT 1` scoped to
+  `(tenant, agent, type)` with `status='active' AND embedding IS NOT NULL`;
+  cosine is derived as `1.0 - (embedding <=> $vec)` in SQL (no JS
+  re-computation, no double floating-point drift). Type is a hard
+  gate via the WHERE clause — never merges across
+  preference / pattern / frustration / workflow.
+- **`mode='enforce'`** — match ≥ threshold supersedes the candidate
+  (`status='superseded'`, `superseded_by=newId` via the existing
+  best-effort UPDATE at the bottom of commitInsight) and the new row
+  records `metadata.dedupVia='semantic'` +
+  `metadata.dedupCandidate={id, cosine}`.
+- **`mode='shadow'`** — no supersede, no state change on the candidate
+  row; the new row records `metadata.shadowMatch={candidateId, cosine,
+  threshold, candidateTitle, candidateBody, wouldSupersede, staleReplay,
+  ranAt}` with title truncated to 200 chars and body truncated-and-
+  whitespace-collapsed to 200 chars. Shadow ALWAYS inserts the new row
+  and writes metadata, even when the enforce-mode twin would have
+  returned `duplicate:true` via the stale-replay guard — the
+  `staleReplay:true` flag surfaces that case to reviewers instead of
+  silently dropping the incoming insight. Operators can inspect
+  would-be merges without any JOIN.
+- **Close band** — when `closeBandFrom <= cosine < cosineThreshold`,
+  new row metadata records `dedupNear={candidateId, cosine, threshold,
+  closeBandFrom, candidateTitle, candidateBody}`. No supersede, no
+  status change. Surfaces tuning candidates during shadow-mode review.
+- **`metadata.dedupSkipped='embed_failed'`** when `embedFn` throws
+  during Step B'. Clean INSERT proceeds without the semantic path;
+  semantic recall still degrades gracefully per the existing non-fatal
+  embed contract.
+- **Stale-replay guard inherits** — when the candidate's
+  `evidence_window` upper is newer than the incoming `to` timestamp,
+  returns `duplicate:true` with the existing row and skips INSERT,
+  mirroring the canonical-path Rule 4 behaviour at line 278.
+- **`dedup` parameter on `createInsights({...})`** — resolved through
+  `resolveDedupConfig(dedup, embedFn)` which: normalises shorthand
+  (`true` → `{mode:'enforce',...}`, `false` → `{mode:'off',...}`);
+  trims + lowercases `mode` with invalid-value warn-and-coerce-to-off;
+  validates numeric thresholds (NaN → default, out-of-[0,1] clamp,
+  out-of-recommended-[0.75, 0.95] warn-and-keep); auto-adjusts
+  `closeBandFrom` when it's not strictly below `cosineThreshold`;
+  honours `process.env.AQUIFER_INSIGHTS_DEDUP_MODE` as a runtime
+  override of `mode` (and only `mode`) so operators can kill-switch
+  the feature without a code redeploy.
+- **Startup log** — a single `[aquifer] insights dedup: mode=…
+  threshold=… close_band_from=…` line at `createInsights()` init when
+  `mode !== 'off'`. Off mode stays silent. Missing `embedFn` warn is
+  emitted once at startup, not per-commit.
+- **NULL-canonical check** — fire-and-forget startup probe that warns
+  (once) if `count(canonical_key_v2 IS NULL AND status='active') > 0`,
+  pointing at `scripts/backfill-canonical-key.js`.
+- **`truncate`** / **`truncateNormalized`** private helpers — 200-char
+  snippet truncation for `shadowMatch` / `dedupNear` payloads; the
+  normalised variant collapses whitespace so multi-line body fragments
+  read cleanly in metadata.
+- **Dead-code cleanup** — duplicate first-copy definitions of
+  `_normalizeText`, `normalizeCanonicalClaim`, `normalizeBody`,
+  `normalizeEntitySet`, `defaultCanonicalKey` at lines 38-85 removed.
+  The second copies at 100-133 already shadowed them; exports and
+  behaviour are unchanged.
+
+### Added — `consumers/shared/config.js`
+
+- `DEFAULTS.insights.dedup = {mode:'off', cosineThreshold:0.88,
+  closeBandFrom:0.85}`. `DEFAULTS.insights.recallWeights` /
+  `recencyWindowDays` explicit null defaults documented.
+- Three new env-var mappings: `AQUIFER_INSIGHTS_DEDUP_MODE`,
+  `AQUIFER_INSIGHTS_DEDUP_COSINE` (→ `Number`),
+  `AQUIFER_INSIGHTS_DEDUP_CLOSE_BAND_FROM` (→ `Number`).
+- Shorthand normalisation after programmatic overrides merge:
+  `insights.dedup: true|false` expands to the full object with
+  `mode='enforce'|'off'` and default thresholds.
+
+### Added — `scripts/backfill-canonical-key.js`
+
+One-shot standalone CLI for pre-1.5.3 rows with `canonical_key_v2 IS
+NULL`. Reuses `defaultCanonicalKey` from `core/insights` as the single
+source of truth for normalisation + hashing. Args:
+`--schema`, `--agent` (or `--all-agents`), `--tenant-id` (default
+`AQUIFER_TENANT_ID` or `'default'`), `--batch-size` (1..1000, default
+50), `--dry-run`. Updates are guarded by
+`WHERE canonical_key_v2 IS NULL` so re-runs and concurrent live writes
+converge without races. Metadata flag
+`{canonicalBackfill: 'title_deterministic'}` is merged into each
+updated row. Id-watermark cursor prevents infinite loops on dry-run
+or all-skip batches.
+
+Invocation:
+```bash
+DATABASE_URL="postgresql://..." \
+  node node_modules/@shadowforge0/aquifer-memory/scripts/backfill-canonical-key.js \
+  --schema miranda --agent main [--dry-run]
+```
+
+Rationale for JS-not-SQL: production PG ships without `pgcrypto`,
+and matching JS's Unicode NFKC normalisation in pure SQL is fragile.
+Single source of truth lives in `core/insights.js`.
+
+### Fixed — `consumers/shared/factory.js`
+
+- `createAquiferFromConfig()` now passes `insights: config.insights`
+  into `createAquifer({...})`. Pre-existing bug since 1.4.0:
+  `config.insights.recallWeights` / `recencyWindowDays` from config
+  file or env were silently dropped for CLI / MCP consumers. Only
+  code paths that called `createAquifer()` directly (e.g. the Miranda
+  gateway's `consumers/miranda/instance.js`) were unaffected. Folded
+  into this release because the dedup config would have shared the
+  same fate.
+
+### Config surface
+
+New `insights.dedup` group under `createAquifer({insights:{dedup:{...}}})`:
+
+| Key | Type | Default | Env |
+|-----|------|---------|-----|
+| `mode` | `'off' \| 'shadow' \| 'enforce'` | `'off'` | `AQUIFER_INSIGHTS_DEDUP_MODE` |
+| `cosineThreshold` | number | `0.88` | `AQUIFER_INSIGHTS_DEDUP_COSINE` |
+| `closeBandFrom` | number | `0.85` | `AQUIFER_INSIGHTS_DEDUP_CLOSE_BAND_FROM` |
+
+**Precedence exception**: for `mode` only, the env var wins over
+`createAquifer({...})` programmatic config. This is an intentional
+carve-out so an operator can force `mode='off'` at runtime without
+pushing new code. `cosineThreshold` / `closeBandFrom` follow the
+standard Aquifer order (programmatic > env > file > defaults).
+
+### Tests
+
+- `test/insights.test.js` — +18 unit cases covering `resolveDedupConfig`
+  validation matrix (shorthand, NaN, out-of-range clamp, adjusted
+  closeBandFrom, env-wins exception), Step B' branching
+  (mode=off bypass, enforce supersede, shadow metadata-only,
+  close-band no-merge, embed-failure, no-candidate), metadata
+  shape invariants (shadow never writes `dedupVia`, enforce never
+  writes `shadowMatch`).
+- `test/insights-semantic-dedup.integration.test.js` — new file, 9
+  real-PG integration cases against a random schema built via
+  `aquifer.init()`. Seeds 10 rows with crafted 1024-dim unit vectors
+  so cosine values are deterministic against the HNSW `<=>` operator;
+  tolerance `< 0.005` on cosine assertions absorbs HNSW approximation.
+  Covers the full matrix: enforce supersede, threshold-edge, close
+  band, shadow side-effect-free snapshot, distant vector, embed
+  failure, cross-agent isolation, cross-type isolation, and legacy
+  NULL-canonical semantic catch.
+- `test/config.test.js` — +9 cases for `insights.dedup` defaults, env
+  mapping, shorthand, partial override, and null-preservation of
+  `recallWeights` / `recencyWindowDays`.
+- Full suite with `AQUIFER_TEST_DB_URL`: 1101/1101 green (was 1065
+  before this PR).
+
+### Migration notes
+
+- **Opt-in**: default `mode='off'` means no behaviour change until an
+  operator flips the env var or passes `insights.dedup` explicitly.
+- **Run backfill before enabling** — the semantic path tolerates
+  legacy `canonical_key_v2 IS NULL` rows (it catches them via
+  embedding anyway), but the canonical lookup path skips them, and
+  the startup warn will nag every restart until resolved. One-shot:
+
+  ```bash
+  DATABASE_URL=... \
+    node scripts/backfill-canonical-key.js --schema <schema> --agent <id>
+  ```
+
+  Repeat per schema (miranda + jenny + any tenant-specific schemas).
+- **Recommended rollout**: shadow for 1 weekly cycle, inspect
+  `SELECT metadata->>'shadowMatch' FROM insights WHERE metadata ? 'shadowMatch'`
+  for false positives, then flip to `enforce`. Kill-switch:
+  `AQUIFER_INSIGHTS_DEDUP_MODE=off` + restart.
+- **No schema change** — all required columns (`canonical_key_v2`,
+  `embedding vector(1024)`) and the partial HNSW index ship since
+  1.5.3. `npm install` + restart is enough on the code side.
+
 ## [1.5.9] - 2026-04-20
 
 Docs-only patch. The 1.5.8 tarball shipped with a pre-1.5.6 README

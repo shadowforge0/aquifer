@@ -1837,6 +1837,7 @@ function createAquifer(config = {}) {
     recallWeights: (config.insights && config.insights.recallWeights) || null,
     recencyWindowDays: config.insights && Number.isFinite(config.insights.recencyWindowDays)
       ? config.insights.recencyWindowDays : undefined,
+    dedup: config.insights && config.insights.dedup ? config.insights.dedup : undefined,
   });
 
   return aquifer;

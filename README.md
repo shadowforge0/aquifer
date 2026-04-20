@@ -134,8 +134,26 @@ Need LLM summarization, the knowledge graph, OpenAI embeddings, or the reranker?
 | `AQUIFER_AGENT_ID` | No | Default agent ID | `main` |
 | `AQUIFER_MIGRATIONS_MODE` | No | Startup handshake mode: `apply` (default), `check`, `off` | `apply` |
 | `AQUIFER_MIGRATION_LOCK_TIMEOUT_MS` | No | Advisory-lock wait before `AQ_MIGRATION_LOCK_TIMEOUT` (default 30000) | `30000` |
+| `AQUIFER_INSIGHTS_DEDUP_MODE` | No | Insights semantic dedup mode: `off` (default), `shadow`, `enforce` — env wins over code for this field only, so operators can kill-switch without redeploy | `shadow` |
+| `AQUIFER_INSIGHTS_DEDUP_COSINE` | No | Cosine threshold for semantic merge (default `0.88`; warn outside `[0.75, 0.95]`) | `0.90` |
+| `AQUIFER_INSIGHTS_DEDUP_CLOSE_BAND_FROM` | No | Lower bound for close-band logging (`dedupNear`); must be below threshold (default `0.85`) | `0.82` |
 
 Full env-to-config mapping is in [consumers/shared/config.js](consumers/shared/config.js).
+
+### Insights semantic dedup (1.5.10)
+
+When a cron extractor (`scripts/extract-insights-from-recent-sessions.js`) or any other caller writes insights via `commitInsight`, the canonical-key layer (1.5.3+) dedupes rows whose `canonicalClaim + entities` hash to the same value. But LLMs don't always produce the same `canonicalClaim` across runs, so 1.5.10 adds a second tier: `title + body` are embedded, matched against `(tenant, agent, type)`-scoped active rows, and a top cosine above `AQUIFER_INSIGHTS_DEDUP_COSINE` triggers supersede (enforce) or metadata-only would-merge logging (shadow). Close-band hits (`closeBandFrom ≤ cos < threshold`) write `metadata.dedupNear` without supersede so operators can tune thresholds without committing.
+
+Recommended rollout: `shadow` for one weekly cycle, inspect `SELECT metadata->>'shadowMatch' FROM insights WHERE metadata ? 'shadowMatch'`, then flip to `enforce`. Kill-switch: `AQUIFER_INSIGHTS_DEDUP_MODE=off` and restart.
+
+Pre-1.5.3 rows with `canonical_key_v2 IS NULL` are caught by the semantic tier but skip the canonical path; a startup warn points at the one-shot backfill:
+
+```bash
+DATABASE_URL=... \
+  node scripts/backfill-canonical-key.js --schema <schema> --agent <id>
+```
+
+The script is idempotent (`WHERE canonical_key_v2 IS NULL` guard) and race-safe with live writers.
 
 ---
 

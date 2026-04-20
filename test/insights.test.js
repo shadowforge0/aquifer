@@ -635,3 +635,383 @@ describe('insights.defaultCanonicalKey', () => {
     assert.equal(key.length, 64);
   });
 });
+
+describe('createInsights dedup', () => {
+  const baseInput = {
+    agentId: 'main',
+    type: 'pattern',
+    title: 'Pattern title',
+    body: 'Body text',
+    sourceSessionIds: ['s1'],
+    evidenceWindow: { from: '2026-01-01T00:00:00Z', to: '2026-01-02T00:00:00Z' },
+  };
+
+  function withConsoleStub(method, fn) {
+    const original = console[method];
+    const calls = [];
+    console[method] = (...args) => { calls.push(args); };
+    return Promise.resolve()
+      .then(() => fn(calls))
+      .finally(() => {
+        console[method] = original;
+      });
+  }
+
+  function makeInsertedRow(metadata = {}, id = 10) {
+    return {
+      id,
+      tenant_id: 'default',
+      agent_id: 'main',
+      insight_type: 'pattern',
+      title: 'Pattern title',
+      body: 'Body text',
+      source_session_ids: ['s1'],
+      evidence_window: '[2026-01-01 00:00:00+00,2026-01-02 00:00:00+00)',
+      importance: 0.5,
+      status: 'active',
+      idempotency_key: 'k',
+      canonical_key_v2: 'ck',
+      metadata,
+      created_at: '2026-01-02T00:00:00Z',
+      updated_at: '2026-01-02T00:00:00Z',
+      superseded_by: null,
+    };
+  }
+
+  function makeCandidateRow(overrides = {}) {
+    return {
+      id: 42,
+      tenant_id: 'default',
+      agent_id: 'main',
+      insight_type: 'pattern',
+      title: 'Candidate title',
+      body: 'Candidate body text that should be normalized for metadata.',
+      source_session_ids: ['s0'],
+      evidence_window: '[2026-01-01 00:00:00+00,2020-01-01 00:00:00+00)',
+      importance: 0.7,
+      status: 'active',
+      idempotency_key: 'old',
+      canonical_key_v2: 'old-ck',
+      metadata: {},
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+      superseded_by: null,
+      cos_sim: 0.92,
+      ...overrides,
+    };
+  }
+
+  function makeDedupPool(replies = []) {
+    return makePool([{ rowCount: 1, rows: [{ n: 0 }] }, ...replies]);
+  }
+
+  it('mode=off default behaviour unchanged', async () => {
+    const pool = makePool([
+      { rowCount: 0, rows: [] },
+      { rowCount: 0, rows: [] },
+      { rowCount: 1, rows: [makeInsertedRow()] },
+    ]);
+    const api = createInsights({ pool, schema: '"aq"', defaultTenantId: 'default' });
+    const r = await api.commitInsight(baseInput);
+    assert.equal(r.ok, true);
+    assert.equal(pool.queries.some(q => /<=>/.test(q.sql)), false);
+    assert.equal(api._internal.dedup.mode, 'off');
+  });
+
+  it('mode=shadow at init + no embedFn', async () => {
+    await withConsoleStub('warn', async (warns) => {
+      createInsights({ pool: makeDedupPool(), schema: '"aq"', defaultTenantId: 'default', dedup: { mode: 'shadow' } });
+      assert.ok(warns.some(args => String(args[0]).includes('embedFn unavailable')));
+    });
+  });
+
+  it('mode=enforce + valid config + embedFn', async () => {
+    await withConsoleStub('log', async (logs) => {
+      createInsights({
+        pool: makeDedupPool(),
+        schema: '"aq"',
+        defaultTenantId: 'default',
+        dedup: { mode: 'enforce' },
+        embedFn: async () => [[0.1, 0.2]],
+      });
+      assert.ok(logs.some(args => String(args[0]).includes('mode=enforce threshold=0.88')));
+    });
+  });
+
+  it('cosineThreshold=2.5', async () => {
+    await withConsoleStub('warn', async (warns) => {
+      const api = createInsights({
+        pool: makeDedupPool(), schema: '"aq"', defaultTenantId: 'default', embedFn: async () => [[0.1]],
+        dedup: { mode: 'enforce', cosineThreshold: 2.5 },
+      });
+      assert.equal(api._internal.dedup.cosineThreshold, 1);
+      assert.ok(warns.some(args => String(args[0]).includes('cosineThreshold 2.5')));
+    });
+  });
+
+  it('cosineThreshold=NaN', async () => {
+    await withConsoleStub('warn', async (warns) => {
+      const api = createInsights({
+        pool: makeDedupPool(), schema: '"aq"', defaultTenantId: 'default', embedFn: async () => [[0.1]],
+        dedup: { mode: 'enforce', cosineThreshold: NaN },
+      });
+      assert.equal(api._internal.dedup.cosineThreshold, 0.88);
+      assert.ok(warns.some(args => String(args[0]).includes('invalid cosineThreshold')));
+    });
+  });
+
+  it('closeBandFrom=0.95 threshold=0.88', async () => {
+    await withConsoleStub('warn', async (warns) => {
+      const api = createInsights({
+        pool: makeDedupPool(), schema: '"aq"', defaultTenantId: 'default', embedFn: async () => [[0.1]],
+        dedup: { mode: 'enforce', cosineThreshold: 0.88, closeBandFrom: 0.95 },
+      });
+      assert.equal(api._internal.dedup.closeBandFrom, 0.85);
+      assert.ok(warns.some(args => String(args[0]).includes('closeBandFrom 0.95')));
+    });
+  });
+
+  it("mode='Shadow '", async () => {
+    const api = createInsights({
+      pool: makeDedupPool(), schema: '"aq"', defaultTenantId: 'default', embedFn: async () => [[0.1]],
+      dedup: { mode: 'Shadow ' },
+    });
+    assert.equal(api._internal.dedup.mode, 'shadow');
+  });
+
+  it("mode='explode'", async () => {
+    await withConsoleStub('warn', async (warns) => {
+      const api = createInsights({
+        pool: makeDedupPool(), schema: '"aq"', defaultTenantId: 'default', embedFn: async () => [[0.1]],
+        dedup: { mode: 'explode' },
+      });
+      assert.equal(api._internal.dedup.mode, 'off');
+      assert.ok(warns.some(args => String(args[0]).includes('invalid mode')));
+    });
+  });
+
+  it('dedup=true shorthand', () => {
+    const api = createInsights({
+      pool: makeDedupPool(), schema: '"aq"', defaultTenantId: 'default', embedFn: async () => [[0.1]], dedup: true,
+    });
+    assert.deepEqual(api._internal.dedup, { mode: 'enforce', cosineThreshold: 0.88, closeBandFrom: 0.85 });
+  });
+
+  it('dedup=false shorthand', () => {
+    const api = createInsights({ pool: makePool(), schema: '"aq"', defaultTenantId: 'default', dedup: false });
+    assert.deepEqual(api._internal.dedup, { mode: 'off', cosineThreshold: 0.88, closeBandFrom: 0.85 });
+  });
+
+  it('env AQUIFER_INSIGHTS_DEDUP_MODE=off + code mode=enforce', () => {
+    const prev = process.env.AQUIFER_INSIGHTS_DEDUP_MODE;
+    process.env.AQUIFER_INSIGHTS_DEDUP_MODE = 'off';
+    try {
+      const api = createInsights({
+        pool: makeDedupPool(), schema: '"aq"', defaultTenantId: 'default', embedFn: async () => [[0.1]],
+        dedup: { mode: 'enforce' },
+      });
+      assert.equal(api._internal.dedup.mode, 'off');
+    } finally {
+      if (prev === undefined) delete process.env.AQUIFER_INSIGHTS_DEDUP_MODE;
+      else process.env.AQUIFER_INSIGHTS_DEDUP_MODE = prev;
+    }
+  });
+
+  it('enforce match cos=0.92', async () => {
+    const inserted = makeInsertedRow({ dedupVia: 'semantic', dedupCandidate: { id: 42, cosine: 0.92 } }, 99);
+    const pool = makeDedupPool([
+      { rowCount: 0, rows: [] },
+      { rowCount: 0, rows: [] },
+      { rowCount: 1, rows: [makeCandidateRow({ evidence_window: '[2019-01-01 00:00:00+00,2020-01-01 00:00:00+00)' })] },
+      { rowCount: 1, rows: [inserted] },
+      { rowCount: 1, rows: [{ id: 42, status: 'superseded', superseded_by: 99 }] },
+    ]);
+    const api = createInsights({
+      pool, schema: '"aq"', defaultTenantId: 'default', dedup: { mode: 'enforce' }, embedFn: async () => [[0.1, 0.2]],
+    });
+    const r = await api.commitInsight(baseInput);
+    assert.equal(r.ok, true);
+    assert.equal(r.data.duplicate, false);
+    assert.equal(r.data.insight.metadata.dedupVia, 'semantic');
+    assert.deepEqual(r.data.insight.metadata.dedupCandidate, { id: 42, cosine: 0.92 });
+    assert.ok(pool.queries.some(q => /ORDER BY embedding <=>/.test(q.sql)));
+    assert.ok(pool.queries.some(q => /UPDATE .*status = 'superseded'/.test(q.sql)));
+  });
+
+  it('enforce stale replay', async () => {
+    const candidate = makeCandidateRow({ evidence_window: '[2029-01-01 00:00:00+00,2030-01-01 00:00:00+00)' });
+    const pool = makeDedupPool([
+      { rowCount: 0, rows: [] },
+      { rowCount: 0, rows: [] },
+      { rowCount: 1, rows: [candidate] },
+    ]);
+    const api = createInsights({
+      pool, schema: '"aq"', defaultTenantId: 'default', dedup: { mode: 'enforce' }, embedFn: async () => [[0.1, 0.2]],
+    });
+    const r = await api.commitInsight(baseInput);
+    assert.equal(r.ok, true);
+    assert.equal(r.data.duplicate, true);
+    assert.equal(r.data.insight.id, 42);
+    assert.equal(pool.queries.some(q => /^INSERT INTO/.test(q.sql)), false);
+  });
+
+  it('shadow match cos=0.92', async () => {
+    const inserted = makeInsertedRow({
+      shadowMatch: {
+        candidateId: 42,
+        cosine: 0.92,
+        threshold: 0.88,
+        candidateTitle: 'Candidate title',
+        candidateBody: 'candidate body text that should be normalized for metadata.',
+        wouldSupersede: true,
+        ranAt: '2026-01-03T00:00:00.000Z',
+      },
+    }, 77);
+    const pool = makeDedupPool([
+      { rowCount: 0, rows: [] },
+      { rowCount: 0, rows: [] },
+      { rowCount: 1, rows: [makeCandidateRow()] },
+      { rowCount: 1, rows: [inserted] },
+    ]);
+    const originalToISOString = Date.prototype.toISOString;
+    Date.prototype.toISOString = function toISOString() { return '2026-01-03T00:00:00.000Z'; };
+    try {
+      const api = createInsights({
+        pool, schema: '"aq"', defaultTenantId: 'default', dedup: { mode: 'shadow' }, embedFn: async () => [[0.1, 0.2]],
+      });
+      const r = await api.commitInsight(baseInput);
+      assert.equal(r.ok, true);
+      assert.equal(r.data.duplicate, false);
+      assert.ok(r.data.insight.metadata.shadowMatch);
+      assert.equal(r.data.insight.metadata.dedupVia, undefined);
+      assert.equal(pool.queries.filter(q => /status = 'superseded'/.test(q.sql)).length, 0);
+    } finally {
+      Date.prototype.toISOString = originalToISOString;
+    }
+  });
+
+  it('shadow + stale semantic candidate: still INSERTs, flags staleReplay', async () => {
+    // Regression for Phase 4 deliver BLOCKER: shadow mode used to share
+    // the canonical stale-replay early-return, which silently dropped
+    // the incoming insight and left no audit trail. Shadow must always
+    // insert and always write shadowMatch metadata.
+    const inserted = makeInsertedRow({
+      shadowMatch: {
+        candidateId: 42,
+        cosine: 0.92,
+        threshold: 0.88,
+        candidateTitle: 'Candidate title',
+        candidateBody: 'candidate body text that should be normalized for metadata.',
+        wouldSupersede: false,
+        staleReplay: true,
+        ranAt: '2026-01-03T00:00:00.000Z',
+      },
+    }, 78);
+    const pool = makeDedupPool([
+      { rowCount: 0, rows: [] },
+      { rowCount: 0, rows: [] },
+      { rowCount: 1, rows: [makeCandidateRow({ evidence_window: '[2029-01-01 00:00:00+00,2030-01-01 00:00:00+00)' })] },
+      { rowCount: 1, rows: [inserted] },
+    ]);
+    const originalToISOString = Date.prototype.toISOString;
+    Date.prototype.toISOString = function toISOString() { return '2026-01-03T00:00:00.000Z'; };
+    try {
+      const api = createInsights({
+        pool, schema: '"aq"', defaultTenantId: 'default', dedup: { mode: 'shadow' }, embedFn: async () => [[0.1, 0.2]],
+      });
+      const r = await api.commitInsight(baseInput);
+      assert.equal(r.ok, true);
+      assert.equal(r.data.duplicate, false);
+      assert.ok(r.data.insight.metadata.shadowMatch);
+      assert.equal(r.data.insight.metadata.shadowMatch.wouldSupersede, false);
+      assert.equal(r.data.insight.metadata.shadowMatch.staleReplay, true);
+      assert.equal(r.data.insight.metadata.dedupVia, undefined);
+      // INSERT fired; no supersede UPDATE.
+      assert.ok(pool.queries.some(q => /^INSERT INTO/.test(q.sql)));
+      assert.equal(pool.queries.filter(q => /status = 'superseded'/.test(q.sql)).length, 0);
+    } finally {
+      Date.prototype.toISOString = originalToISOString;
+    }
+  });
+
+  it('resolveDedupConfig rejects null threshold as numeric 0', async () => {
+    // Regression: Number(null) === 0 used to silently lower enforce
+    // threshold to zero and merge everything non-negative.
+    await withConsoleStub('warn', async (warns) => {
+      const api = createInsights({
+        pool: makeDedupPool(), schema: '"aq"', defaultTenantId: 'default', embedFn: async () => [[0.1]],
+        dedup: { mode: 'enforce', cosineThreshold: null },
+      });
+      assert.equal(api._internal.dedup.cosineThreshold, 0.88);
+      assert.ok(warns.some(args => String(args[0]).includes('invalid cosineThreshold')));
+    });
+  });
+
+  it('close band 0.86', async () => {
+    const longBody = 'Body   with    extra spacing '.repeat(20);
+    const inserted = makeInsertedRow({
+      dedupNear: {
+        candidateId: 42,
+        cosine: 0.86,
+        threshold: 0.88,
+        closeBandFrom: 0.85,
+        candidateTitle: 'Candidate title',
+        candidateBody: normalizeBody(longBody).slice(0, 200),
+      },
+    }, 55);
+    const pool = makeDedupPool([
+      { rowCount: 0, rows: [] },
+      { rowCount: 0, rows: [] },
+      { rowCount: 1, rows: [makeCandidateRow({ cos_sim: 0.86, body: longBody })] },
+      { rowCount: 1, rows: [inserted] },
+    ]);
+    const api = createInsights({
+      pool,
+      schema: '"aq"',
+      defaultTenantId: 'default',
+      dedup: { mode: 'enforce', cosineThreshold: 0.88, closeBandFrom: 0.85 },
+      embedFn: async () => [[0.1, 0.2]],
+    });
+    const r = await api.commitInsight(baseInput);
+    assert.equal(r.ok, true);
+    assert.ok(r.data.insight.metadata.dedupNear);
+    assert.equal(r.data.insight.metadata.dedupVia, undefined);
+    assert.equal(pool.queries.filter(q => /status = 'superseded'/.test(q.sql)).length, 0);
+    assert.equal(r.data.insight.metadata.dedupNear.candidateBody.length <= 200, true);
+  });
+
+  it('embed throw', async () => {
+    const inserted = makeInsertedRow({ dedupSkipped: 'embed_failed' }, 66);
+    const pool = makeDedupPool([
+      { rowCount: 0, rows: [] },
+      { rowCount: 0, rows: [] },
+      { rowCount: 1, rows: [inserted] },
+    ]);
+    const api = createInsights({
+      pool, schema: '"aq"', defaultTenantId: 'default', dedup: { mode: 'enforce' }, embedFn: async () => { throw new Error('fail'); },
+    });
+    const r = await api.commitInsight(baseInput);
+    assert.equal(r.ok, true);
+    assert.equal(r.data.insight.metadata.dedupSkipped, 'embed_failed');
+    assert.equal(pool.queries.some(q => /embedding <=>/.test(q.sql)), false);
+    assert.equal(pool.queries.filter(q => /status = 'superseded'/.test(q.sql)).length, 0);
+  });
+
+  it('no candidate', async () => {
+    const inserted = makeInsertedRow({}, 88);
+    const pool = makeDedupPool([
+      { rowCount: 0, rows: [] },
+      { rowCount: 0, rows: [] },
+      { rowCount: 0, rows: [] },
+      { rowCount: 1, rows: [inserted] },
+    ]);
+    const api = createInsights({
+      pool, schema: '"aq"', defaultTenantId: 'default', dedup: { mode: 'enforce' }, embedFn: async () => [[0.1, 0.2]],
+    });
+    const r = await api.commitInsight(baseInput);
+    assert.equal(r.ok, true);
+    assert.equal(r.data.insight.metadata.dedupSkipped, undefined);
+    assert.equal(r.data.insight.metadata.dedupVia, undefined);
+    assert.ok(pool.queries.some(q => /embedding <=>/.test(q.sql)));
+  });
+});

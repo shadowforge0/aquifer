@@ -85,4 +85,79 @@ describe('config.loadConfig', () => {
     const config = loadConfig({ env: {} });
     assert.equal(config.entities.scope, 'default');
   });
+
+  it('sets insights.dedup defaults', () => {
+    const config = loadConfig({ env: {}, cwd: '/nonexistent' });
+    assert.equal(config.insights.dedup.mode, 'off');
+    assert.equal(config.insights.dedup.cosineThreshold, 0.88);
+    assert.equal(config.insights.dedup.closeBandFrom, 0.85);
+  });
+
+  it('reads AQUIFER_INSIGHTS_DEDUP_MODE from env', () => {
+    const config = loadConfig({ env: { AQUIFER_INSIGHTS_DEDUP_MODE: 'shadow' } });
+    assert.equal(config.insights.dedup.mode, 'shadow');
+  });
+
+  it('reads AQUIFER_INSIGHTS_DEDUP_COSINE from env', () => {
+    const config = loadConfig({ env: { AQUIFER_INSIGHTS_DEDUP_COSINE: '0.92' } });
+    assert.equal(config.insights.dedup.cosineThreshold, 0.92);
+  });
+
+  it('reads AQUIFER_INSIGHTS_DEDUP_CLOSE_BAND_FROM from env', () => {
+    const config = loadConfig({ env: { AQUIFER_INSIGHTS_DEDUP_CLOSE_BAND_FROM: '0.80' } });
+    assert.equal(config.insights.dedup.closeBandFrom, 0.8);
+  });
+
+  it('treats empty AQUIFER_INSIGHTS_DEDUP_MODE as unset', () => {
+    const config = loadConfig({ env: { AQUIFER_INSIGHTS_DEDUP_MODE: '' } });
+    assert.equal(config.insights.dedup.mode, 'off');
+  });
+
+  it('programmatic insights.dedup.mode override wins over env', () => {
+    const config = loadConfig({
+      env: { AQUIFER_INSIGHTS_DEDUP_MODE: 'off' },
+      overrides: { insights: { dedup: { mode: 'enforce' } } },
+    });
+    assert.equal(config.insights.dedup.mode, 'enforce');
+  });
+
+  it('normalizes insights.dedup shorthand true', () => {
+    const config = loadConfig({
+      env: {},
+      overrides: { insights: { dedup: true } },
+    });
+    assert.deepEqual(config.insights.dedup, {
+      mode: 'enforce',
+      cosineThreshold: 0.88,
+      closeBandFrom: 0.85,
+    });
+  });
+
+  it('normalizes insights.dedup shorthand false', () => {
+    const config = loadConfig({
+      env: {},
+      overrides: { insights: { dedup: false } },
+    });
+    assert.deepEqual(config.insights.dedup, {
+      mode: 'off',
+      cosineThreshold: 0.88,
+      closeBandFrom: 0.85,
+    });
+  });
+
+  it('deep merges partial insights.dedup override', () => {
+    const config = loadConfig({
+      env: {},
+      overrides: { insights: { dedup: { mode: 'shadow' } } },
+    });
+    assert.equal(config.insights.dedup.mode, 'shadow');
+    assert.equal(config.insights.dedup.cosineThreshold, 0.88);
+    assert.equal(config.insights.dedup.closeBandFrom, 0.85);
+  });
+
+  it('preserves null insights recall defaults', () => {
+    const config = loadConfig({ env: {} });
+    assert.equal(config.insights.recallWeights, null);
+    assert.equal(config.insights.recencyWindowDays, null);
+  });
 });
