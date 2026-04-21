@@ -32,8 +32,8 @@ function getAquifer() {
 
 const { formatRecallResults } = require('./shared/recall-format');
 
-function formatResults(results, query) {
-  return formatRecallResults(results, { query, showScore: true });
+function formatResults(results, query, explain) {
+  return formatRecallResults(results, { query, showScore: true, showExplain: !!explain });
 }
 
 // ---------------------------------------------------------------------------
@@ -74,6 +74,7 @@ async function main() {
       entities: z.array(z.string()).optional().describe('Entity names to match'),
       entityMode: z.enum(['any', 'all']).optional().describe('"any" (default, boost) or "all" (only sessions with every entity)'),
       mode: z.enum(['fts', 'hybrid', 'vector']).optional().describe('Recall mode: "fts" (keyword only, no embed needed), "hybrid" (default, FTS + vector), "vector" (vector only)'),
+      explain: z.boolean().optional().describe('Include per-result score breakdown (diagnostic)'),
     },
     async (params) => {
       try {
@@ -93,7 +94,7 @@ async function main() {
         if (params.mode) recallOpts.mode = params.mode;
 
         const results = await aquifer.recall(params.query, recallOpts);
-        const text = formatResults(results, params.query);
+        const text = formatResults(results, params.query, params.explain);
         return { content: [{ type: 'text', text }] };
       } catch (err) {
         return {
@@ -106,7 +107,7 @@ async function main() {
 
   server.tool(
     'session_feedback',
-    'Record trust feedback on a recalled session. Helpful sessions rank higher in future recalls.',
+    'After using session_recall, mark the result helpful if it directly informed your answer, or unhelpful if it was irrelevant/outdated. Include a short note. Sessions with more helpful feedback rank higher in future recalls.',
     {
       sessionId: z.string().min(1).describe('Session ID to give feedback on'),
       verdict: z.enum(['helpful', 'unhelpful']).describe('Was the recalled session useful?'),
@@ -127,6 +128,37 @@ async function main() {
       } catch (err) {
         return {
           content: [{ type: 'text', text: `session_feedback error: ${err.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    'feedback_stats',
+    'Return trust feedback statistics: total feedback count, helpful/unhelpful breakdown, trust score distribution, and coverage.',
+    {
+      agentId: z.string().optional().describe('Filter by agent ID'),
+      dateFrom: z.string().optional().describe('Start date YYYY-MM-DD'),
+      dateTo: z.string().optional().describe('End date YYYY-MM-DD'),
+    },
+    async (params) => {
+      try {
+        const aquifer = getAquifer();
+        const stats = await aquifer.feedbackStats({
+          agentId: params.agentId || undefined,
+          dateFrom: params.dateFrom || undefined,
+          dateTo: params.dateTo || undefined,
+        });
+        const lines = [
+          `Feedback: ${stats.totalFeedback} total (${stats.helpfulCount} helpful, ${stats.unhelpfulCount} unhelpful)`,
+          `Coverage: ${stats.feedbackSessions}/${stats.totalSessions} sessions rated`,
+          `Trust score: avg=${stats.trustScoreAvg} min=${stats.trustScoreMin} max=${stats.trustScoreMax}`,
+        ];
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+      } catch (err) {
+        return {
+          content: [{ type: 'text', text: `feedback_stats error: ${err.message}` }],
           isError: true,
         };
       }

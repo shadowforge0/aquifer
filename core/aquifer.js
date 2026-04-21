@@ -1558,6 +1558,17 @@ function createAquifer(config = {}) {
       });
     },
 
+    async feedbackStats(opts = {}) {
+      await ensureMigrated();
+      return storage.getFeedbackStats(pool, {
+        schema,
+        tenantId,
+        agentId: opts.agentId || undefined,
+        dateFrom: opts.dateFrom || undefined,
+        dateTo: opts.dateTo || undefined,
+      });
+    },
+
     // --- admin ---
 
     async getSession(sessionId, opts = {}) {

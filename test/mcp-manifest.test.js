@@ -20,7 +20,7 @@ describe('MCP_TOOL_MANIFEST', () => {
                        'memory_pending', 'session_bootstrap']) {
       assert.ok(names.includes(req), `missing tool ${req}`);
     }
-    assert.equal(names.length, 5);
+    assert.equal(names.length, 6);
   });
 
   it('every tool has name + description + inputSchema', () => {
@@ -51,7 +51,7 @@ describe('getMcpManifest', () => {
   it('returns envelope with serverName + tools + generatedAt', () => {
     const m = getMcpManifest();
     assert.equal(m.serverName, MCP_SERVER_NAME);
-    assert.equal(m.tools.length, 5);
+    assert.equal(m.tools.length, 6);
     assert.equal(m.manifestVersion, 1);
     assert.ok(m.generatedAt.match(/^\d{4}-\d{2}-\d{2}T/));
   });
@@ -77,7 +77,7 @@ describe('writeMcpManifestFile', () => {
     assert.ok(fs.existsSync(outFile));
     const parsed = JSON.parse(fs.readFileSync(outFile, 'utf8'));
     assert.equal(parsed.serverName, MCP_SERVER_NAME);
-    assert.equal(parsed.tools.length, 5);
+    assert.equal(parsed.tools.length, 6);
   });
 
   it('creates parent directory if missing', () => {

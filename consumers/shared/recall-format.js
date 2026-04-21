@@ -66,6 +66,30 @@ const defaultRenderers = {
         if (!showScore) return null;
         return `Score: ${typeof result.score === 'number' ? result.score.toFixed(3) : '?'}`;
     },
+    explain(result, { showExplain }) {
+        if (!showExplain) return null;
+        const d = result._debug;
+        if (!d) return null;
+        const f = (v) => typeof v === 'number' ? v.toFixed(3) : '?';
+        const parts = [
+            `rrf=${f(d.rrf)}`,
+            `td=${f(d.timeDecay)}`,
+            `access=${f(d.access)}`,
+            `entity=${f(d.entityScore)}`,
+            `trust=${f(d.trustScore)}(\u00d7${f(d.trustMultiplier)})`,
+            `ol=${f(d.openLoopBoost)}`,
+            `\u2192 hybrid=${f(d.hybridScore)}`,
+        ];
+        if (d.rerankApplied) {
+            parts.push(`rerank=${f(d.rerankScore)}(${d.rerankReason || '?'})`);
+        } else {
+            parts.push(`[rerank: off (${d.rerankReason || '?'})]`);
+        }
+        if (Array.isArray(d.searchErrors) && d.searchErrors.length > 0) {
+            parts.push(`errors: ${d.searchErrors.map(e => (e && e.path) || '?').join(',')}`);
+        }
+        return `  ${parts.join(' ')}`;
+    },
     separator() {
         return '';
     },
@@ -102,6 +126,8 @@ function createRecallFormatter(overrides = {}) {
             if (matched) lines.push(matched);
             const score = r.score(res, { showScore: !!opts.showScore, ...ctx });
             if (score) lines.push(score);
+            const explain = r.explain(res, { showExplain: !!opts.showExplain, ...ctx });
+            if (explain) lines.push(explain);
             const sep = r.separator(i, ctx);
             if (sep !== null && sep !== undefined) lines.push(sep);
         }

@@ -46,13 +46,17 @@ const MCP_TOOL_MANIFEST = Object.freeze([
           enum: ['fts', 'hybrid', 'vector'],
           description: 'Recall mode: "fts" (keyword only, no embed needed), "hybrid" (default, FTS + vector), "vector" (vector only)',
         },
+        explain: {
+          type: 'boolean',
+          description: 'Include per-result score breakdown (rrf, timeDecay, entity, trust, rerank). Diagnostic use only.',
+        },
       },
       required: ['query'],
     },
   },
   {
     name: 'session_feedback',
-    description: 'Record trust feedback on a recalled session. Helpful sessions rank higher in future recalls.',
+    description: 'After using session_recall, mark the result helpful if it directly informed your answer, or unhelpful if it was irrelevant/outdated. Include a short note. Sessions with more helpful feedback rank higher in future recalls.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -82,6 +86,19 @@ const MCP_TOOL_MANIFEST = Object.freeze([
       additionalProperties: false,
       properties: {
         limit: { type: 'integer', minimum: 1, maximum: 200, description: 'Max results (default 20)' },
+      },
+    },
+  },
+  {
+    name: 'feedback_stats',
+    description: 'Return trust feedback statistics: total feedback count, helpful/unhelpful breakdown, trust score distribution, and coverage (how many sessions have been rated).',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        agentId: { type: 'string', description: 'Filter by agent ID' },
+        dateFrom: { type: 'string', description: 'Start date YYYY-MM-DD for feedback window' },
+        dateTo: { type: 'string', description: 'End date YYYY-MM-DD for feedback window' },
       },
     },
   },

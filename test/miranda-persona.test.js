@@ -218,3 +218,21 @@ describe('mountOnOpenClaw — hook registration', () => {
         assert.equal(toolFactory({ sessionKey: 'main:subagent:xyz' }), null);
     });
 });
+
+describe('context-inject feedback guidance', () => {
+    it('buildSessionContext includes session_feedback guidance', () => {
+        const { buildSessionContext } = require('../consumers/miranda/context-inject');
+        const ctx = buildSessionContext({
+            today: '2026-04-21',
+            agentId: 'main',
+            focusText: 'some focus',
+            todoItems: [],
+            moodLine: '',
+            handoffText: '',
+            cliEntries: [],
+        });
+        assert.ok(ctx.includes('session_feedback'), 'should mention session_feedback tool');
+        assert.ok(ctx.includes('helpful'), 'should mention helpful verdict');
+        assert.ok(ctx.includes('unhelpful'), 'should mention unhelpful verdict');
+    });
+});

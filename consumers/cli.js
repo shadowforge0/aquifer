@@ -99,6 +99,7 @@ async function cmdRecall(aquifer, args) {
     return;
   }
 
+  const showExplain = !!args.flags.explain;
   for (let i = 0; i < results.length; i++) {
     const r = results[i];
     const ss = r.structuredSummary || {};
@@ -107,6 +108,18 @@ async function cmdRecall(aquifer, args) {
     console.log(`${i + 1}. [${r.score?.toFixed(3)}] ${title} (${date}, ${r.agentId})`);
     if (ss.overview) console.log(`   ${ss.overview.slice(0, 200)}`);
     if (r.matchedTurnText) console.log(`   > ${r.matchedTurnText.slice(0, 150)}`);
+    if (showExplain && r._debug) {
+      const d = r._debug;
+      const f = (v) => typeof v === 'number' ? v.toFixed(3) : '?';
+      const parts = [
+        `rrf=${f(d.rrf)}`, `td=${f(d.timeDecay)}`, `access=${f(d.access)}`,
+        `entity=${f(d.entityScore)}`, `trust=${f(d.trustScore)}(\u00d7${f(d.trustMultiplier)})`,
+        `ol=${f(d.openLoopBoost)}`, `\u2192 hybrid=${f(d.hybridScore)}`,
+      ];
+      if (d.rerankApplied) parts.push(`rerank=${f(d.rerankScore)}(${d.rerankReason || '?'})`);
+      else parts.push(`[rerank: off (${d.rerankReason || '?'})]`);
+      console.log(`   ${parts.join(' ')}`);
+    }
     console.log();
   }
 }
@@ -130,6 +143,22 @@ async function cmdFeedback(aquifer, args) {
     console.log(JSON.stringify(result, null, 2));
   } else {
     console.log(`Feedback: ${result.verdict} (trust ${result.trustBefore.toFixed(2)} → ${result.trustAfter.toFixed(2)})`);
+  }
+}
+
+async function cmdFeedbackStats(aquifer, args) {
+  const stats = await aquifer.feedbackStats({
+    agentId: args.flags['agent-id'] || undefined,
+    dateFrom: args.flags['date-from'] || undefined,
+    dateTo: args.flags['date-to'] || undefined,
+  });
+
+  if (args.flags.json) {
+    console.log(JSON.stringify(stats, null, 2));
+  } else {
+    console.log(`Feedback: ${stats.totalFeedback} total (${stats.helpfulCount} helpful, ${stats.unhelpfulCount} unhelpful)`);
+    console.log(`Coverage: ${stats.feedbackSessions}/${stats.totalSessions} sessions rated`);
+    console.log(`Trust score: avg=${stats.trustScoreAvg} min=${stats.trustScoreMin} max=${stats.trustScoreMax}`);
   }
 }
 
@@ -318,6 +347,7 @@ Commands:
   migrate                     Run database migrations
   recall <query>              Search sessions (requires embed config)
   feedback                    Record trust feedback on a session
+  feedback-stats              Show trust feedback statistics and coverage
   backfill                    Enrich pending sessions
   stats                       Show database statistics
   export                      Export sessions as JSONL
@@ -336,6 +366,7 @@ Options:
   --session-id ID             Session ID (feedback)
   --verdict helpful|unhelpful Feedback verdict (feedback)
   --note TEXT                 Feedback note (feedback)
+  --explain                    Show score breakdown per result (recall)
   --json                      JSON output
   --dry-run                   Preview only (backfill)
   --output PATH               Output file (export)
@@ -409,6 +440,9 @@ Options:
         break;
       case 'feedback':
         await cmdFeedback(aquifer, args);
+        break;
+      case 'feedback-stats':
+        await cmdFeedbackStats(aquifer, args);
         break;
       case 'backfill':
         await cmdBackfill(aquifer, args);

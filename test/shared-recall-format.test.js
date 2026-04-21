@@ -190,3 +190,63 @@ describe('createRecallFormatter — overrides', () => {
         assert.ok(out.includes('Cron audit'));
     });
 });
+
+describe('explain renderer', () => {
+    const resultWithDebug = {
+        ...sampleResult,
+        _debug: {
+            rrf: 0.823,
+            timeDecay: 0.714,
+            access: 0.12,
+            entityScore: 0.45,
+            trustScore: 0.55,
+            trustMultiplier: 1.05,
+            openLoopBoost: 0,
+            hybridScore: 0.682,
+            rerankScore: null,
+            rerankApplied: false,
+            rerankReason: 'no_provider_configured',
+            rerankFallback: false,
+            searchErrors: [],
+        },
+    };
+
+    it('showExplain=false omits breakdown', () => {
+        const out = formatRecallResults([resultWithDebug], { showScore: true, showExplain: false });
+        assert.ok(!out.includes('rrf='));
+    });
+
+    it('showExplain=true includes breakdown line', () => {
+        const out = formatRecallResults([resultWithDebug], { showScore: true, showExplain: true });
+        assert.ok(out.includes('rrf=0.823'));
+        assert.ok(out.includes('td=0.714'));
+        assert.ok(out.includes('entity=0.450'));
+        assert.ok(out.includes('trust=0.550'));
+        assert.ok(out.includes('hybrid=0.682'));
+        assert.ok(out.includes('[rerank: off'));
+    });
+
+    it('showExplain=true with rerank applied shows rerank score', () => {
+        const rerankResult = {
+            ...resultWithDebug,
+            _debug: { ...resultWithDebug._debug, rerankApplied: true, rerankScore: 0.91, rerankReason: 'forced' },
+        };
+        const out = formatRecallResults([rerankResult], { showScore: true, showExplain: true });
+        assert.ok(out.includes('rerank=0.910(forced)'));
+        assert.ok(!out.includes('[rerank: off'));
+    });
+
+    it('showExplain=true with search errors shows error paths', () => {
+        const errResult = {
+            ...resultWithDebug,
+            _debug: { ...resultWithDebug._debug, searchErrors: [{ path: 'fts', message: 'timeout' }] },
+        };
+        const out = formatRecallResults([errResult], { showScore: true, showExplain: true });
+        assert.ok(out.includes('errors: fts'));
+    });
+
+    it('no _debug object gracefully returns null', () => {
+        const out = formatRecallResults([sampleResult], { showScore: true, showExplain: true });
+        assert.ok(!out.includes('rrf='));
+    });
+});

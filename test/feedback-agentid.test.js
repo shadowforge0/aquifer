@@ -281,3 +281,64 @@ describe('openclaw-plugin consumer session_feedback — agentId resolution', () 
     assert.strictEqual(capturedOpts.agentId, undefined, 'undefined when no agentId');
   });
 });
+
+// ---------------------------------------------------------------------------
+// 4. getFeedbackStats — aggregate query
+// ---------------------------------------------------------------------------
+
+describe('getFeedbackStats', () => {
+  const { getFeedbackStats } = require('../core/storage');
+
+  it('returns zeroed stats when both tables are empty', async () => {
+    const pool = {
+      async query(sql) {
+        if (sql.includes('session_feedback')) {
+          return { rows: [{ total: 0, helpful: 0, unhelpful: 0, rated_sessions: 0 }] };
+        }
+        return { rows: [{ total_sessions: 0, avg_ts: null, min_ts: null, max_ts: null }] };
+      },
+    };
+    const stats = await getFeedbackStats(pool, { schema: '"test"', tenantId: 'default' });
+    assert.strictEqual(stats.totalFeedback, 0);
+    assert.strictEqual(stats.helpfulCount, 0);
+    assert.strictEqual(stats.unhelpfulCount, 0);
+    assert.strictEqual(stats.feedbackSessions, 0);
+    assert.strictEqual(stats.totalSessions, 0);
+    assert.strictEqual(stats.trustScoreAvg, 0.5);
+  });
+
+  it('preserves trust_score=0 without defaulting to 0.5', async () => {
+    const pool = {
+      async query(sql) {
+        if (sql.includes('session_feedback')) {
+          return { rows: [{ total: 5, helpful: 0, unhelpful: 5, rated_sessions: 3 }] };
+        }
+        return { rows: [{ total_sessions: 10, avg_ts: '0.000', min_ts: 0, max_ts: 0.3 }] };
+      },
+    };
+    const stats = await getFeedbackStats(pool, { schema: '"test"', tenantId: 'default' });
+    assert.strictEqual(stats.trustScoreAvg, 0);
+    assert.strictEqual(stats.trustScoreMin, 0);
+    assert.strictEqual(stats.trustScoreMax, 0.3);
+  });
+
+  it('returns correct counts with feedback data', async () => {
+    const pool = {
+      async query(sql) {
+        if (sql.includes('session_feedback')) {
+          return { rows: [{ total: 10, helpful: 7, unhelpful: 3, rated_sessions: 5 }] };
+        }
+        return { rows: [{ total_sessions: 20, avg_ts: '0.600', min_ts: 0.4, max_ts: 0.8 }] };
+      },
+    };
+    const stats = await getFeedbackStats(pool, { schema: '"test"', tenantId: 'default', agentId: 'main' });
+    assert.strictEqual(stats.totalFeedback, 10);
+    assert.strictEqual(stats.helpfulCount, 7);
+    assert.strictEqual(stats.unhelpfulCount, 3);
+    assert.strictEqual(stats.feedbackSessions, 5);
+    assert.strictEqual(stats.totalSessions, 20);
+    assert.strictEqual(stats.trustScoreAvg, 0.6);
+    assert.strictEqual(stats.trustScoreMin, 0.4);
+    assert.strictEqual(stats.trustScoreMax, 0.8);
+  });
+});

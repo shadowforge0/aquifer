@@ -214,6 +214,7 @@ function register(api) {
             entities: { type: 'array', items: { type: 'string' }, description: 'Entity names to match' },
             entityMode: { type: 'string', enum: ['any', 'all'], description: '"any" (default, boost) or "all" (only sessions with every entity)' },
             mode: { type: 'string', enum: ['fts', 'hybrid', 'vector'], description: 'Recall mode: "fts" (keyword only), "hybrid" (default), "vector" (vector only)' },
+            explain: { type: 'boolean', description: 'Include per-result score breakdown (diagnostic)' },
           },
           required: ['query'],
         },
@@ -234,7 +235,7 @@ function register(api) {
             if (params.mode) recallOpts.mode = params.mode;
 
             const results = await aquifer.recall(params.query, recallOpts);
-            const text = formatRecallResults(results);
+            const text = formatRecallResults(results, { showScore: true, showExplain: !!params.explain });
             return { content: [{ type: 'text', text }] };
           } catch (err) {
             return {
@@ -253,7 +254,7 @@ function register(api) {
 
       return {
         name: 'session_feedback',
-        description: 'Record trust feedback on a recalled session. Helpful sessions rank higher in future recalls.',
+        description: 'After using session_recall, mark the result helpful if it directly informed your answer, or unhelpful if it was irrelevant/outdated. Include a short note. Sessions with more helpful feedback rank higher in future recalls.',
         parameters: {
           type: 'object',
           properties: {
@@ -285,5 +286,44 @@ function register(api) {
       };
     }, { name: 'session_feedback' });
 
-  api.logger.info('[aquifer-memory] registered (before_reset + session_recall + session_feedback)');
+    // --- feedback_stats tool ---
+
+    api.registerTool((ctx) => {
+      if ((ctx?.sessionKey || '').includes('subagent')) return null;
+
+      return {
+        name: 'feedback_stats',
+        description: 'Return trust feedback statistics: total feedback count, helpful/unhelpful breakdown, trust score distribution, and coverage.',
+        parameters: {
+          type: 'object',
+          properties: {
+            agentId: { type: 'string', description: 'Filter by agent ID' },
+            dateFrom: { type: 'string', description: 'Start date YYYY-MM-DD' },
+            dateTo: { type: 'string', description: 'End date YYYY-MM-DD' },
+          },
+        },
+        async execute(_toolCallId, params) {
+          try {
+            const stats = await aquifer.feedbackStats({
+              agentId: params.agentId || undefined,
+              dateFrom: params.dateFrom || undefined,
+              dateTo: params.dateTo || undefined,
+            });
+            const lines = [
+              `Feedback: ${stats.totalFeedback} total (${stats.helpfulCount} helpful, ${stats.unhelpfulCount} unhelpful)`,
+              `Coverage: ${stats.feedbackSessions}/${stats.totalSessions} sessions rated`,
+              `Trust score: avg=${stats.trustScoreAvg} min=${stats.trustScoreMin} max=${stats.trustScoreMax}`,
+            ];
+            return { content: [{ type: 'text', text: lines.join('\n') }] };
+          } catch (err) {
+            return {
+              content: [{ type: 'text', text: `feedback_stats error: ${err.message}` }],
+              isError: true,
+            };
+          }
+        },
+      };
+    }, { name: 'feedback_stats' });
+
+  api.logger.info('[aquifer-memory] registered (before_reset + session_recall + session_feedback + feedback_stats)');
 }

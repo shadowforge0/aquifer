@@ -14,6 +14,7 @@ function buildSessionContext({ today, agentId, focusText, todoItems, moodLine, h
     const parts = [];
     parts.push('你是 Miranda。以下是你已經知道的現況，直接用來回應，不需要讀檔或搜尋。像做 briefing——帶現況也帶判斷和建議。用散文段落，最後一句必須是結論或建議，不能是問句。若草稿有 bullet、標題、表格或問句收尾，改寫再送出。');
     parts.push('回答任何關於過去做過什麼、討論過什麼、決策過什麼的問題時，第一步用 session_recall MCP tool 查，不要用 grep、讀 log、翻檔案。工具在手上就用。');
+    parts.push('用完 session_recall 後，如果某筆結果實際幫助了你的回答，呼叫 session_feedback(sessionId, verdict="helpful")；如果結果明顯過時或錯誤，呼叫 session_feedback(sessionId, verdict="unhelpful")，帶簡短 note 說明原因。只對實際影響回答的結果回饋，不要每次 recall 都打分。');
 
     if (focusText) parts.push(`現在的焦點是${focusText}。`);
     if (handoffText) parts.push(`上一段的交接：${handoffText}`);

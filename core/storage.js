@@ -667,6 +667,71 @@ async function recordFeedback(pool, {
 }
 
 // ---------------------------------------------------------------------------
+// getFeedbackStats — aggregate feedback and trust score metrics
+// ---------------------------------------------------------------------------
+
+async function getFeedbackStats(pool, { schema, tenantId, agentId, dateFrom, dateTo }) {
+  const params = [tenantId];
+  let agentClause = '';
+  if (agentId) {
+    params.push(agentId);
+    agentClause = `AND sf.agent_id = $${params.length}`;
+  }
+  let dateClause = '';
+  if (dateFrom) {
+    params.push(dateFrom);
+    dateClause += ` AND sf.created_at >= $${params.length}::date`;
+  }
+  if (dateTo) {
+    params.push(dateTo);
+    dateClause += ` AND sf.created_at < ($${params.length}::date + interval '1 day')`;
+  }
+
+  const fbQuery = `
+    SELECT
+      COUNT(*)::int AS total,
+      COUNT(*) FILTER (WHERE sf.verdict = 'helpful')::int AS helpful,
+      COUNT(*) FILTER (WHERE sf.verdict = 'unhelpful')::int AS unhelpful,
+      COUNT(DISTINCT sf.session_row_id)::int AS rated_sessions
+    FROM ${qi(schema)}.session_feedback sf
+    WHERE sf.tenant_id = $1 ${agentClause} ${dateClause}`;
+
+  const ssParams = [tenantId];
+  let ssAgentClause = '';
+  if (agentId) {
+    ssParams.push(agentId);
+    ssAgentClause = `AND ss.agent_id = $${ssParams.length}`;
+  }
+  const ssQuery = `
+    SELECT
+      COUNT(*)::int AS total_sessions,
+      ROUND(AVG(ss.trust_score)::numeric, 3) AS avg_ts,
+      MIN(ss.trust_score) AS min_ts,
+      MAX(ss.trust_score) AS max_ts
+    FROM ${qi(schema)}.session_summaries ss
+    WHERE ss.tenant_id = $1 ${ssAgentClause}`;
+
+  const [fbResult, ssResult] = await Promise.all([
+    pool.query(fbQuery, params),
+    pool.query(ssQuery, ssParams),
+  ]);
+
+  const fb = fbResult.rows[0];
+  const ss = ssResult.rows[0];
+
+  return {
+    totalFeedback: fb.total,
+    helpfulCount: fb.helpful,
+    unhelpfulCount: fb.unhelpful,
+    feedbackSessions: fb.rated_sessions,
+    totalSessions: ss.total_sessions,
+    trustScoreAvg: (ss.avg_ts !== null && ss.avg_ts !== undefined) ? parseFloat(ss.avg_ts) : 0.5,
+    trustScoreMin: (ss.min_ts !== null && ss.min_ts !== undefined) ? parseFloat(ss.min_ts) : 0.5,
+    trustScoreMax: (ss.max_ts !== null && ss.max_ts !== undefined) ? parseFloat(ss.max_ts) : 0.5,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Exports
 // ---------------------------------------------------------------------------
 
@@ -683,4 +748,5 @@ module.exports = {
   searchTurnEmbeddings,
   searchSummaryEmbeddings,
   recordFeedback,
+  getFeedbackStats,
 };
