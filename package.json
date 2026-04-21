@@ -24,7 +24,7 @@
     "scripts/smoke.mjs"
   ],
   "bin": {
-    "aquifer": "./consumers/cli.js"
+    "aquifer": "consumers/cli.js"
   },
   "exports": {
     ".": "./index.js",
