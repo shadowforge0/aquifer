@@ -14,7 +14,7 @@ const {
 const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aq-mcp-'));
 
 describe('MCP_TOOL_MANIFEST', () => {
-  it('declares all 5 canonical tools', () => {
+  it('declares all 6 canonical tools', () => {
     const names = MCP_TOOL_MANIFEST.map(t => t.name);
     for (const req of ['session_recall', 'session_feedback', 'memory_stats',
                        'memory_pending', 'session_bootstrap']) {

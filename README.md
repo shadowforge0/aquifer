@@ -159,7 +159,7 @@ The script is idempotent (`WHERE canonical_key_v2 IS NULL` guard) and race-safe 
 
 ## Host Integration
 
-MCP is the primary integration surface. Agent hosts connect to the Aquifer MCP server, which exposes five tools: `session_recall`, `session_feedback`, `session_bootstrap`, `memory_stats`, `memory_pending`.
+MCP is the primary integration surface. Agent hosts connect to the Aquifer MCP server, which exposes six tools: `session_recall`, `session_feedback`, `feedback_stats`, `session_bootstrap`, `memory_stats`, `memory_pending`.
 
 | Integration | Route | Status | When to use |
 |-------------|-------|--------|-------------|
@@ -214,7 +214,7 @@ Add to `openclaw.json` under `mcp.servers`:
 }
 ```
 
-Tools materialize as `aquifer__session_recall`, `aquifer__session_feedback`, `aquifer__session_bootstrap`, `aquifer__memory_stats`, `aquifer__memory_pending` (server name prefix added by the host).
+Tools materialize as `aquifer__session_recall`, `aquifer__session_feedback`, `aquifer__feedback_stats`, `aquifer__session_bootstrap`, `aquifer__memory_stats`, `aquifer__memory_pending` (server name prefix added by the host).
 
 The OpenClaw plugin (`consumers/openclaw-plugin.js`) is retained for session capture via `before_reset` but is **not** the recommended tool delivery path. Use MCP.
 

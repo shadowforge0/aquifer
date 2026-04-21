@@ -341,4 +341,35 @@ describe('getFeedbackStats', () => {
     assert.strictEqual(stats.trustScoreMin, 0.4);
     assert.strictEqual(stats.trustScoreMax, 0.8);
   });
+
+  it('uses the same session window for feedback and trust aggregates', async () => {
+    const calls = [];
+    const pool = {
+      async query(sql, params) {
+        calls.push({ sql, params });
+        if (sql.includes('session_feedback')) {
+          return { rows: [{ total: 2, helpful: 1, unhelpful: 1, rated_sessions: 2 }] };
+        }
+        return { rows: [{ total_sessions: 4, avg_ts: '0.550', min_ts: 0.2, max_ts: 0.9 }] };
+      },
+    };
+
+    const stats = await getFeedbackStats(pool, {
+      schema: '"test"',
+      tenantId: 'default',
+      agentId: 'main',
+      dateFrom: '2026-04-01',
+      dateTo: '2026-04-30',
+    });
+
+    assert.strictEqual(stats.totalFeedback, 2);
+    assert.strictEqual(stats.totalSessions, 4);
+    assert.equal(calls.length, 2);
+    assert.deepEqual(calls[0].params, ['default', 'main', '2026-04-01', '2026-04-30']);
+    assert.deepEqual(calls[1].params, ['default', 'main', '2026-04-01', '2026-04-30']);
+    assert.match(calls[0].sql, /FROM .*sessions s/);
+    assert.match(calls[1].sql, /FROM .*sessions s/);
+    assert.match(calls[0].sql, /s\.started_at >= \$3::date/);
+    assert.match(calls[1].sql, /s\.started_at >= \$3::date/);
+  });
 });

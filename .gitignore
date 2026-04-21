@@ -6,3 +6,16 @@ package-lock.json
 HANDOFF_*.md
 bench-report-*.json
 bench-report-*.md
+
+# Local bench outputs / real-session datasets
+bench/time-decay-report.json
+bench/time-decay-report.md
+bench/time-decay-queries.json
+bench/time-decay-judgements.template.json
+
+# Local bench / research helpers
+bench/README-time-decay.md
+bench/time-decay-sweep.js
+scripts/queries.json
+scripts/retro-recall-bench.js
+scripts/sample-bench-queries.sql

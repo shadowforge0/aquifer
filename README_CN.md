@@ -174,7 +174,7 @@ const results = await aquifer.recall('auth middleware 决定', {
 
 ## 宿主集成
 
-MCP 是主要的集成接口。Agent 宿主连接到 Aquifer MCP server，该 server 暴露五个工具：`session_recall`、`session_feedback`、`session_bootstrap`、`memory_stats`、`memory_pending`。
+MCP 是主要的集成接口。Agent 宿主连接到 Aquifer MCP server，该 server 暴露六个工具：`session_recall`、`session_feedback`、`feedback_stats`、`session_bootstrap`、`memory_stats`、`memory_pending`。
 
 | 集成方式 | 路径 | 状态 | 使用场景 |
 |----------|------|------|----------|
@@ -229,7 +229,7 @@ MCP 是主要的集成接口。Agent 宿主连接到 Aquifer MCP server，该 se
 }
 ```
 
-工具显示为 `aquifer__session_recall`、`aquifer__session_feedback`、`aquifer__memory_stats`、`aquifer__memory_pending`（宿主自动添加 server 名称前缀）。
+工具显示为 `aquifer__session_recall`、`aquifer__session_feedback`、`aquifer__feedback_stats`、`aquifer__session_bootstrap`、`aquifer__memory_stats`、`aquifer__memory_pending`（宿主自动添加 server 名称前缀）。
 
 OpenClaw 插件（`consumers/openclaw-plugin.js`）保留用于通过 `before_reset` 捕获 session，但**不是**推荐的工具分发路径。请使用 MCP。
 

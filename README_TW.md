@@ -174,7 +174,7 @@ const results = await aquifer.recall('auth middleware 決定', {
 
 ## 主機整合（Host Integration）
 
-MCP 是主要的整合介面。Agent 主機連接 Aquifer MCP 伺服器，伺服器提供五個工具：`session_recall`、`session_feedback`、`session_bootstrap`、`memory_stats`、`memory_pending`。
+MCP 是主要的整合介面。Agent 主機連接 Aquifer MCP 伺服器，伺服器提供六個工具：`session_recall`、`session_feedback`、`feedback_stats`、`session_bootstrap`、`memory_stats`、`memory_pending`。
 
 | 整合方式 | 路由 | 狀態 | 使用時機 |
 |----------|------|------|----------|

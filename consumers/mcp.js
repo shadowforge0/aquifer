@@ -7,7 +7,8 @@
  * This is the primary integration surface for Aquifer. Agent hosts (Claude Code,
  * Codex, OpenCode, etc.) should integrate through this MCP server.
  *
- * Tools: session_recall, session_feedback, memory_stats, memory_pending
+ * Tools: session_recall, session_feedback, feedback_stats,
+ * session_bootstrap, memory_stats, memory_pending
  *
  * Usage:
  *   npx aquifer mcp

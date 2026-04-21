@@ -672,48 +672,53 @@ async function recordFeedback(pool, {
 
 async function getFeedbackStats(pool, { schema, tenantId, agentId, dateFrom, dateTo }) {
   const params = [tenantId];
-  let agentClause = '';
+  let sessionClause = '';
   if (agentId) {
     params.push(agentId);
-    agentClause = `AND sf.agent_id = $${params.length}`;
+    sessionClause += ` AND s.agent_id = $${params.length}`;
   }
-  let dateClause = '';
   if (dateFrom) {
     params.push(dateFrom);
-    dateClause += ` AND sf.created_at >= $${params.length}::date`;
+    sessionClause += ` AND s.started_at >= $${params.length}::date`;
   }
   if (dateTo) {
     params.push(dateTo);
-    dateClause += ` AND sf.created_at < ($${params.length}::date + interval '1 day')`;
+    sessionClause += ` AND s.started_at < ($${params.length}::date + interval '1 day')`;
   }
 
   const fbQuery = `
+    WITH scoped_sessions AS (
+      SELECT s.id
+      FROM ${qi(schema)}.sessions s
+      WHERE s.tenant_id = $1${sessionClause}
+    )
     SELECT
-      COUNT(*)::int AS total,
+      COUNT(sf.*)::int AS total,
       COUNT(*) FILTER (WHERE sf.verdict = 'helpful')::int AS helpful,
       COUNT(*) FILTER (WHERE sf.verdict = 'unhelpful')::int AS unhelpful,
       COUNT(DISTINCT sf.session_row_id)::int AS rated_sessions
-    FROM ${qi(schema)}.session_feedback sf
-    WHERE sf.tenant_id = $1 ${agentClause} ${dateClause}`;
+    FROM scoped_sessions ss
+    LEFT JOIN ${qi(schema)}.session_feedback sf
+      ON sf.session_row_id = ss.id`;
 
-  const ssParams = [tenantId];
-  let ssAgentClause = '';
-  if (agentId) {
-    ssParams.push(agentId);
-    ssAgentClause = `AND ss.agent_id = $${ssParams.length}`;
-  }
   const ssQuery = `
+    WITH scoped_sessions AS (
+      SELECT s.id
+      FROM ${qi(schema)}.sessions s
+      WHERE s.tenant_id = $1${sessionClause}
+    )
     SELECT
-      COUNT(*)::int AS total_sessions,
-      ROUND(AVG(ss.trust_score)::numeric, 3) AS avg_ts,
-      MIN(ss.trust_score) AS min_ts,
-      MAX(ss.trust_score) AS max_ts
-    FROM ${qi(schema)}.session_summaries ss
-    WHERE ss.tenant_id = $1 ${ssAgentClause}`;
+      COUNT(scoped_sessions.id)::int AS total_sessions,
+      ROUND(AVG(summary.trust_score)::numeric, 3) AS avg_ts,
+      MIN(summary.trust_score) AS min_ts,
+      MAX(summary.trust_score) AS max_ts
+    FROM scoped_sessions
+    LEFT JOIN ${qi(schema)}.session_summaries summary
+      ON summary.session_row_id = scoped_sessions.id`;
 
   const [fbResult, ssResult] = await Promise.all([
     pool.query(fbQuery, params),
-    pool.query(ssQuery, ssParams),
+    pool.query(ssQuery, params),
   ]);
 
   const fb = fbResult.rows[0];
