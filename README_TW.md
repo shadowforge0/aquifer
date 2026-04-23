@@ -2,9 +2,9 @@
 
 # 🌊 Aquifer
 
-**基於 PostgreSQL 的 AI Agent 長期記憶系統**
+**基於 PostgreSQL 的 AI Agent 長期記憶系統。**
 
-*Turn 級 embedding、三路 RRF 混合排序、信任評分、實體交叉查詢、知識圖譜、實體作用域——全部跑在 PostgreSQL + pgvector 上。*
+*把 session 存進 PostgreSQL，做 enrich，再把精確的決策片段 recall 回來，不需要另外掛一個向量資料庫。*
 
 [![npm version](https://img.shields.io/npm/v/@shadowforge0/aquifer-memory)](https://www.npmjs.com/package/@shadowforge0/aquifer-memory)
 [![PostgreSQL 15+](https://img.shields.io/badge/PostgreSQL-15%2B-336791)](https://www.postgresql.org/)
@@ -17,55 +17,13 @@
 
 ---
 
-## 為什麼選 Aquifer？
+## 先從這裡開始
 
-多數 AI 記憶系統會在旁邊掛一個向量資料庫。Aquifer 的做法不同：**PostgreSQL 就是記憶本體**。
+Aquifer 的預設路徑應該很短：先把 PostgreSQL + embedding 跑起來，執行 `quickstart` 驗證，最後把 MCP client 指到 `aquifer mcp`。
 
-Session、摘要、turn 級 embedding、實體圖譜——全部住在同一個資料庫裡，用同一個連線查詢。不需要同步層、沒有最終一致性問題、不用額外基礎設施。
+如果你是要直接走程式化整合，往下跳到 [API 參考](#api-參考)。如果你想看比較完整但還是新手導向的說明，直接看 [docs/getting-started.md](docs/getting-started.md)。
 
-### 跟典型做法的差異
-
-| | Aquifer | 典型向量 DB 做法 |
-|---|---|---|
-| **儲存** | PostgreSQL + pgvector | 獨立向量 DB + 應用 DB |
-| **粒度** | Turn 級 embedding（不只是 session 摘要） | Session 或文件切片 |
-| **排序** | 三路 RRF：FTS + session embedding + turn embedding | 單一向量相似度 |
-| **知識圖譜** | 內建實體擷取與共現關係 | 通常是獨立系統 |
-| **多租戶** | 每張表都有 `tenant_id`，第一天就內建 | 通常是事後補做 |
-| **依賴** | `pg` + MCP SDK | 多個 SDK |
-
-### 有和沒有的差別
-
-**沒有 turn 級記憶——搜尋只能命中模糊的摘要：**
-
-> 查詢：「我們對 auth middleware 做了什麼決定？」
-> → 回傳一份 2000 字的 session 摘要，裡面某處提到了 auth
-
-**有 Aquifer——搜尋直接命中精確的對話片段：**
-
-> 查詢：「我們對 auth middleware 做了什麼決定？」
-> → 回傳那句原話：「舊的 auth middleware 拆掉吧——法務說 session token 儲存方式不合規」
-
----
-
-## 需求
-
-| 元件 | 必要？ | 用途 | 範例 |
-|------|--------|------|------|
-| Node.js >= 18 | 是 | Runtime | — |
-| PostgreSQL 15+ | 是 | 儲存 session、摘要、實體 | 本機、Docker 或 managed |
-| pgvector extension | 是 | 向量相似度搜尋 | `CREATE EXTENSION vector;`（`pgvector/pgvector` Docker image 內建） |
-| Embedding 端點 | 是（recall 用） | Turn + session embedding | Ollama `bge-m3`、OpenAI `text-embedding-3-small`、任何 OpenAI 相容 API |
-| LLM 端點 | 選用 | `enrich` 階段的內建摘要 | Ollama、OpenRouter、OpenAI——或自己傳 `summaryFn` |
-| `@modelcontextprotocol/sdk` + `zod` | 是（MCP server 用） | MCP 協定 runtime | 已列入 dependencies，自動安裝 |
-
----
-
-## 快速開始（MCP 伺服器）
-
-兩行指令從零到可用的 MCP 記憶伺服器——不需要設任何 env。Library API 用法請往下看 [Library API](#library-api)。
-
-### 1. 起 stack
+### 1. 起本機 stack
 
 ```bash
 docker compose up -d
@@ -73,15 +31,15 @@ docker compose up -d
 # 第一次跑會拉 model——`docker compose logs -f ollama-pull` 盯進度。
 ```
 
-已經有 PostgreSQL + pgvector 和 embedding 端點在跑？跳過這步——`quickstart` 會從環境變數讀 `DATABASE_URL` / `EMBED_PROVIDER`(如果有設的話)。
+已經有 PostgreSQL + pgvector 跟 embedding 端點在跑？這步可以跳過。`quickstart` 會讀你現有的環境變數設定。
 
-### 2. 驗證
+### 2. 做端到端驗證
 
 ```bash
 npx --yes @shadowforge0/aquifer-memory quickstart
 ```
 
-就這樣。`quickstart` 會自動偵測 `localhost:5432` 的 PostgreSQL 跟 `localhost:11434` 的 Ollama（步驟 1 起的或你自己的都行），跑 migration、embed 一個測試 session、recall 回來、清乾淨。看到 `✓ Aquifer is working` 就成功了。
+`quickstart` 會自動偵測 `localhost:5432` 的 PostgreSQL 跟 `localhost:11434` 的 Ollama（步驟 1 起的或你自己的都行），跑 migration、embed 一個測試 session、recall 回來、清乾淨。看到 `✓ Aquifer is working` 就成功了。
 
 長期使用建議裝進專案省掉 `npx` 解析成本:`npm install @shadowforge0/aquifer-memory` 然後 `npx aquifer quickstart`。
 
@@ -106,9 +64,63 @@ Claude Code、Claude Desktop 或任何支援 MCP 的 client——放進 `.mcp.js
 }
 ```
 
-或直接跑:`DATABASE_URL=... EMBED_PROVIDER=ollama npx aquifer mcp`。(MCP server 本身對 env 嚴格——`quickstart` 的 autodetect 是試用路徑，不是 production 路徑。)
+或直接跑：`DATABASE_URL=... EMBED_PROVIDER=ollama npx aquifer mcp`。MCP server 本身對 env 比較嚴格，`quickstart` 的 autodetect 是試用路徑，不是 production 路徑。
 
-需要 LLM 摘要、知識圖譜、OpenAI embedding 或 reranker?往下看 [環境變數](#環境變數)跟 [docs/setup.md](docs/setup.md)。
+### 常用指令
+
+| 目標 | 指令 |
+|---|---|
+| 驗證 setup | `npx aquifer quickstart` |
+| 啟動 MCP server | `npx aquifer mcp` |
+| 手動查記憶 | `npx aquifer recall "auth middleware"` |
+| 看儲存狀態 | `npx aquifer stats` |
+| 補跑 pending session | `npx aquifer backfill` |
+
+需要 LLM 摘要、知識圖譜、OpenAI embedding、reranker 或維運細節，就往下看 [環境變數](#環境變數) 跟 [docs/setup.md](docs/setup.md)。
+
+---
+
+## 為什麼選 Aquifer？
+
+多數 AI 記憶系統會在旁邊掛一個向量資料庫。Aquifer 的做法不同：**PostgreSQL 就是記憶本體**。
+
+Session、摘要、turn 級 embedding、實體圖譜，全部住在同一個資料庫裡，用同一個連線查詢。不需要同步層，沒有最終一致性問題，也不用額外基礎設施。
+
+### 跟典型做法的差異
+
+| | Aquifer | 典型向量 DB 做法 |
+|---|---|---|
+| **儲存** | PostgreSQL + pgvector | 獨立向量 DB + 應用 DB |
+| **粒度** | Turn 級 embedding（不只是 session 摘要） | Session 或文件切片 |
+| **排序** | 三路 RRF：FTS + session embedding + turn embedding | 單一向量相似度 |
+| **知識圖譜** | 內建實體擷取與共現關係 | 通常是獨立系統 |
+| **多租戶** | 每張表都有 `tenant_id`，第一天就內建 | 通常是事後補做 |
+| **依賴** | `pg` + MCP SDK | 多個 SDK |
+
+### 有和沒有的差別
+
+**沒有 turn 級記憶，搜尋只能命中模糊的摘要：**
+
+> 查詢：「我們對 auth middleware 做了什麼決定？」
+> → 回傳一份 2000 字的 session 摘要，裡面某處提到了 auth
+
+**有 Aquifer，搜尋直接命中精確的對話片段：**
+
+> 查詢：「我們對 auth middleware 做了什麼決定？」
+> → 回傳那句原話：「舊的 auth middleware 拆掉吧，法務說 session token 儲存方式不合規」
+
+---
+
+## 需求
+
+| 元件 | 必要？ | 用途 | 範例 |
+|------|--------|------|------|
+| Node.js >= 18 | 是 | Runtime | — |
+| PostgreSQL 15+ | 是 | 儲存 session、摘要、實體 | 本機、Docker 或 managed |
+| pgvector extension | 是 | 向量相似度搜尋 | `CREATE EXTENSION vector;`（`pgvector/pgvector` Docker image 內建） |
+| Embedding 端點 | 是（recall 用） | Turn + session embedding | Ollama `bge-m3`、OpenAI `text-embedding-3-small`、任何 OpenAI 相容 API |
+| LLM 端點 | 選用 | `enrich` 階段的內建摘要 | Ollama、OpenRouter、OpenAI，或自己傳 `summaryFn` |
+| `@modelcontextprotocol/sdk` + `zod` | 是（MCP server 用） | MCP 協定 runtime | 已列入 dependencies，自動安裝 |
 
 ---
 

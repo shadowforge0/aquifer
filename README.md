@@ -2,9 +2,9 @@
 
 # 🌊 Aquifer
 
-**PG-native long-term memory for AI agents**
+**Long-term memory for AI agents, backed by PostgreSQL.**
 
-*Turn-level embedding, hybrid RRF ranking, trust scoring, entity intersection, knowledge graph, entity scoping — all on PostgreSQL + pgvector.*
+*Store sessions, enrich them, and recall the exact turn where a decision happened — without adding a separate vector database.*
 
 [![npm version](https://img.shields.io/npm/v/@shadowforge0/aquifer-memory)](https://www.npmjs.com/package/@shadowforge0/aquifer-memory)
 [![PostgreSQL 15+](https://img.shields.io/badge/PostgreSQL-15%2B-336791)](https://www.postgresql.org/)
@@ -14,6 +14,69 @@
 [English](README.md) | [繁體中文](README_TW.md) | [简体中文](README_CN.md)
 
 </div>
+
+---
+
+## Start Here
+
+Aquifer is designed to have a short default path: start PostgreSQL + embeddings, run `quickstart`, then point your MCP client at `aquifer mcp`.
+
+For library API usage, skip to [API Reference](#api-reference). For a slightly more guided first run, see [docs/getting-started.md](docs/getting-started.md).
+
+### 1. Start the local stack
+
+```bash
+docker compose up -d
+# PostgreSQL 16 + pgvector and Ollama with bge-m3 (auto-pulled).
+# First run pulls the model — `docker compose logs -f ollama-pull` to watch.
+```
+
+Already running PostgreSQL + pgvector and an embedding endpoint? Skip this step. `quickstart` picks up `DATABASE_URL` and embed settings from your environment if you already have them.
+
+### 2. Verify end-to-end
+
+```bash
+npx --yes @shadowforge0/aquifer-memory quickstart
+```
+
+`quickstart` autodetects `localhost:5432` PostgreSQL and `localhost:11434` Ollama (from step 1 or your own), runs migrations, embeds a test session, recalls it, and cleans up. If it prints `✓ Aquifer is working`, you're done.
+
+For ongoing use, install it into your project so you skip the `npx` resolution cost: `npm install @shadowforge0/aquifer-memory` then `npx aquifer quickstart`.
+
+Using OpenAI instead of Ollama? `export EMBED_PROVIDER=openai` + `OPENAI_API_KEY=sk-...` before `quickstart` — model defaults to `text-embedding-3-small`.
+
+### 3. Connect your MCP client
+
+Claude Code, Claude Desktop, or any MCP-capable client — drop this into `.mcp.json` (project-level) or `claude_desktop_config.json`:
+
+```jsonc
+{
+  "mcpServers": {
+    "aquifer": {
+      "command": "npx",
+      "args": ["--yes", "@shadowforge0/aquifer-memory", "mcp"],
+      "env": {
+        "DATABASE_URL": "postgresql://aquifer:aquifer@localhost:5432/aquifer",
+        "EMBED_PROVIDER": "ollama"
+      }
+    }
+  }
+}
+```
+
+Or run it directly: `DATABASE_URL=... EMBED_PROVIDER=ollama npx aquifer mcp`. The MCP server itself stays strict about env; `quickstart` autodetect is the try-it path, not the production one.
+
+### Common commands
+
+| Goal | Command |
+|---|---|
+| Verify setup | `npx aquifer quickstart` |
+| Start the MCP server | `npx aquifer mcp` |
+| Search memory manually | `npx aquifer recall "auth middleware"` |
+| Inspect storage health | `npx aquifer stats` |
+| Enrich pending sessions | `npx aquifer backfill` |
+
+Need LLM summarization, the knowledge graph, OpenAI embeddings, reranking, or operations details? See [docs/setup.md](docs/setup.md) and [Environment Variables](#environment-variables).
 
 ---
 
@@ -58,57 +121,6 @@ Sessions, summaries, turn-level embeddings, entity graph — all live in one dat
 | Embedding endpoint | Yes (for recall) | Turn + session embedding | Ollama `bge-m3`, OpenAI `text-embedding-3-small`, any OpenAI-compatible API |
 | LLM endpoint | Optional | Built-in summarization during `enrich` | Ollama, OpenRouter, OpenAI — or provide your own `summaryFn` |
 | `@modelcontextprotocol/sdk` + `zod` | Yes (for MCP server) | MCP protocol runtime | Included in dependencies — installed automatically |
-
----
-
-## Quick Start (MCP Server)
-
-Two commands from zero to a working MCP memory server — no env vars to set. For library API usage, see [API Reference](#api-reference) below.
-
-### 1. Start the stack
-
-```bash
-docker compose up -d
-# PostgreSQL 16 + pgvector and Ollama with bge-m3 (auto-pulled).
-# First run pulls the model — `docker compose logs -f ollama-pull` to watch.
-```
-
-Already running PostgreSQL + pgvector and an embedding endpoint? Skip this step — `quickstart` picks up `DATABASE_URL` / `EMBED_PROVIDER` from your environment if you've set them.
-
-### 2. Verify
-
-```bash
-npx --yes @shadowforge0/aquifer-memory quickstart
-```
-
-That's it. `quickstart` autodetects `localhost:5432` PostgreSQL and `localhost:11434` Ollama (from step 1 or your own), runs migrations, embeds a test session, recalls it, and cleans up. If it prints `✓ Aquifer is working`, you're done.
-
-For ongoing use, install it into your project so you skip the `npx` resolution cost: `npm install @shadowforge0/aquifer-memory` then `npx aquifer quickstart`.
-
-Using OpenAI instead of Ollama? `export EMBED_PROVIDER=openai` + `OPENAI_API_KEY=sk-...` before `quickstart` — model defaults to `text-embedding-3-small`.
-
-### 3. Wire into your MCP client
-
-Claude Code, Claude Desktop, or any MCP-capable client — drop this into `.mcp.json` (project-level) or `claude_desktop_config.json`:
-
-```jsonc
-{
-  "mcpServers": {
-    "aquifer": {
-      "command": "npx",
-      "args": ["--yes", "@shadowforge0/aquifer-memory", "mcp"],
-      "env": {
-        "DATABASE_URL": "postgresql://aquifer:aquifer@localhost:5432/aquifer",
-        "EMBED_PROVIDER": "ollama"
-      }
-    }
-  }
-}
-```
-
-Or run it directly: `DATABASE_URL=... EMBED_PROVIDER=ollama npx aquifer mcp`. (MCP server itself stays strict about env — `quickstart`'s autodetect is the try-it path, not the production one.)
-
-Need LLM summarization, the knowledge graph, OpenAI embeddings, or the reranker? See [Environment Variables](#environment-variables) below and [docs/setup.md](docs/setup.md).
 
 ---
 

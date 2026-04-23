@@ -36,6 +36,86 @@ function parsePositiveInt(value, fallback) {
   return Math.max(1, parsed);
 }
 
+function hasQuickstartEmbedConfig(env) {
+  return !!(
+    env.EMBED_PROVIDER
+    || (env.AQUIFER_EMBED_BASE_URL && env.AQUIFER_EMBED_MODEL)
+  );
+}
+
+function printQuickstartFailure(title, detailLines = []) {
+  console.error(`     FAIL — ${title}`);
+  for (const line of detailLines) {
+    if (line) console.error(`     ${line}`);
+  }
+}
+
+function buildQuickstartSetupHints(env, detected, err) {
+  const hints = [];
+  const message = err && err.message ? err.message : String(err || 'Unknown error');
+  const hasDb = !!(env.DATABASE_URL || env.AQUIFER_DB_URL || detected.DATABASE_URL);
+  const hasEmbed = hasQuickstartEmbedConfig(env)
+    || !!detected.EMBED_PROVIDER;
+
+  if (/Database URL is required/i.test(message)) {
+    hints.push('Quickstart could not find a PostgreSQL connection.');
+    if (!hasDb) {
+      hints.push('If you expect local defaults, make sure PostgreSQL is running on localhost:5432.');
+      hints.push('Otherwise set DATABASE_URL or AQUIFER_DB_URL explicitly and run quickstart again.');
+    }
+    return hints;
+  }
+
+  if (/OPENAI_API_KEY/i.test(message)) {
+    hints.push('OpenAI embeddings were selected, but OPENAI_API_KEY is not set.');
+    hints.push('Export OPENAI_API_KEY or switch EMBED_PROVIDER back to ollama for local quickstart.');
+    return hints;
+  }
+
+  if (!hasDb || !hasEmbed) {
+    hints.push('Quickstart is missing part of the local setup.');
+    if (!hasDb) hints.push('PostgreSQL was not autodetected and no DATABASE_URL is set.');
+    if (!hasEmbed) hints.push('No embedding provider was autodetected and no embed env is set.');
+    hints.push('Try `docker compose up -d`, then run `npx aquifer quickstart` again.');
+  }
+
+  hints.push(`Raw error: ${message}`);
+  return hints;
+}
+
+function buildQuickstartRecallHints(err) {
+  const message = err && err.message ? err.message : String(err || 'Unknown error');
+
+  if (/requires config\.embed\.fn|EMBED_PROVIDER/i.test(message)) {
+    return [
+      'Quickstart reached recall, but embeddings are not configured.',
+      'Set EMBED_PROVIDER=ollama for local Ollama, or EMBED_PROVIDER=openai with OPENAI_API_KEY.',
+      `Raw error: ${message}`,
+    ];
+  }
+
+  if (/OPENAI_API_KEY/i.test(message)) {
+    return [
+      'Recall is configured to use OpenAI embeddings, but OPENAI_API_KEY is missing.',
+      'Export OPENAI_API_KEY and rerun quickstart.',
+      `Raw error: ${message}`,
+    ];
+  }
+
+  if (/ECONNREFUSED|ENOTFOUND|fetch failed|connect/i.test(message)) {
+    return [
+      'Aquifer could not reach the embedding service during recall.',
+      'If you expect local Ollama, make sure it is running and the model is available.',
+      `Raw error: ${message}`,
+    ];
+  }
+
+  return [
+    'Aquifer could not recall the quickstart test session.',
+    `Raw error: ${message}`,
+  ];
+}
+
 // ---------------------------------------------------------------------------
 // Argument parser (minimal, no deps)
 // ---------------------------------------------------------------------------
@@ -238,13 +318,39 @@ async function cmdQuickstart(aquifer) {
     skipSummary: true,
     skipEntities: true,
   });
+  if (Array.isArray(enrichResult.warnings) && enrichResult.warnings.length > 0) {
+    printQuickstartFailure('embedding step returned warnings.', [
+      'Quickstart expects turn embeddings to succeed cleanly.',
+      ...enrichResult.warnings.map(w => `Warning: ${w}`),
+    ]);
+    process.exitCode = 1;
+    return;
+  }
+  if (!Number.isFinite(enrichResult.turnsEmbedded) || enrichResult.turnsEmbedded <= 0) {
+    printQuickstartFailure('0 turns were embedded.', [
+      'The quickstart test session contains user turns, so this usually means the embedding setup is not working.',
+      'Check EMBED_PROVIDER / AQUIFER_EMBED_* settings, or make sure Ollama/OpenAI is reachable.',
+    ]);
+    process.exitCode = 1;
+    return;
+  }
   console.log(`     OK — ${enrichResult.turnsEmbedded} turns embedded\n`);
 
   // 4. Recall
   console.log('4/5  Recalling "PostgreSQL memory store"...');
-  const results = await aquifer.recall('PostgreSQL memory store', { limit: 3 });
+  let results;
+  try {
+    results = await aquifer.recall('PostgreSQL memory store', { limit: 3 });
+  } catch (err) {
+    printQuickstartFailure('recall step failed.', buildQuickstartRecallHints(err));
+    process.exitCode = 1;
+    return;
+  }
   if (results.length === 0) {
-    console.error('     FAIL — no results returned. Check your embedding config.');
+    printQuickstartFailure('quickstart could not recall its own test session.', [
+      'The write step succeeded, but the test query returned no matches.',
+      'This usually means the embedding path is misconfigured or the embed service is not reachable.',
+    ]);
     process.exitCode = 1;
     return;
   }
@@ -343,8 +449,8 @@ async function main() {
     console.log(`Usage: aquifer <command> [options]
 
 Commands:
-  quickstart                  Verify end-to-end setup (migrate → commit → enrich → recall)
-  migrate                     Run database migrations
+   quickstart                  Verify end-to-end setup (migrate → commit → enrich → recall)
+   migrate                     Run database migrations
   recall <query>              Search sessions (requires embed config)
   feedback                    Record trust feedback on a session
   feedback-stats              Show trust feedback statistics and coverage
@@ -352,8 +458,8 @@ Commands:
   stats                       Show database statistics
   export                      Export sessions as JSONL
   bootstrap                   Show recent session context (for new session start)
-  ingest-opencode             Import sessions from OpenCode's local SQLite DB
-  mcp                         Start MCP server
+   ingest-opencode             Import sessions from OpenCode's local SQLite DB
+   mcp                         Start MCP server
 
 Options:
   --limit N                   Limit results
@@ -381,6 +487,7 @@ Options:
 
   const command = argv[0];
   const args = parseArgs(argv);
+  let quickstartDetected = {};
 
   // MCP: delegate to mcp.js
   if (command === 'mcp') {
@@ -414,10 +521,10 @@ Options:
   // the operator to have set env explicitly.
   if (command === 'quickstart') {
     const { autodetectForQuickstart } = require('./shared/autodetect');
-    const detected = await autodetectForQuickstart(process.env);
-    if (Object.keys(detected).length > 0) {
+    quickstartDetected = await autodetectForQuickstart(process.env);
+    if (Object.keys(quickstartDetected).length > 0) {
       console.log('Autodetected localhost services (env not set):');
-      for (const [k, v] of Object.entries(detected)) {
+      for (const [k, v] of Object.entries(quickstartDetected)) {
         console.log(`  ${k}=${v}`);
         process.env[k] = v;
       }
@@ -425,7 +532,17 @@ Options:
     }
   }
 
-  const aquifer = createAquiferFromConfig(configOverrides);
+  let aquifer;
+  try {
+    aquifer = createAquiferFromConfig(configOverrides);
+  } catch (err) {
+    if (command === 'quickstart') {
+      printQuickstartFailure('setup check failed before quickstart could start.', buildQuickstartSetupHints(process.env, quickstartDetected, err));
+      process.exit(1);
+      return;
+    }
+    throw err;
+  }
 
   try {
     switch (command) {

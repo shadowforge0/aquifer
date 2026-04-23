@@ -154,7 +154,7 @@ async function startServer(handler) {
 }
 
 const cliPrivate = loadModuleFromSource('consumers/cli.js', {
-  exportNames: ['cmdRecall', 'cmdBackfill', 'cmdStats', 'cmdExport', 'cmdQuickstart', 'formatDate', 'quoteIdentifier', 'parsePositiveInt'],
+  exportNames: ['cmdRecall', 'cmdBackfill', 'cmdStats', 'cmdExport', 'cmdQuickstart', 'formatDate', 'quoteIdentifier', 'parsePositiveInt', 'hasQuickstartEmbedConfig', 'printQuickstartFailure', 'buildQuickstartSetupHints', 'buildQuickstartRecallHints', 'main'],
   mocks: {
     './shared/factory': { createAquiferFromConfig() { throw new Error('not used in unit tests'); } },
     './shared/config': { loadConfig() { return {}; } },
@@ -222,6 +222,18 @@ describe('consumers/cli.js', () => {
     assert.equal(received.limit, 1);
   });
 
+  it('buildQuickstartSetupHints explains missing DB config', () => {
+    const lines = cliPrivate.buildQuickstartSetupHints({}, {}, new Error('Database URL is required (set DATABASE_URL or AQUIFER_DB_URL)'));
+    assert.ok(lines.some(line => /could not find a PostgreSQL connection/i.test(line)));
+    assert.ok(lines.some(line => /DATABASE_URL or AQUIFER_DB_URL/i.test(line)));
+  });
+
+  it('buildQuickstartSetupHints explains missing OPENAI_API_KEY', () => {
+    const lines = cliPrivate.buildQuickstartSetupHints({ EMBED_PROVIDER: 'openai' }, {}, new Error('EMBED_PROVIDER=openai requires OPENAI_API_KEY'));
+    assert.ok(lines.some(line => /OPENAI_API_KEY/i.test(line)));
+    assert.ok(lines.some(line => /OpenAI embeddings were selected/i.test(line)));
+  });
+
   it('cmdRecall exits when query is missing', async () => {
     const err = captureConsole('error');
     try {
@@ -229,6 +241,90 @@ describe('consumers/cli.js', () => {
       assert.equal(code, 1);
       assert.match(err.calls[0], /Usage: aquifer recall/);
     } finally {
+      err.restore();
+    }
+  });
+
+  it('cmdQuickstart fails when enrich returns warnings', async () => {
+    const aquifer = {
+      async migrate() {},
+      async commit() {},
+      async enrich() {
+        return { turnsEmbedded: 1, warnings: ['turn embed failed: connect ECONNREFUSED'] };
+      },
+      async recall() {
+        assert.fail('recall should not run after enrich warnings');
+      },
+    };
+
+    const out = captureConsole('log');
+    const err = captureConsole('error');
+    const originalExitCode = process.exitCode;
+    process.exitCode = undefined;
+    try {
+      await cliPrivate.cmdQuickstart(aquifer);
+      assert.equal(process.exitCode, 1);
+      assert.ok(err.calls.some(line => /embedding step returned warnings/i.test(line)));
+      assert.ok(err.calls.some(line => /turn embed failed/i.test(line)));
+    } finally {
+      process.exitCode = originalExitCode;
+      out.restore();
+      err.restore();
+    }
+  });
+
+  it('cmdQuickstart fails when no turns are embedded', async () => {
+    const aquifer = {
+      async migrate() {},
+      async commit() {},
+      async enrich() {
+        return { turnsEmbedded: 0, warnings: [] };
+      },
+      async recall() {
+        assert.fail('recall should not run after zero embedded turns');
+      },
+    };
+
+    const out = captureConsole('log');
+    const err = captureConsole('error');
+    const originalExitCode = process.exitCode;
+    process.exitCode = undefined;
+    try {
+      await cliPrivate.cmdQuickstart(aquifer);
+      assert.equal(process.exitCode, 1);
+      assert.ok(err.calls.some(line => /0 turns were embedded/i.test(line)));
+      assert.ok(err.calls.some(line => /embedding setup is not working/i.test(line)));
+    } finally {
+      process.exitCode = originalExitCode;
+      out.restore();
+      err.restore();
+    }
+  });
+
+  it('cmdQuickstart explains empty recall results more clearly', async () => {
+    const aquifer = {
+      async migrate() {},
+      async commit() {},
+      async enrich() {
+        return { turnsEmbedded: 2, warnings: [] };
+      },
+      async recall() {
+        return [];
+      },
+    };
+
+    const out = captureConsole('log');
+    const err = captureConsole('error');
+    const originalExitCode = process.exitCode;
+    process.exitCode = undefined;
+    try {
+      await cliPrivate.cmdQuickstart(aquifer);
+      assert.equal(process.exitCode, 1);
+      assert.ok(err.calls.some(line => /could not recall its own test session/i.test(line)));
+      assert.ok(err.calls.some(line => /test query returned no matches/i.test(line)));
+    } finally {
+      process.exitCode = originalExitCode;
+      out.restore();
       err.restore();
     }
   });
