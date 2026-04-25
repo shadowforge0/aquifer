@@ -361,22 +361,6 @@ Built-in entity extraction and relationship tracking:
 - **Entity-session mapping**: which entities appear in which sessions
 - **Entity boost in ranking**: sessions with relevant entities score higher
 
----
-
-## Benchmark: LongMemEval
-
-We tested Aquifer's retrieval pipeline on [LongMemEval_S](https://github.com/xiaowu0162/LongMemEval) — 470 questions across 19,195 sessions with 98,795 turn embeddings. Per-question haystack scoping (matching the official protocol), bge-m3 embeddings via OpenRouter.
-
-| Pipeline | R@1 | R@3 | R@5 | R@10 |
-|----------|-----|-----|-----|------|
-| Turn-only (cosine) | 89.5% | 96.6% | 98.1% | 98.9% |
-| Three-way hybrid (FTS + session_emb + turn_emb → RRF) | 79.2% | 94.0% | 97.7% | 98.9% |
-| **Hybrid + Cohere Rerank v3.5 (top-30)** | **96.0%** | **98.5%** | **99.3%** | **99.8%** |
-
-Measured 2026-04-19 on Aquifer 1.2.1.
-
-**Key findings.** Turn-level embedding alone beats session-level (26.8% → 89.5% R@1, a 3× improvement). Hybrid fusion adds robustness at R@3-R@10 but trades R@1 because FTS + session-level signals spread the top candidate across adjacent sessions. Re-ranking the hybrid top-30 with a cross-encoder (Cohere Rerank v3.5) wins back the top-1 precision and then some — +16.9pt R@1 over hybrid baseline, and 6.5pt above pure turn-level cosine. That's the production pipeline Aquifer ships by default when a reranker is configured.
-
 ### Multi-Tenant
 
 Every table includes `tenant_id` (default: `'default'`). Isolation is enforced at the query level — no cross-tenant data leakage by design.

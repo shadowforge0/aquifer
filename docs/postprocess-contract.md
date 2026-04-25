@@ -21,7 +21,7 @@ postProcess?: (ctx: PostProcessContext) => Promise<void>
 ```ts
 interface PostProcessContext {
   session: {
-    id: number;              // DB primary key (miranda.sessions.id)
+    id: number;              // DB primary key (<schema>.sessions.id)
     sessionId: string;       // caller-provided session key
     agentId: string;
     model: string | null;
@@ -123,7 +123,7 @@ if (result.postProcessError) {
 
 - Don't throw as a signal of "enrich should have failed" — enrich is already committed. Use warnings or a separate audit table.
 - Don't mutate `ctx.normalized`, `ctx.parsedEntities`, or `ctx.warnings`. They're shared-reference with the enrich return; defensive copy if you need to modify.
-- Don't rely on postProcess running quickly — it's outside the tx. Long-running work should be fire-and-forget (see Miranda's `setImmediate` consolidation) or queued.
+- Don't rely on postProcess running quickly — it's outside the tx. Long-running work should be fire-and-forget or queued by the consumer.
 
 ## What Aquifer guarantees
 
