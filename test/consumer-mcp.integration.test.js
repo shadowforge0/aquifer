@@ -104,12 +104,12 @@ describe('MCP consumer — aquifer mcp tool surface', () => {
     finally { await pool.end().catch(() => {}); }
   });
 
-  it('listTools exposes the five Aquifer tools', async () => {
+  it('listTools exposes the six Aquifer tools', async () => {
     const result = await client.listTools();
     const names = result.tools.map(t => t.name).sort();
     assert.deepEqual(
       names,
-      ['memory_pending', 'memory_stats', 'session_bootstrap', 'session_feedback', 'session_recall']
+      ['feedback_stats', 'memory_pending', 'memory_stats', 'session_bootstrap', 'session_feedback', 'session_recall']
     );
   });
 
@@ -150,6 +150,16 @@ describe('MCP consumer — aquifer mcp tool surface', () => {
     const text = getToolText(result);
     assert.match(text, /Feedback:\s*helpful/);
     assert.match(text, /trust.*→/);
+  });
+
+  it('feedback_stats returns feedback totals', async () => {
+    const result = await client.callTool({
+      name: 'feedback_stats',
+      arguments: { agentId: 'mcp-test' },
+    });
+    const text = getToolText(result);
+    assert.match(text, /Feedback:\s*1 total/);
+    assert.match(text, /1 helpful/);
   });
 
   it('memory_pending returns empty after enrich', async () => {
