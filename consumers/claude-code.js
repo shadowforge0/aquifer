@@ -3,10 +3,9 @@
 // ---------------------------------------------------------------------------
 // Claude Code host adapter.
 //
-// Generic entry points for CC-side afterburn hooks. No persona logic — the
-// caller (typically cc-afterburn.js) constructs the Miranda persona hooks
-// via consumers/miranda and injects them via `postProcess`, `summaryFn`,
-// `entityParseFn`.
+// Generic entry points for CC-side afterburn hooks. No persona logic — callers
+// construct any persona-specific hooks outside this package and inject them via
+// `postProcess`, `summaryFn`, `entityParseFn`, or `contextInjector`.
 //
 // API:
 //   runEnrich({ aquifer, sessionId, agentId, ... })
@@ -16,9 +15,9 @@
 //   runBackfill({ aquifer, sessionIds, ... })
 //       Iterate enrich() over pending sessions (for catch-up after a gap).
 //
-//   runContextInject({ aquifer, pool, agentId })
-//       Return the Miranda-flavored system context string for a CC session
-//       start hook. (Delegates to consumers/miranda/context-inject.)
+//   runContextInject({ contextInjector, ... })
+//       Return a host-specific system context string for a CC session start
+//       hook. The injector is supplied by the deployment, not by Aquifer core.
 // ---------------------------------------------------------------------------
 
 /**
@@ -106,12 +105,13 @@ async function runBackfill({
 }
 
 /**
- * Build the Miranda-flavored system context for a CC SessionStart hook.
- * Delegates to consumers/miranda/context-inject.computeInjection.
+ * Build a host-specific system context for a CC SessionStart hook.
+ * The caller supplies the context injector so this public adapter stays generic.
  */
 async function runContextInject(opts = {}) {
-    const { computeInjection } = require('./miranda/context-inject');
-    return computeInjection(opts);
+    const injector = opts.contextInjector || opts.computeInjection;
+    if (typeof injector !== 'function') throw new Error('runContextInject: contextInjector is required');
+    return injector(opts);
 }
 
 module.exports = { runEnrich, runBackfill, runContextInject };

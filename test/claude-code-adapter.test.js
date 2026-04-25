@@ -119,13 +119,35 @@ describe('runBackfill', () => {
 });
 
 describe('runContextInject', () => {
-    it('delegates to miranda context-inject.computeInjection', async () => {
-        // Real call: minimal pool that returns no rows; expect empty string (briefing drops to 0 parts).
-        const aq = {
-            async bootstrap() { return { text: '', sessions: [] }; },
-        };
-        const pool = { async query() { return { rows: [] }; } };
-        const out = await cc.runContextInject({ aquifer: aq, pool, agentId: 'main' });
-        assert.equal(typeof out, 'string');
+    it('requires a caller-supplied context injector', async () => {
+        await assert.rejects(() => cc.runContextInject({ agentId: 'main' }), /contextInjector is required/);
+    });
+
+    it('delegates to the supplied context injector', async () => {
+        const seen = [];
+        const out = await cc.runContextInject({
+            agentId: 'main',
+            contextInjector: async (opts) => {
+                seen.push(opts.agentId);
+                return 'context';
+            },
+        });
+
+        assert.equal(out, 'context');
+        assert.deepEqual(seen, ['main']);
+    });
+
+    it('supports the legacy computeInjection alias', async () => {
+        const seen = [];
+        const out = await cc.runContextInject({
+            agentId: 'main',
+            computeInjection: async (opts) => {
+                seen.push(opts.agentId);
+                return 'legacy context';
+            },
+        });
+
+        assert.equal(out, 'legacy context');
+        assert.deepEqual(seen, ['main']);
     });
 });

@@ -139,15 +139,15 @@ TODO_DONE: 已完成待辦（需匹配既有）
 }
 
 // ---------------------------------------------------------------------------
-// parseSummaryOutput / parseRecapLines — delegate to miranda's parsers.
-// The output format is intentionally the same, so parsers work for both.
+// parseSummaryOutput / parseRecapLines — shared parser used by all personas.
+// The output format is intentionally stable so downstream daily entries work.
 // ---------------------------------------------------------------------------
 
-const mirandaSummary = require('../../miranda/prompts/summary');
+const summaryParser = require('../../shared/summary-parser');
 
 module.exports = {
   buildSummaryPrompt,
-  parseSummaryOutput: mirandaSummary.parseSummaryOutput,
-  parseRecapLines: mirandaSummary.parseRecapLines,
-  parseWorkingFacts: mirandaSummary.parseWorkingFacts,
+  parseSummaryOutput: summaryParser.parseSummaryOutput,
+  parseRecapLines: summaryParser.parseRecapLines,
+  parseWorkingFacts: summaryParser.parseWorkingFacts,
 };

@@ -107,4 +107,77 @@ describe('createPersona — daily-entries toggle', () => {
     // No throw = ok
     assert.ok(true);
   });
+
+  it('writes handoff entries through the shared summary parser', async () => {
+    const p = createPersona();
+    const calls = [];
+    const pool = {
+      async query(sql, params) {
+        calls.push({ sql, params });
+        return { rows: [{ id: 1, event_at: params[0], source: params[1], tag: params[2], text: params[3] }] };
+      },
+    };
+
+    await p.dailyEntries.writeDailyEntries({
+      sections: {
+        handoff: [
+          'STATUS: in_progress',
+          'LAST_STEP: 修 SessionStart continuity',
+          'NEXT: 補 live 驗證',
+          'STOP_REASON: natural',
+          'DECIDED: hook 讀真正 Aquifer repo',
+        ].join('\n'),
+      },
+      recap: null,
+      pool,
+      sessionId: 's1',
+      agentId: 'main',
+      now: new Date('2026-04-25T01:00:00.000Z'),
+      dailyTable: 'test.daily_entries',
+      logger: { info: () => {}, warn: () => {} },
+    });
+
+    assert.equal(calls.length, 1);
+    const { sql, params } = calls[0];
+    assert.match(sql, /INSERT INTO "test"\."daily_entries"/);
+    assert.equal(params[2], '[HANDOFF]');
+    assert.match(params[3], /上一段停在 修 SessionStart continuity/);
+    assert.match(params[3], /下一步建議 補 live 驗證/);
+    assert.match(params[3], /已決定 hook 讀真正 Aquifer repo/);
+    assert.equal(params[4], 'main');
+    assert.equal(params[5], 's1');
+    assert.deepEqual(JSON.parse(params[6]), {
+      status: 'in_progress',
+      lastStep: '修 SessionStart continuity',
+      next: '補 live 驗證',
+      stopReason: 'natural',
+      decided: 'hook 讀真正 Aquifer repo',
+      blocker: '',
+      proposed_by: 'afterburn',
+    });
+    assert.equal(params[7], 'daily:2026-04-25:handoff:afterburn');
+  });
+
+  it('rejects unsafe dailyTable identifiers', async () => {
+    const p = createPersona();
+    const pool = {
+      async query() {
+        throw new Error('query should not run');
+      },
+    };
+
+    await assert.rejects(
+      () => p.dailyEntries.writeDailyEntries({
+        sections: { session_entries: '- (14:05) unsafe table' },
+        recap: null,
+        pool,
+        sessionId: 's1',
+        agentId: 'main',
+        now: new Date('2026-04-25T01:00:00.000Z'),
+        dailyTable: 'test.daily_entries;DROP TABLE sessions',
+        logger: { info: () => {}, warn: () => {} },
+      }),
+      /Invalid dailyTable/
+    );
+  });
 });

@@ -9,7 +9,7 @@
 //   CREATE TABLE jenny.daily_entries (LIKE miranda.daily_entries INCLUDING ALL);
 
 const crypto = require('crypto');
-const { parseHandoffSection } = require('../miranda/prompts/summary');
+const { parseHandoffSection } = require('../shared/summary-parser');
 
 const UPSERT_TAGS = new Set(['[FOCUS]', '[TODO]', '[STATS]', '[HIGHLIGHT]', '[SYSTEM]', '[HANDOFF]']);
 
@@ -27,10 +27,27 @@ function textHash6(text) {
   return crypto.createHash('sha256').update(normalized).digest('hex').slice(0, 6);
 }
 
+function quoteIdentifier(identifier) {
+  if (!/^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(identifier)) {
+    throw new Error(`Invalid dailyTable identifier: ${identifier}`);
+  }
+  return `"${identifier}"`;
+}
+
+function quoteTableName(tableName) {
+  if (typeof tableName !== 'string') throw new Error('dailyTable must be a string');
+  const parts = tableName.split('.');
+  if (parts.length < 1 || parts.length > 2 || parts.some(part => !part)) {
+    throw new Error(`Invalid dailyTable name: ${tableName}`);
+  }
+  return parts.map(quoteIdentifier).join('.');
+}
+
 async function insertDailyEntry(pool, tableName, { eventAt, source, tag, text, agentId, sessionId, metadata, dedupeKey }) {
+  const tableSql = quoteTableName(tableName);
   const shouldUpsert = dedupeKey && UPSERT_TAGS.has(tag);
   const sql = shouldUpsert
-    ? `INSERT INTO ${tableName}
+    ? `INSERT INTO ${tableSql}
          (event_at, source, tag, text, agent_id, session_id, metadata, dedupe_key)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        ON CONFLICT (dedupe_key) DO UPDATE SET
@@ -38,7 +55,7 @@ async function insertDailyEntry(pool, tableName, { eventAt, source, tag, text, a
          event_at = EXCLUDED.event_at,
          metadata = EXCLUDED.metadata
        RETURNING id, event_at, source, tag, text`
-    : `INSERT INTO ${tableName}
+    : `INSERT INTO ${tableSql}
          (event_at, source, tag, text, agent_id, session_id, metadata, dedupe_key)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        ON CONFLICT (dedupe_key) DO NOTHING
@@ -53,8 +70,9 @@ async function insertDailyEntry(pool, tableName, { eventAt, source, tag, text, a
 }
 
 async function getDailyEntries(pool, tableName, date, agentId) {
+  const tableSql = quoteTableName(tableName);
   const result = await pool.query(
-    `SELECT * FROM ${tableName}
+    `SELECT * FROM ${tableSql}
       WHERE (event_at AT TIME ZONE 'Asia/Taipei')::date = $1
         AND ($2::text IS NULL OR agent_id = $2)
       ORDER BY event_at ASC`,
@@ -191,6 +209,7 @@ async function writeDailyEntries({
 
 module.exports = {
   taipeiDateString, textHash6,
+  quoteIdentifier, quoteTableName,
   insertDailyEntry, getDailyEntries, fetchDailyContext, writeDailyEntries,
   UPSERT_TAGS,
 };

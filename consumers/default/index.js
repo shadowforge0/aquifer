@@ -15,7 +15,7 @@
 //       briefingIntro: '你是 Dobby。以下是現況...',  // optional context-inject preamble
 //     });
 //
-// Returns a persona module with the same shape as consumers/miranda — host
+// Returns a persona module with the standard persona adapter shape — host
 // can do `AQUIFER_PERSONA=<host-path>` where <host-path>/index.js does:
 //   module.exports = require('@shadowforge0/aquifer-memory/consumers/default')
 //     .createPersona({ ... });
