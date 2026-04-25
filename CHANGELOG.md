@@ -4,6 +4,45 @@ All notable changes to `@shadowforge0/aquifer-memory` are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project uses semantic versioning.
 
+## [1.5.12] - 2026-04-25
+
+### Changed
+
+- Public package files are now whitelisted to generic Aquifer entrypoints:
+  core, pipeline, schema, CLI/MCP/OpenClaw/OpenCode/Claude Code adapters,
+  shared consumer helpers, and the default persona.
+- `consumers/claude-code` no longer imports a Miranda context injector.
+  Callers must supply `contextInjector` / `computeInjection`.
+- Default persona summary parsing now uses `consumers/shared/summary-parser`
+  instead of importing Miranda prompt internals.
+- Default persona daily-entry table names are now validated and quoted before
+  SQL construction.
+- Shared recap parsing preserves safe named `OPEN` owners instead of collapsing
+  them to `unknown`.
+- `./consumers/miranda` remains exported as a deprecated compatibility shim.
+  The shim delegates to the private `@mingko/aquifer-miranda-adapter` package
+  when that adapter is installed.
+- `session_summaries.model` is nullable in schema, while storage uses an
+  `unknown` insert fallback so legacy NOT NULL installs do not fail before
+  migration converges.
+
+### Removed
+
+- Removed npm lifecycle `prepare` side effect that configured
+  `core.hooksPath`; contributors can run `npm run hooks:install`
+  explicitly.
+- Removed unreproducible LongMemEval benchmark claims from README and this
+  changelog until the benchmark harness and reproduction instructions are
+  published.
+- Removed dated internal planning specs from the package worktree.
+
+### Compatibility note
+
+- Miranda deployment code now lives outside the public Aquifer package. Existing
+  `./consumers/miranda` imports still resolve, but callers must install/use the
+  private `@mingko/aquifer-miranda-adapter` package for Miranda-specific runtime
+  behavior.
+
 ## [1.5.11] - 2026-04-21
 
 Removes a dead legacy helper from `core/insights`. No runtime or schema
@@ -981,21 +1020,6 @@ future `miranda → aquifer` rename.
   CLI — canonical 5-tool manifest for bi-directional registration. Gateway
   imports in-process; CC MCP server reads
   `/tmp/aquifer-mcp-contract.json`.
-
-### Benchmark
-
-Re-ingested full LongMemEval_S (19,195 sessions / 98,795 turn embeddings
-via OpenRouter bge-m3) and re-ran retrieval pipeline. Added
-`bench_production_rerank.js` exercising the Cohere Rerank v3.5 top-30
-pass. New baselines documented in README:
-
-| Pipeline | R@1 | R@3 | R@5 | R@10 |
-|----------|-----|-----|-----|------|
-| Turn-only cosine | 89.5% | 96.6% | 98.1% | 98.9% |
-| 3-way hybrid | 79.2% | 94.0% | 97.7% | 98.9% |
-| **Hybrid + Cohere Rerank v3.5** | **96.0%** | **98.5%** | **99.3%** | **99.8%** |
-
-Rerank lift: R@1 +16.9pt over hybrid baseline, +6.5pt over turn-only.
 
 ### Tests
 
