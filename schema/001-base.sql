@@ -160,6 +160,9 @@ CREATE TABLE IF NOT EXISTS ${schema}.session_summaries (
   updated_at               TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
 
+ALTER TABLE ${schema}.session_summaries
+  ALTER COLUMN model DROP NOT NULL;
+
 -- Cleanup legacy segment-era schema artifacts so migrate() converges old installs.
 -- Wrapped because the implicit sequence on session_segments can be referenced from
 -- other schemas (e.g. bench/staging created via CREATE TABLE LIKE), which would

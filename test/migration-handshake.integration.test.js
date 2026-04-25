@@ -16,6 +16,7 @@ const assert = require('node:assert/strict');
 const crypto = require('crypto');
 const { Pool } = require('pg');
 const { createAquifer } = require('../index');
+const storage = require('../core/storage');
 
 const DB_URL = process.env.AQUIFER_TEST_DB_URL;
 if (!DB_URL) {
@@ -37,6 +38,28 @@ const makeAquifer = (schema, extra = {}) => createAquifer({
 
 async function dropSchema(pool, schema) {
   try { await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`); } catch {}
+}
+
+async function sessionSummaryModelNullable(pool, schema) {
+  const r = await pool.query(
+    `SELECT is_nullable
+     FROM information_schema.columns
+     WHERE table_schema = $1
+       AND table_name = 'session_summaries'
+       AND column_name = 'model'`,
+    [schema]
+  );
+  return r.rows[0]?.is_nullable;
+}
+
+async function insertSession(pool, schema, sessionId) {
+  const r = await pool.query(
+    `INSERT INTO ${schema}.sessions (tenant_id, session_id, agent_id, source)
+     VALUES ('default', $1, 'main', 'test')
+     RETURNING id`,
+    [sessionId]
+  );
+  return r.rows[0].id;
 }
 
 describe('aquifer.init() — apply mode (default)', () => {
@@ -222,5 +245,84 @@ describe('aquifer.init() — onEvent observability', () => {
     for (const name of required) {
       assert.ok(events.includes(name), `expected event ${name} in ${JSON.stringify(events)}`);
     }
+  });
+});
+
+describe('session_summaries.model legacy compatibility', () => {
+  const schema = randomSchema();
+  let pool;
+  let aquifer;
+
+  before(async () => {
+    pool = new Pool({ connectionString: DB_URL });
+    aquifer = makeAquifer(schema);
+    await aquifer.migrate();
+  });
+  after(async () => {
+    await dropSchema(pool, schema);
+    if (aquifer) await aquifer.close?.().catch(() => {});
+    await pool.end().catch(() => {});
+  });
+
+  it('migrate() relaxes a legacy NOT NULL model column', async () => {
+    await pool.query(`ALTER TABLE ${schema}.session_summaries ALTER COLUMN model SET NOT NULL`);
+    assert.equal(await sessionSummaryModelNullable(pool, schema), 'NO');
+
+    await aquifer.migrate();
+
+    assert.equal(await sessionSummaryModelNullable(pool, schema), 'YES');
+  });
+
+  it('upsertSummary tolerates missing model without downgrading an existing model', async () => {
+    await pool.query(`ALTER TABLE ${schema}.session_summaries ALTER COLUMN model SET NOT NULL`);
+    const sessionRowId = await insertSession(pool, schema, 'legacy-model-upsert');
+    const base = {
+      schema,
+      tenantId: 'default',
+      agentId: 'main',
+      sessionId: 'legacy-model-upsert',
+      summaryText: 'legacy summary',
+      structuredSummary: {},
+      msgCount: 1,
+      userCount: 1,
+      assistantCount: 0,
+    };
+
+    const inserted = await storage.upsertSummary(pool, sessionRowId, base);
+    assert.equal(inserted.model, 'unknown');
+
+    const explicit = await storage.upsertSummary(pool, sessionRowId, {
+      ...base,
+      model: 'gpt-real',
+    });
+    assert.equal(explicit.model, 'gpt-real');
+
+    const fallback = await storage.upsertSummary(pool, sessionRowId, base);
+    assert.equal(fallback.model, 'gpt-real');
+  });
+
+  it('upsertSummary preserves an existing NULL model on nullable schemas', async () => {
+    await aquifer.migrate();
+    const sessionRowId = await insertSession(pool, schema, 'nullable-model-upsert');
+    await pool.query(
+      `INSERT INTO ${schema}.session_summaries
+         (session_row_id, tenant_id, agent_id, session_id, model, structured_summary)
+       VALUES ($1, 'default', 'main', 'nullable-model-upsert', NULL, '{}'::jsonb)`,
+      [sessionRowId]
+    );
+
+    const row = await storage.upsertSummary(pool, sessionRowId, {
+      schema,
+      tenantId: 'default',
+      agentId: 'main',
+      sessionId: 'nullable-model-upsert',
+      summaryText: 'nullable summary',
+      structuredSummary: {},
+      msgCount: 1,
+      userCount: 1,
+      assistantCount: 0,
+    });
+
+    assert.equal(row.model, null);
   });
 });

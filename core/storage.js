@@ -127,7 +127,7 @@ async function upsertSummary(pool, sessionRowId, {
       tenant_id = EXCLUDED.tenant_id,
       agent_id = EXCLUDED.agent_id,
       session_id = EXCLUDED.session_id,
-      model = COALESCE(EXCLUDED.model, ${qi(schema)}.session_summaries.model),
+      model = COALESCE(NULLIF(EXCLUDED.model, 'unknown'), ${qi(schema)}.session_summaries.model),
       source_hash = COALESCE(EXCLUDED.source_hash, ${qi(schema)}.session_summaries.source_hash),
       message_count = COALESCE(EXCLUDED.message_count, ${qi(schema)}.session_summaries.message_count),
       user_message_count = COALESCE(EXCLUDED.user_message_count, ${qi(schema)}.session_summaries.user_message_count),
@@ -141,7 +141,7 @@ async function upsertSummary(pool, sessionRowId, {
     RETURNING session_row_id, tenant_id, agent_id, session_id, model`,
     [
       sessionRowId, tenantId, agentId || null, sessionId || null,
-      model || null, sourceHash || null,
+      model || 'unknown', sourceHash || null,
       msgCount || 0, userCount || 0, assistantCount || 0,
       startedAt || null, endedAt || null,
       structuredSummary ? JSON.stringify(structuredSummary) : null,
