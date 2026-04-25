@@ -8,9 +8,14 @@
     "core/",
     "pipeline/",
     "schema/",
-    "consumers/",
-    "consumers/miranda/",
+    "consumers/cli.js",
+    "consumers/mcp.js",
+    "consumers/claude-code.js",
+    "consumers/openclaw-plugin.js",
+    "consumers/opencode.js",
+    "consumers/shared/",
     "consumers/default/",
+    "consumers/miranda/index.js",
     "consumers/openclaw-ext/",
     "docs/",
     "scripts/backfill-canonical-key.js",
@@ -32,8 +37,8 @@
     "./consumers/openclaw-plugin": "./consumers/openclaw-plugin.js",
     "./consumers/opencode": "./consumers/opencode.js",
     "./consumers/claude-code": "./consumers/claude-code.js",
-    "./consumers/miranda": "./consumers/miranda/index.js",
     "./consumers/default": "./consumers/default/index.js",
+    "./consumers/miranda": "./consumers/miranda/index.js",
     "./consumers/openclaw-ext": "./consumers/openclaw-ext/index.js",
     "./consumers/shared/config": "./consumers/shared/config.js",
     "./consumers/shared/factory": "./consumers/shared/factory.js",
@@ -41,6 +46,7 @@
     "./consumers/shared/normalize": "./consumers/shared/normalize.js",
     "./consumers/shared/ingest": "./consumers/shared/ingest.js",
     "./consumers/shared/recall-format": "./consumers/shared/recall-format.js",
+    "./consumers/shared/summary-parser": "./consumers/shared/summary-parser.js",
     "./consumers/shared/llm-autodetect": "./consumers/shared/llm-autodetect.js"
   },
   "repository": {
@@ -55,8 +61,8 @@
   "scripts": {
     "test": "node --test test/*.test.js",
     "test:integration": "node --test test/integration.test.js",
-    "lint": "eslint index.js core/*.js consumers/*.js consumers/shared/*.js consumers/miranda/*.js consumers/miranda/prompts/*.js consumers/default/*.js consumers/default/prompts/*.js consumers/openclaw-ext/*.js pipeline/*.js pipeline/consolidation/*.js scripts/*.js test/*.js",
-    "prepare": "git config core.hooksPath .githooks 2>/dev/null || true"
+    "lint": "eslint index.js core/*.js consumers/cli.js consumers/mcp.js consumers/claude-code.js consumers/openclaw-plugin.js consumers/opencode.js consumers/shared/*.js consumers/default/*.js consumers/default/prompts/*.js consumers/openclaw-ext/*.js pipeline/*.js pipeline/consolidation/*.js scripts/*.js test/*.js",
+    "hooks:install": "git config core.hooksPath .githooks"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
