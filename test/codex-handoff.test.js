@@ -120,7 +120,17 @@ describe('Codex handoff finalization helper', () => {
     const calls = [];
     const aquifer = {
       async getSession() {
-        return { session_id: 'codex-session-1', processing_status: 'pending' };
+        return {
+          session_id: 'codex-session-1',
+          processing_status: 'pending',
+          msg_count: view.counts.safeMessageCount,
+          user_count: view.counts.userCount,
+          assistant_count: view.counts.assistantCount,
+          messages: {
+            normalized: view.messages,
+            metadata: { transcript_hash: view.transcriptHash },
+          },
+        };
       },
       finalization: {
         async finalizeSession(input) {

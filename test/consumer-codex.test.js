@@ -556,6 +556,98 @@ describe('Codex consumer recovery helpers', () => {
         assert.match(finalizeCall.input.transcriptHash, /^[a-f0-9]{64}$/);
         assert.equal(finalizeCall.input.metadata.trigger, 'session_start_recovery');
     });
+
+    it('re-commits a stale session snapshot before finalization', async () => {
+        const root = tmpDir();
+        const file = path.join(root, 'rollout-stale-finalize.jsonl');
+        writeJsonl(file, [
+            sessionMeta('meta-stale'),
+            user('u1'),
+            assistant('a1'),
+            user('u2'),
+            assistant('a2'),
+            user('u3'),
+            assistant('a3'),
+        ]);
+        const view = codex.materializeRecoveryTranscriptView({
+            sessionId: 'meta-stale',
+            filePath: file,
+        }, { maxRecoveryBytes: 1024 * 1024 });
+        assert.equal(view.status, 'ok');
+
+        const aq = makeFakeAquifer({
+            'meta-stale': {
+                session_id: 'meta-stale',
+                processing_status: 'succeeded',
+                msg_count: 2,
+                user_count: 1,
+                assistant_count: 1,
+                messages: {
+                    normalized: view.messages.slice(0, 2),
+                    metadata: { transcript_hash: '0'.repeat(64) },
+                },
+            },
+        });
+
+        const result = await codex.finalizeCodexSession(aq, {
+            view,
+            summaryText: 'Re-finalization uses the current committed transcript.',
+            structuredSummary: {
+                facts: [{ subject: 'Codex', statement: 'Stale snapshots are recommitted before finalization.' }],
+            },
+        });
+
+        assert.equal(result.status, 'finalized');
+        assert.equal(result.commit.status, 'recommitted');
+        assert.equal(aq.calls.commit.length, 1);
+        assert.equal(aq.calls.commit[0].sessionId, 'meta-stale');
+        assert.equal(aq.calls.commit[0].messages.length, view.messages.length);
+    });
+
+    it('does not re-commit when the existing session snapshot matches the finalization view', async () => {
+        const root = tmpDir();
+        const file = path.join(root, 'rollout-current-finalize.jsonl');
+        writeJsonl(file, [
+            sessionMeta('meta-current'),
+            user('u1'),
+            assistant('a1'),
+            user('u2'),
+            assistant('a2'),
+            user('u3'),
+            assistant('a3'),
+        ]);
+        const view = codex.materializeRecoveryTranscriptView({
+            sessionId: 'meta-current',
+            filePath: file,
+        }, { maxRecoveryBytes: 1024 * 1024 });
+        assert.equal(view.status, 'ok');
+
+        const aq = makeFakeAquifer({
+            'meta-current': {
+                session_id: 'meta-current',
+                processing_status: 'succeeded',
+                msg_count: view.messages.length,
+                user_count: view.counts.userCount,
+                assistant_count: view.counts.assistantCount,
+                messages: {
+                    normalized: view.messages,
+                    metadata: { transcript_hash: view.transcriptHash },
+                },
+            },
+        });
+
+        const result = await codex.finalizeCodexSession(aq, {
+            view,
+            summaryText: 'Current snapshot can be finalized directly.',
+            structuredSummary: {
+                facts: [{ subject: 'Codex', statement: 'Matching snapshots do not need recommit.' }],
+            },
+        });
+
+        assert.equal(result.status, 'finalized');
+        assert.equal(result.commit.status, 'already_committed');
+        assert.equal(aq.calls.commit.length, 0);
+    });
 });
 
 describe('Codex consumer runSync', () => {

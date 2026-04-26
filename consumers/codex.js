@@ -450,9 +450,27 @@ function defaultPaths(opts = {}) {
     };
 }
 
-async function getExistingSession(aquifer, sessionId, agentId) {
+async function getExistingSession(aquifer, sessionId, agentId, opts = {}) {
     if (!aquifer || typeof aquifer.getSession !== 'function') return null;
-    return aquifer.getSession(sessionId, { agentId });
+    return aquifer.getSession(sessionId, { agentId, source: opts.source || undefined });
+}
+
+function readCommittedTranscriptHash(session = {}) {
+    const messages = session.messages || session.rawMessages || null;
+    if (!messages || typeof messages !== 'object') return null;
+    const metadata = messages.metadata || {};
+    return metadata.transcript_hash || metadata.transcriptHash || null;
+}
+
+function committedSnapshotMatchesView(session = {}, view = {}) {
+    if (!session) return false;
+    const viewCount = view.counts?.safeMessageCount || (Array.isArray(view.messages) ? view.messages.length : 0);
+    const dbMsgCount = Number(session.msg_count || session.msgCount || 0);
+    if (viewCount !== dbMsgCount) return false;
+
+    const committedHash = readCommittedTranscriptHash(session);
+    if (committedHash && view.transcriptHash && committedHash !== view.transcriptHash) return false;
+    return true;
 }
 
 async function needsImport(aquifer, candidate, opts = {}) {
@@ -1062,12 +1080,15 @@ async function ensureCommittedForFinalization(aquifer, view = {}, opts = {}) {
         source = 'codex',
         sessionKey = 'codex:cli',
     } = opts;
-    const existing = await getExistingSession(aquifer, view.sessionId, agentId);
-    if (existing) return { status: 'already_committed', session: existing };
+    const existing = await getExistingSession(aquifer, view.sessionId, agentId, { source });
+    if (committedSnapshotMatchesView(existing, view)) {
+        return { status: 'already_committed', session: existing };
+    }
 
     if (!aquifer || typeof aquifer.commit !== 'function') {
-        throw new Error('aquifer.commit is required to finalize an uncommitted Codex session');
+        throw new Error('aquifer.commit is required to finalize an uncommitted or stale Codex session');
     }
+
     await aquifer.commit(view.sessionId, view.messages, {
         rawMessages: {
             normalized: view.messages,
@@ -1087,7 +1108,7 @@ async function ensureCommittedForFinalization(aquifer, view = {}, opts = {}) {
         startedAt: view.metadata?.startedAt || null,
         lastMessageAt: view.metadata?.lastMessageAt || null,
     });
-    return { status: 'committed' };
+    return { status: existing ? 'recommitted' : 'committed', previous: existing || null };
 }
 
 async function finalizeTranscriptView(aquifer, view = {}, summary = {}, opts = {}) {
