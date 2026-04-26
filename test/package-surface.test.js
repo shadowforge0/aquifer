@@ -13,6 +13,8 @@ describe('package surface', () => {
       '/consumers/mcp',
       '/consumers/openclaw-plugin',
       '/consumers/opencode',
+      '/consumers/codex',
+      '/consumers/codex-handoff',
       '/consumers/claude-code',
       '/consumers/default',
       '/consumers/miranda',
@@ -55,6 +57,13 @@ describe('package surface', () => {
 
     assert.ok(paths.has('consumers/shared/summary-parser.js'));
     assert.ok(paths.has('consumers/default/index.js'));
+    assert.ok(paths.has('consumers/codex-handoff.js'));
+    assert.ok(paths.has('scripts/codex-recovery.js'));
+    assert.ok(paths.has('docs/getting-started.md'));
+    assert.ok(paths.has('docs/postprocess-contract.md'));
+    assert.ok(paths.has('docs/setup.md'));
+    assert.ok(!paths.has('docs/memory-scope-v1.md'));
+    assert.ok(!paths.has('docs/memory-v1-roadmap.md'));
     assert.ok(paths.has('consumers/miranda/index.js'));
     const mirandaPaths = [...paths].filter(p => p.startsWith('consumers/miranda/')).sort();
     assert.deepEqual(mirandaPaths, ['consumers/miranda/index.js']);

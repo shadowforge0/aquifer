@@ -3,6 +3,7 @@ package-lock.json
 *.tgz
 .review-run-*/
 .develop-runs/
+.aquifer/
 HANDOFF_*.md
 bench-report-*.json
 bench-report-*.md
