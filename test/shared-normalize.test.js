@@ -24,6 +24,27 @@ function ccEntry({ role, content, timestamp = null, model = null, usage = null }
     };
 }
 
+function codexEntry(entry) {
+    return entry;
+}
+
+function codexUser(text, timestamp = '2026-04-18T10:00:00Z') {
+    return codexEntry({ type: 'event_msg', timestamp, payload: { type: 'user_message', message: text } });
+}
+
+function codexAssistant(text, timestamp = '2026-04-18T10:00:05Z', extra = {}) {
+    return codexEntry({
+        type: 'response_item',
+        timestamp,
+        payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text }],
+            ...extra,
+        },
+    });
+}
+
 // ---------------------------------------------------------------------------
 
 describe('normalizeMessages — empty input', () => {
@@ -75,6 +96,17 @@ describe('normalizeMessages — adapter selection', () => {
         ];
         const out = normalizeMessages(entries, { adapter: 'gateway' });
         assert.equal(out.messages.length, 2);
+    });
+
+    it('accepts explicit "codex" adapter', () => {
+        const entries = [
+            codexUser('hi'),
+            codexAssistant('hello'),
+        ];
+        const out = normalizeMessages(entries, { adapter: 'codex' });
+        assert.equal(out.userCount, 1);
+        assert.equal(out.assistantCount, 1);
+        assert.equal(out.messages[1].content, 'hello');
     });
 
     it('auto-detects when adapter omitted', () => {
@@ -168,6 +200,55 @@ describe('normalizeMessages — output shape (claude-code)', () => {
         assert.equal(out.assistantCount, 1);
         assert.equal(out.messages[0].content, 'hi');
         assert.equal(new Date(out.startedAt).toISOString(), '2026-04-18T10:00:00.000Z');
+    });
+});
+
+describe('normalizeMessages — output shape (codex)', () => {
+    it('uses the shared narration/tool-only filter for Codex commentary before tool calls', () => {
+        const entries = [
+            { type: 'turn_context', payload: { model: 'gpt-5.4' } },
+            codexUser('請處理這件事', '2026-04-18T10:00:00Z'),
+            codexAssistant('我先查檔案狀態', '2026-04-18T10:00:01Z', { phase: 'commentary' }),
+            { type: 'response_item', timestamp: '2026-04-18T10:00:02Z', payload: { type: 'function_call', name: 'exec_command' } },
+            codexAssistant('已完成修復，測試通過。', '2026-04-18T10:00:03Z', { phase: 'final_answer' }),
+            { type: 'event_msg', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 12, output_tokens: 7 } } } },
+        ];
+        const out = normalizeMessages(entries, { adapter: 'codex' });
+        assert.equal(out.model, 'gpt-5.4');
+        assert.equal(out.tokensIn, 12);
+        assert.equal(out.tokensOut, 7);
+        assert.equal(out.skipStats.narration, 1);
+        assert.equal(out.toolsUsed.includes('exec_command'), true);
+        assert.deepEqual(out.messages.map(m => m.content), ['請處理這件事', '已完成修復，測試通過。']);
+    });
+
+    it('normalizes equivalent Claude Code and Codex transcripts to the same conversation', () => {
+        const ccEntries = [
+            ccEntry({ role: 'user', content: '請修 afterburn 流程', timestamp: '2026-04-18T10:00:00Z' }),
+            ccEntry({ role: 'assistant', content: '我先查檔案狀態', timestamp: '2026-04-18T10:00:01Z' }),
+            {
+                type: 'assistant',
+                timestamp: '2026-04-18T10:00:02Z',
+                message: {
+                    role: 'assistant',
+                    content: [{ type: 'tool_use', name: 'exec_command', input: { cmd: 'rg afterburn' } }],
+                },
+            },
+            ccEntry({ role: 'assistant', content: '已完成修復，測試通過。', timestamp: '2026-04-18T10:00:03Z' }),
+        ];
+        const codexEntries = [
+            { type: 'turn_context', payload: { model: 'gpt-5.4' } },
+            codexUser('請修 afterburn 流程', '2026-04-18T10:00:00Z'),
+            codexAssistant('我先查檔案狀態', '2026-04-18T10:00:01Z', { phase: 'commentary' }),
+            { type: 'response_item', timestamp: '2026-04-18T10:00:02Z', payload: { type: 'function_call', name: 'exec_command' } },
+            codexAssistant('已完成修復，測試通過。', '2026-04-18T10:00:03Z', { phase: 'final_answer' }),
+        ];
+
+        const ccOut = normalizeMessages(ccEntries, { adapter: 'cc' });
+        const codexOut = normalizeMessages(codexEntries, { adapter: 'codex' });
+        const pickConversation = (out) => out.messages.map(({ role, content }) => ({ role, content }));
+
+        assert.deepEqual(pickConversation(codexOut), pickConversation(ccOut));
     });
 });
 

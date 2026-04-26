@@ -5,7 +5,7 @@
 // session-level metadata. Wraps pipeline/normalize so consumers don't each
 // reinvent their own role/content extraction.
 //
-// Supported adapters: 'gateway' | 'cc' (alias of 'claude-code'). The OpenCode
+// Supported adapters: 'gateway' | 'cc' (alias of 'claude-code') | 'codex'. The OpenCode
 // consumer reads from SQLite and constructs the output shape directly; it is
 // not expected to route through here.
 //
@@ -21,13 +21,14 @@ const ADAPTER_ALIASES = {
     'cc': 'claude-code',
     'claude-code': 'claude-code',
     'gateway': 'gateway',
+    'codex': 'codex',
 };
 
 function resolveAdapter(adapter) {
     if (!adapter) return null;  // auto-detect
     const name = ADAPTER_ALIASES[adapter];
     if (!name) {
-        throw new Error(`Unknown adapter: "${adapter}". Supported: gateway, cc (alias claude-code).`);
+        throw new Error(`Unknown adapter: "${adapter}". Supported: gateway, cc (alias claude-code), codex.`);
     }
     return name;
 }
@@ -39,6 +40,16 @@ function extractRawMeta(rawEntries) {
 
     for (const entry of rawEntries || []) {
         if (!entry || typeof entry !== 'object') continue;
+
+        if (entry.type === 'turn_context' && entry.payload?.model && !model) {
+            model = entry.payload.model;
+        }
+        if (entry.type === 'event_msg' && entry.payload?.type === 'token_count') {
+            const usage = entry.payload?.info?.last_token_usage || {};
+            tokensIn += usage.input_tokens || usage.input || 0;
+            tokensOut += usage.output_tokens || usage.output || 0;
+        }
+
         const msg = entry.message || entry;
         if (msg && typeof msg === 'object') {
             if (msg.model && !model) model = msg.model;
@@ -57,7 +68,7 @@ function extractRawMeta(rawEntries) {
  *
  * @param {any[]} rawEntries
  * @param {object} [opts]
- * @param {'gateway'|'cc'|'claude-code'} [opts.adapter] — host adapter; auto-detected if omitted
+ * @param {'gateway'|'cc'|'claude-code'|'codex'} [opts.adapter] — host adapter; auto-detected if omitted
  * @returns {{
  *   messages: {role:string,content:string,timestamp:string|null}[],
  *   userCount: number, assistantCount: number,

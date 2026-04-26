@@ -37,7 +37,7 @@ function evictStale(dedupMap, now = Date.now()) {
  * @param {string} [opts.source] — caller-provided source tag (e.g. 'openclaw', 'cc', 'opencode')
  * @param {string} [opts.sessionKey] — passed through to commit()
  * @param {any[]} opts.rawEntries — host-native session entries
- * @param {'gateway'|'cc'|'claude-code'|'preNormalized'} [opts.adapter]
+ * @param {'gateway'|'cc'|'claude-code'|'codex'|'preNormalized'} [opts.adapter]
  *        'preNormalized' means rawEntries already matches normalizeMessages output
  *        (used by OpenCode which reads SQLite directly).
  * @param {object} [opts.preNormalized] — { messages, userCount, ... } ready to commit,

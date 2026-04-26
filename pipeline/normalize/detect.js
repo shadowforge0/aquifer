@@ -2,14 +2,15 @@
 
 const gatewayAdapter = require('./adapters/gateway');
 const claudeCodeAdapter = require('./adapters/claude-code');
+const codexAdapter = require('./adapters/codex');
 
-const ADAPTERS = [gatewayAdapter, claudeCodeAdapter];
+const ADAPTERS = [gatewayAdapter, claudeCodeAdapter, codexAdapter];
 
 /**
  * Auto-detect the client type from raw session entries.
  * Samples the first 5 entries and picks the adapter with the most matches.
  * @param {any[]} rawEntries
- * @returns {string} Client name ('gateway' | 'claude-code')
+ * @returns {string} Client name ('gateway' | 'claude-code' | 'codex')
  * @throws {Error} If entries are empty, no adapter matches, or detection is ambiguous
  */
 function detectClient(rawEntries) {
