@@ -12,17 +12,15 @@ const assert = require('node:assert/strict');
 const crypto = require('crypto');
 const { Pool } = require('pg');
 const { createAquifer } = require('../index');
+const { requireTestDb } = require('./helpers/require-test-db');
 
-const DB_URL = process.env.AQUIFER_TEST_DB_URL;
-if (!DB_URL) {
-  console.error('AQUIFER_TEST_DB_URL not set. Skipping session ended_at integration tests.');
-  process.exit(0);
-}
+const DB_URL = requireTestDb('session ended_at integration tests');
 
 function randomSchema() {
   return `aquifer_test_${crypto.randomBytes(4).toString('hex')}`;
 }
 
+if (DB_URL) {
 describe('upsertSession ended_at behaviour', () => {
   const schema = randomSchema();
   let pool;
@@ -93,3 +91,4 @@ describe('upsertSession ended_at behaviour', () => {
       'ended_at must be preserved when caller omits lastMessageAt');
   });
 });
+}

@@ -7,17 +7,15 @@ const assert = require('node:assert/strict');
 const crypto = require('crypto');
 const { Pool } = require('pg');
 const { createAquifer } = require('../index');
+const { requireTestDb } = require('./helpers/require-test-db');
 
-const DB_URL = process.env.AQUIFER_TEST_DB_URL;
-if (!DB_URL) {
-  console.error('AQUIFER_TEST_DB_URL not set. Skipping timeline integration tests.');
-  process.exit(0);
-}
+const DB_URL = requireTestDb('timeline integration tests');
 
 function randomSchema() {
   return `aquifer_test_${crypto.randomBytes(4).toString('hex')}`;
 }
 
+if (DB_URL) {
 describe('aq.timeline capability', () => {
   const schema = randomSchema();
   let pool;
@@ -117,3 +115,4 @@ describe('aq.timeline capability', () => {
     }
   });
 });
+}

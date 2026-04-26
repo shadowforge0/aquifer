@@ -17,12 +17,9 @@ const crypto = require('crypto');
 const { Pool } = require('pg');
 const { createAquifer } = require('../index');
 const storage = require('../core/storage');
+const { requireTestDb } = require('./helpers/require-test-db');
 
-const DB_URL = process.env.AQUIFER_TEST_DB_URL;
-if (!DB_URL) {
-  console.error('AQUIFER_TEST_DB_URL not set. Skipping migration handshake integration tests.');
-  process.exit(0);
-}
+const DB_URL = requireTestDb('migration handshake integration tests');
 
 function randomSchema() {
   return `aquifer_test_${crypto.randomBytes(4).toString('hex')}`;
@@ -62,6 +59,7 @@ async function insertSession(pool, schema, sessionId) {
   return r.rows[0].id;
 }
 
+if (DB_URL) {
 describe('aquifer.init() — apply mode (default)', () => {
   const schema = randomSchema();
   let pool;
@@ -326,3 +324,4 @@ describe('session_summaries.model legacy compatibility', () => {
     assert.equal(row.model, null);
   });
 });
+}

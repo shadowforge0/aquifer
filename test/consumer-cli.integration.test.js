@@ -18,12 +18,9 @@ const { spawnSync } = require('child_process');
 const { Pool } = require('pg');
 
 const { createAquifer } = require('../index');
+const { requireTestDb } = require('./helpers/require-test-db');
 
-const DB_URL = process.env.AQUIFER_TEST_DB_URL;
-if (!DB_URL) {
-  console.error('AQUIFER_TEST_DB_URL not set. Skipping CLI consumer integration tests.');
-  process.exit(0);
-}
+const DB_URL = requireTestDb('CLI consumer integration tests');
 
 const CLI_PATH = path.join(__dirname, '..', 'consumers', 'cli.js');
 
@@ -52,6 +49,7 @@ function runCli(args, env = {}) {
   };
 }
 
+if (DB_URL) {
 describe('CLI consumer — aquifer <command> end-to-end', () => {
   let schema, pool, aq;
 
@@ -157,3 +155,4 @@ describe('CLI consumer — aquifer <command> end-to-end', () => {
     assert.notEqual(res.code, 0, 'unknown command should fail');
   });
 });
+}

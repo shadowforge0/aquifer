@@ -23,12 +23,9 @@ const { DatabaseSync } = require('node:sqlite');
 
 const { createAquifer } = require('../index');
 const { ingestOpenCode } = require('../consumers/opencode');
+const { requireTestDb } = require('./helpers/require-test-db');
 
-const DB_URL = process.env.AQUIFER_TEST_DB_URL;
-if (!DB_URL) {
-  console.error('AQUIFER_TEST_DB_URL not set. Skipping OpenCode consumer integration tests.');
-  process.exit(0);
-}
+const DB_URL = requireTestDb('OpenCode consumer integration tests');
 
 // ---------------------------------------------------------------------------
 // SQLite fixture — OpenCode schema subset (session, message, part)
@@ -132,6 +129,7 @@ async function teardown(aq, pool, schema, fixturePath) {
 // Tests
 // ---------------------------------------------------------------------------
 
+if (DB_URL) {
 describe('OpenCode consumer — ingestOpenCode end-to-end', () => {
   let aq, pool, schema, fixturePath;
 
@@ -283,3 +281,4 @@ describe('OpenCode consumer — ingestOpenCode end-to-end', () => {
     assert.equal(Number(res.rows[0].n), 1);
   });
 });
+}

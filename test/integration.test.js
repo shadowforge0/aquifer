@@ -19,16 +19,13 @@ const assert = require('node:assert/strict');
 const crypto = require('crypto');
 const { Pool } = require('pg');
 const { createAquifer } = require('../index');
+const { requireTestDb } = require('./helpers/require-test-db');
 
 // ---------------------------------------------------------------------------
 // 環境變數
 // ---------------------------------------------------------------------------
 
-const DB_URL = process.env.AQUIFER_TEST_DB_URL;
-if (!DB_URL) {
-  console.error('AQUIFER_TEST_DB_URL not set. Skipping integration tests.');
-  process.exit(0);
-}
+const DB_URL = requireTestDb('integration tests');
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -133,6 +130,7 @@ async function teardown(aq, adminPool, schema) {
   }
 }
 
+if (DB_URL) {
 // ---------------------------------------------------------------------------
 // 1. migrate() — DDL 完整性
 // ---------------------------------------------------------------------------
@@ -1240,3 +1238,4 @@ describe('8. bootstrap() — session visibility contract', () => {
       `bootstrap must not include pending sessions; got ${JSON.stringify(ids)}`);
   });
 });
+}

@@ -7,17 +7,15 @@ const assert = require('node:assert/strict');
 const crypto = require('crypto');
 const { Pool } = require('pg');
 const { createAquifer } = require('../index');
+const { requireTestDb } = require('./helpers/require-test-db');
 
-const DB_URL = process.env.AQUIFER_TEST_DB_URL;
-if (!DB_URL) {
-  console.error('AQUIFER_TEST_DB_URL not set. Skipping artifacts integration tests.');
-  process.exit(0);
-}
+const DB_URL = requireTestDb('artifacts integration tests');
 
 function randomSchema() {
   return `aquifer_test_${crypto.randomBytes(4).toString('hex')}`;
 }
 
+if (DB_URL) {
 describe('aq.artifacts capability', () => {
   const schema = randomSchema();
   let pool;
@@ -114,3 +112,4 @@ describe('aq.artifacts capability', () => {
     assert.ok(r.data.rows.length >= 3);
   });
 });
+}

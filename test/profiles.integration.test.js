@@ -7,17 +7,15 @@ const assert = require('node:assert/strict');
 const crypto = require('crypto');
 const { Pool } = require('pg');
 const { createAquifer } = require('../index');
+const { requireTestDb } = require('./helpers/require-test-db');
 
-const DB_URL = process.env.AQUIFER_TEST_DB_URL;
-if (!DB_URL) {
-  console.error('AQUIFER_TEST_DB_URL not set. Skipping profiles integration tests.');
-  process.exit(0);
-}
+const DB_URL = requireTestDb('profiles integration tests');
 
 function randomSchema() {
   return `aquifer_test_${crypto.randomBytes(4).toString('hex')}`;
 }
 
+if (DB_URL) {
 describe('aq.profiles capability', () => {
   const schema = randomSchema();
   let pool;
@@ -115,3 +113,4 @@ describe('aq.profiles capability', () => {
     assert.equal(r.data.version, 1);
   });
 });
+}

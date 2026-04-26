@@ -5,12 +5,9 @@ const assert = require('node:assert/strict');
 const crypto = require('crypto');
 const { Pool } = require('pg');
 const { createAquifer } = require('../index');
+const { requireTestDb } = require('./helpers/require-test-db');
 
-const DB_URL = process.env.AQUIFER_TEST_DB_URL;
-if (!DB_URL) {
-  console.error('AQUIFER_TEST_DB_URL not set. Skipping insights semantic dedup integration tests.');
-  process.exit(0);
-}
+const DB_URL = requireTestDb('insights semantic dedup integration tests');
 
 const schema = `aquifer_test_dedup_${crypto.randomBytes(4).toString('hex')}`;
 const SEED_WINDOW = '[2026-04-01T00:00:00Z,2026-04-10T00:00:00Z)';
@@ -208,6 +205,7 @@ async function fetchInsight(id) {
   return r.rows[0];
 }
 
+if (DB_URL) {
 describe('insights semantic dedup integration (real PG)', () => {
   before(async () => {
     const boot = createAquifer({
@@ -574,3 +572,4 @@ describe('insights semantic dedup integration (real PG)', () => {
     }
   });
 });
+}

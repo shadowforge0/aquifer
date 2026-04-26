@@ -143,18 +143,18 @@ describe('config.js — loadConfig', () => {
   });
 
   it('nested override merges deeply', () => {
-    const result = loadConfig({ overrides: { embed: { timeoutMs: 99999 } } });
+    const result = loadConfig({ env: {}, overrides: { embed: { timeoutMs: 99999 } } });
     assert.strictEqual(result.embed.timeoutMs, 99999);
     assert.strictEqual(result.embed.model, null); // unchanged
   });
 
   it('configPath with non-existent JSON file is ignored (ENOENT)', () => {
-    const result = loadConfig({ configPath: '/nonexistent/config.json', overrides: {} });
+    const result = loadConfig({ env: {}, configPath: '/nonexistent/config.json', overrides: {} });
     assert.strictEqual(result.schema, 'aquifer');
   });
 
   it('configPath with non-existent JS file is ignored', () => {
-    const result = loadConfig({ configPath: '/nonexistent/config.js', overrides: {} });
+    const result = loadConfig({ env: {}, configPath: '/nonexistent/config.js', overrides: {} });
     assert.strictEqual(result.schema, 'aquifer');
   });
 });

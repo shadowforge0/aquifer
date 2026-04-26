@@ -21,17 +21,15 @@ const assert = require('node:assert/strict');
 const crypto = require('crypto');
 const { Pool } = require('pg');
 const { createAquifer } = require('../index');
+const { requireTestDb } = require('./helpers/require-test-db');
 
-const DB_URL = process.env.AQUIFER_TEST_DB_URL;
-if (!DB_URL) {
-  console.error('AQUIFER_TEST_DB_URL not set. Skipping migration FTS integration tests.');
-  process.exit(0);
-}
+const DB_URL = requireTestDb('migration FTS integration tests');
 
 function randomSchema() {
   return `aquifer_ftstest_${crypto.randomBytes(4).toString('hex')}`;
 }
 
+if (DB_URL) {
 describe('Chinese FTS migration (zhcfg state machine)', () => {
   const schema = randomSchema();
   const pool = new Pool({ connectionString: DB_URL });
@@ -161,3 +159,4 @@ describe('Chinese FTS migration (zhcfg state machine)', () => {
     );
   });
 });
+}
