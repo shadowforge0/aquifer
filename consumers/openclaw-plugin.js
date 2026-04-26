@@ -201,7 +201,7 @@ function register(api) {
 
       return {
         name: 'session_recall',
-        description: 'Search stored sessions by keyword. Supports entity intersection for precise multi-entity queries.',
+        description: 'Search Aquifer memory by keyword. In curated serving mode this searches active curated memory; legacy/evidence lookup is exposed by the MCP stdio evidence_recall tool. Supports entity intersection for precise multi-entity queries.',
         parameters: {
           type: 'object',
           properties: {

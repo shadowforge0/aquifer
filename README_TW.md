@@ -458,7 +458,7 @@ MCP consumer（`consumers/mcp.js`）已經把 `aquifer.init()` 串進 `server.co
 
 #### `aquifer.listPendingMigrations()` / `aquifer.getMigrationStatus()`
 
-靠 `pg_tables` signature probe 回 `{ required, applied, pending, lastRunAt }`，完全不跑 DDL。適合 health check 或 consumer 在 `init()` 之前想先知道 drift 狀態。
+靠 table / column signature probe 回 `{ required, applied, pending, lastRunAt }`；table 走 `pg_tables`，alter-only migration 會用 `information_schema.columns` 判斷欄位是否存在，完全不跑 DDL。適合 health check 或 consumer 在 `init()` 之前想先知道 drift 狀態。
 
 #### `aquifer.migrate()`
 

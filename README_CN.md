@@ -446,7 +446,7 @@ MCP consumer（`consumers/mcp.js`）已经在 `server.connect()` 前接好 `aqui
 
 #### `aquifer.listPendingMigrations()` / `aquifer.getMigrationStatus()`
 
-通过 `pg_tables` signature probe 返回 `{ required, applied, pending, lastRunAt }`，不执行任何 DDL。适合 health check 或者 consumer 在 `init()` 前先了解 drift 状态。
+通过 table / column signature probe 返回 `{ required, applied, pending, lastRunAt }`；table 走 `pg_tables`，alter-only migration 会用 `information_schema.columns` 判断字段是否存在，不执行任何 DDL。适合 health check 或者 consumer 在 `init()` 前先了解 drift 状态。
 
 #### `aquifer.migrate()`
 

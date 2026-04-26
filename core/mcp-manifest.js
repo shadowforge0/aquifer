@@ -20,7 +20,7 @@ const MCP_SERVER_NAME = 'aquifer-memory';
 const MCP_TOOL_MANIFEST = Object.freeze([
   {
     name: 'session_recall',
-    description: 'Search stored sessions by keyword or natural language. Use entities when the user names specific people, projects, files, tools, or concepts; entityMode="all" hard-filters to sessions containing every entity (default "any" boosts). Use mode to force fts/vector/hybrid (default hybrid). Use dateFrom/dateTo for time-bounded recall.',
+    description: 'Search Aquifer memory. When memory serving mode is curated, this searches active curated memory only; use evidence_recall for legacy session/evidence lookup. Use entities/date filters where supported by the active serving mode.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -50,6 +50,27 @@ const MCP_TOOL_MANIFEST = Object.freeze([
           type: 'boolean',
           description: 'Include per-result score breakdown (rrf, timeDecay, entity, trust, rerank). Diagnostic use only.',
         },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'evidence_recall',
+    description: 'Explicit legacy/evidence search over stored sessions and summaries. This is for audit/debug/distillation and must not implicitly feed bootstrap.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        query: { type: 'string', minLength: 1, description: 'Evidence search query (keyword or natural language)' },
+        limit: { type: 'integer', minimum: 1, maximum: 20, description: 'Max results (default 5)' },
+        agentId: { type: 'string', description: 'Filter by agent ID' },
+        source: { type: 'string', description: 'Filter by source (e.g., gateway, cc)' },
+        dateFrom: { type: 'string', description: 'Start date YYYY-MM-DD' },
+        dateTo: { type: 'string', description: 'End date YYYY-MM-DD' },
+        entities: { type: 'array', items: { type: 'string' }, description: 'Entity names to match' },
+        entityMode: { type: 'string', enum: ['any', 'all'], description: '"any" (default, boost) or "all" hard filter' },
+        mode: { type: 'string', enum: ['fts', 'hybrid', 'vector'], description: 'Legacy evidence recall mode' },
+        explain: { type: 'boolean', description: 'Include diagnostic score breakdown.' },
       },
       required: ['query'],
     },

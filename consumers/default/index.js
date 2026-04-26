@@ -222,7 +222,7 @@ function createPersona(personaOpts = {}) {
       if ((ctx?.sessionKey || '').includes('subagent')) return null;
       return {
         name: 'session_recall',
-        description: 'Search stored sessions by keyword or natural language. Use entities when the user names specific people, projects, files, tools, or concepts; use entity_mode="all" when every named entity must co-occur (default "any" boosts). Use mode to force fts/vector/hybrid (default hybrid).',
+        description: 'Search Aquifer memory by keyword or natural language. In curated serving mode this searches active curated memory; legacy/evidence lookup is exposed by the MCP stdio evidence_recall tool. Use entities when the user names specific people, projects, files, tools, or concepts; use entity_mode="all" when every named entity must co-occur (default "any" boosts). Use mode to force fts/vector/hybrid (default hybrid).',
         parameters: {
           type: 'object',
           properties: {

@@ -17,21 +17,19 @@ const path = require('path');
 const { Pool } = require('pg');
 
 const { createAquifer } = require('../index');
+const { requireTestDb, registerSkip } = require('./helpers/require-test-db');
 
-const DB_URL = process.env.AQUIFER_TEST_DB_URL;
-if (!DB_URL) {
-  console.error('AQUIFER_TEST_DB_URL not set. Skipping MCP consumer integration tests.');
-  process.exit(0);
-}
+const DB_URL = requireTestDb('MCP consumer integration tests');
 
 // Lazy require — SDK is optional at module scope, only needed for these tests
 let Client, StdioClientTransport;
-try {
-  ({ Client } = require('@modelcontextprotocol/sdk/client/index.js'));
-  ({ StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js'));
-} catch (err) {
-  console.error(`MCP SDK not installed; skipping MCP integration tests: ${err.message}`);
-  process.exit(0);
+if (DB_URL) {
+  try {
+    ({ Client } = require('@modelcontextprotocol/sdk/client/index.js'));
+    ({ StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js'));
+  } catch (err) {
+    registerSkip(`MCP consumer integration tests require @modelcontextprotocol/sdk (${err.message})`);
+  }
 }
 
 const CLI_PATH = path.join(__dirname, '..', 'consumers', 'cli.js');
@@ -62,6 +60,7 @@ function getToolText(result) {
   return block ? block.text : '';
 }
 
+if (DB_URL && Client && StdioClientTransport) {
 describe('MCP consumer — aquifer mcp tool surface', () => {
   let schema, pool, aq, client, transport;
 
@@ -104,12 +103,12 @@ describe('MCP consumer — aquifer mcp tool surface', () => {
     finally { await pool.end().catch(() => {}); }
   });
 
-  it('listTools exposes the six Aquifer tools', async () => {
+  it('listTools exposes the Aquifer MCP tools', async () => {
     const result = await client.listTools();
     const names = result.tools.map(t => t.name).sort();
     assert.deepEqual(
       names,
-      ['feedback_stats', 'memory_pending', 'memory_stats', 'session_bootstrap', 'session_feedback', 'session_recall']
+      ['evidence_recall', 'feedback_stats', 'memory_pending', 'memory_stats', 'session_bootstrap', 'session_feedback', 'session_recall']
     );
   });
 
@@ -169,3 +168,4 @@ describe('MCP consumer — aquifer mcp tool surface', () => {
       `no pending sessions expected after enrich; got: ${text.slice(0, 200)}`);
   });
 });
+}

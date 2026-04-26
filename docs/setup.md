@@ -153,7 +153,7 @@ Add to `.claude.json` (project-level) or user-level MCP config:
 }
 ```
 
-Tools appear as `mcp__aquifer__session_recall`, `mcp__aquifer__session_feedback`, `mcp__aquifer__memory_stats`, `mcp__aquifer__memory_pending`.
+Tools appear as `mcp__aquifer__session_recall`, `mcp__aquifer__evidence_recall`, `mcp__aquifer__session_bootstrap`, `mcp__aquifer__session_feedback`, `mcp__aquifer__feedback_stats`, `mcp__aquifer__memory_stats`, `mcp__aquifer__memory_pending`.
 
 ### OpenClaw
 
@@ -177,7 +177,7 @@ Add to `openclaw.json`:
 }
 ```
 
-Tools materialize as `aquifer__session_recall`, `aquifer__session_feedback`, `aquifer__memory_stats`, `aquifer__memory_pending`.
+Tools materialize as `aquifer__session_recall`, `aquifer__evidence_recall`, `aquifer__session_bootstrap`, `aquifer__session_feedback`, `aquifer__feedback_stats`, `aquifer__memory_stats`, `aquifer__memory_pending`.
 
 Do **not** use the OpenClaw plugin (`consumers/openclaw-plugin.js`) for tool delivery. The plugin is retained for session capture via `before_reset` only.
 

@@ -7,7 +7,7 @@
  * This is the primary integration surface for Aquifer. Agent hosts (Claude Code,
  * Codex, OpenCode, etc.) should integrate through this MCP server.
  *
- * Tools: session_recall, session_feedback, feedback_stats,
+ * Tools: session_recall, evidence_recall, session_feedback, feedback_stats,
  * session_bootstrap, memory_stats, memory_pending
  *
  * Usage:
@@ -64,7 +64,7 @@ async function main() {
 
   server.tool(
     'session_recall',
-    'Search stored sessions by keyword. Supports entity intersection for precise multi-entity queries.',
+    'Search Aquifer memory. In curated serving mode this searches active curated memory only; use evidence_recall for legacy session/evidence lookup.',
     {
       query: z.string().min(1).describe('Search query (keyword or natural language)'),
       limit: z.number().int().min(1).max(20).optional().describe('Max results (default 5)'),
@@ -100,6 +100,50 @@ async function main() {
       } catch (err) {
         return {
           content: [{ type: 'text', text: `session_recall error: ${err.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    'evidence_recall',
+    'Explicit legacy/evidence search over stored sessions and summaries. Use for audit/debug/distillation; it does not feed bootstrap implicitly.',
+    {
+      query: z.string().min(1).describe('Evidence search query (keyword or natural language)'),
+      limit: z.number().int().min(1).max(20).optional().describe('Max results (default 5)'),
+      agentId: z.string().optional().describe('Filter by agent ID'),
+      source: z.string().optional().describe('Filter by source (e.g., gateway, cc)'),
+      dateFrom: z.string().optional().describe('Start date YYYY-MM-DD'),
+      dateTo: z.string().optional().describe('End date YYYY-MM-DD'),
+      entities: z.array(z.string()).optional().describe('Entity names to match'),
+      entityMode: z.enum(['any', 'all']).optional().describe('"any" (default, boost) or "all" (only sessions with every entity)'),
+      mode: z.enum(['fts', 'hybrid', 'vector']).optional().describe('Legacy evidence recall mode'),
+      explain: z.boolean().optional().describe('Include per-result score breakdown (diagnostic)'),
+    },
+    async (params) => {
+      try {
+        const aquifer = getAquifer();
+        const limit = params.limit || 5;
+        const recallOpts = {
+          limit,
+          agentId: params.agentId || undefined,
+          source: params.source || undefined,
+          dateFrom: params.dateFrom || undefined,
+          dateTo: params.dateTo || undefined,
+        };
+        if (params.entities && params.entities.length > 0) {
+          recallOpts.entities = params.entities;
+          recallOpts.entityMode = params.entityMode || 'any';
+        }
+        if (params.mode) recallOpts.mode = params.mode;
+
+        const results = await aquifer.evidenceRecall(params.query, recallOpts);
+        const text = formatResults(results, params.query, params.explain);
+        return { content: [{ type: 'text', text }] };
+      } catch (err) {
+        return {
+          content: [{ type: 'text', text: `evidence_recall error: ${err.message}` }],
           isError: true,
         };
       }

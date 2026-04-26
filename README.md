@@ -414,7 +414,7 @@ The MCP consumer (`consumers/mcp.js`) already wires `aquifer.init()` before `ser
 
 #### `aquifer.listPendingMigrations()` / `aquifer.getMigrationStatus()`
 
-Returns `{ required, applied, pending, lastRunAt }` via a `pg_tables` signature probe. No DDL runs. Use it from a health check or from a consumer that wants to surface drift before calling `init()`.
+Returns `{ required, applied, pending, lastRunAt }` via table and column signature probes (`pg_tables` plus `information_schema.columns` for alter-only migrations). No DDL runs. Use it from a health check or from a consumer that wants to surface drift before calling `init()`.
 
 #### `aquifer.migrate()`
 
