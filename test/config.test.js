@@ -160,4 +160,17 @@ describe('config.loadConfig', () => {
     assert.equal(config.insights.recallWeights, null);
     assert.equal(config.insights.recencyWindowDays, null);
   });
+
+  it('reads AQUIFER_MEMORY_SERVING_MODE from env', () => {
+    const config = loadConfig({ env: { AQUIFER_MEMORY_SERVING_MODE: 'curated' } });
+    assert.equal(config.memory.servingMode, 'curated');
+  });
+
+  it('programmatic memory.servingMode override wins over env', () => {
+    const config = loadConfig({
+      env: { AQUIFER_MEMORY_SERVING_MODE: 'legacy' },
+      overrides: { memory: { servingMode: 'curated' } },
+    });
+    assert.equal(config.memory.servingMode, 'curated');
+  });
 });

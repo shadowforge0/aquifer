@@ -1,0 +1,52 @@
+{
+  "policyVersion": "v1-foundation",
+  "rawEvidence": [
+    {
+      "evidenceId": "raw-commentary",
+      "text": "我先查檔案狀態",
+      "tags": ["commentary"]
+    },
+    {
+      "evidenceId": "raw-secret",
+      "text": "DATABASE_URL=postgresql://user:pass@example/aquifer",
+      "tags": ["secret"]
+    },
+    {
+      "evidenceId": "raw-final",
+      "text": "Use PostgreSQL as the curated memory source.",
+      "tags": []
+    }
+  ],
+  "candidates": [
+    {
+      "memoryType": "decision",
+      "canonicalKey": "decision:project:aquifer:source",
+      "scopeKey": "project:aquifer",
+      "summary": "Use PostgreSQL as the curated memory source.",
+      "authority": "verified_summary",
+      "pollutionTags": [],
+      "evidenceRefs": [
+        {
+          "sourceKind": "session_summary",
+          "sourceRef": "session-1",
+          "relationKind": "primary"
+        }
+      ]
+    },
+    {
+      "memoryType": "decision",
+      "canonicalKey": "decision:project:aquifer:secret",
+      "scopeKey": "project:aquifer",
+      "summary": "DATABASE_URL=postgresql://user:pass@example/aquifer",
+      "authority": "verified_summary",
+      "pollutionTags": ["secret"],
+      "evidenceRefs": [
+        {
+          "sourceKind": "session",
+          "sourceRef": "session-1",
+          "relationKind": "supporting"
+        }
+      ]
+    }
+  ]
+}

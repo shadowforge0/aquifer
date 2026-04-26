@@ -10,6 +10,7 @@ const { hybridRank } = require('./hybrid-rank');
 const { summarize } = require('../pipeline/summarize');
 const { extractEntities } = require('../pipeline/extract-entities');
 const { createEmbedder } = require('../pipeline/embed');
+const { applyEnrichSafetyGate, sanitizeSummaryResult } = require('./memory-safety-gate');
 
 // ---------------------------------------------------------------------------
 // Schema name validation
@@ -278,6 +279,15 @@ function createAquifer(config = {}) {
   // Override via config.ftsConfig if you need to force one or the other.
   let ftsConfig = config.ftsConfig || null;
 
+  const memoryCfg = config.memory || {};
+  const memoryServingMode = memoryCfg.servingMode || process.env.AQUIFER_MEMORY_SERVING_MODE || 'legacy';
+  function resolveMemoryServingMode(opts = {}) {
+    const mode = opts.memoryMode || opts.servingMode || memoryServingMode;
+    if (mode === 'legacy' || mode === 'evidence') return 'legacy';
+    if (mode === 'curated') return 'curated';
+    throw new Error(`Invalid memory serving mode: "${mode}". Must be one of: legacy, curated`);
+  }
+
   // State-change extraction (Q3): off by default. When enabled, enrich() runs
   // an extra LLM call to capture temporal state transitions on whitelisted
   // entities. See pipeline/extract-state-changes.js + core/entity-state.js.
@@ -326,6 +336,13 @@ function createAquifer(config = {}) {
     { id: '004-completion',          file: '004-completion.sql',          always: true, signature: 'narratives' },
     { id: '005-entity-state-history',file: '005-entity-state-history.sql',gate: 'entities', signature: 'entity_state_history' },
     { id: '006-insights',            file: '006-insights.sql',            always: true, signature: 'insights' },
+    { id: '007-v1-foundation',       file: '007-v1-foundation.sql',       always: true, signature: 'memory_records' },
+    { id: '008-session-finalizations',file: '008-session-finalizations.sql',always: true, signature: 'session_finalizations' },
+    { id: '009-v1-assertion-plane',  file: '009-v1-assertion-plane.sql',  always: true, signature: 'fact_assertions_v1' },
+    { id: '010-v1-finalization-review',file: '010-v1-finalization-review.sql',always: true, signature: 'finalization_candidates' },
+    { id: '011-v1-compaction-claim', file: '011-v1-compaction-claim.sql', always: true, signature: { table: 'compaction_runs', column: 'apply_token' } },
+    { id: '012-v1-compaction-lease', file: '012-v1-compaction-lease.sql', always: true, signature: { table: 'compaction_runs', column: 'lease_expires_at' } },
+    { id: '013-v1-compaction-lineage', file: '013-v1-compaction-lineage.sql', always: true, signature: 'compaction_candidates' },
   ];
 
   function requiredMigrations() {
@@ -340,15 +357,38 @@ function createAquifer(config = {}) {
     const required = MIGRATION_PLAN.filter(m => m.always
       || (m.gate === 'entities' && entitiesEnabled)
       || (m.gate === 'facts' && factsEnabled));
-    const signatures = required.map(m => m.signature);
-    if (signatures.length === 0) return [];
-    const r = await queryRunner.query(
-      `SELECT tablename FROM pg_tables
-         WHERE schemaname = $1 AND tablename = ANY($2::text[])`,
-      [schema, signatures]
-    );
-    const present = new Set(r.rows.map(row => row.tablename));
-    return required.filter(m => present.has(m.signature)).map(m => m.id);
+    const tableSignatures = required
+      .map(m => m.signature)
+      .filter(signature => typeof signature === 'string');
+    const columnSignatures = required
+      .map(m => m.signature)
+      .filter(signature => signature && typeof signature === 'object');
+    const presentTables = new Set();
+    const presentColumns = new Set();
+    if (tableSignatures.length > 0) {
+      const r = await queryRunner.query(
+        `SELECT tablename FROM pg_tables
+           WHERE schemaname = $1 AND tablename = ANY($2::text[])`,
+        [schema, tableSignatures]
+      );
+      for (const row of r.rows) presentTables.add(row.tablename);
+    }
+    if (columnSignatures.length > 0) {
+      const tables = [...new Set(columnSignatures.map(signature => signature.table))];
+      const r = await queryRunner.query(
+        `SELECT table_name, column_name
+           FROM information_schema.columns
+          WHERE table_schema = $1 AND table_name = ANY($2::text[])`,
+        [schema, tables]
+      );
+      for (const row of r.rows) presentColumns.add(`${row.table_name}.${row.column_name}`);
+    }
+    return required
+      .filter(m => {
+        if (typeof m.signature === 'string') return presentTables.has(m.signature);
+        return presentColumns.has(`${m.signature.table}.${m.signature.column}`);
+      })
+      .map(m => m.id);
   }
 
   async function buildMigrationPlan(queryRunner) {
@@ -491,6 +531,49 @@ function createAquifer(config = {}) {
           // safe to DROP CASCADE. See scripts/drop-insights.sql.
           const insightsSql = loadSql('006-insights.sql', schema);
           await client.query(insightsSql); ddlExecuted.push('006-insights');
+
+          // 8. v1 curated-memory foundation (always, additive). This creates
+          // a sidecar curated plane without changing the legacy session recall
+          // or bootstrap serving path.
+          const memoryV1Sql = loadSql('007-v1-foundation.sql', schema);
+          await client.query(memoryV1Sql); ddlExecuted.push('007-v1-foundation');
+
+          // 9. v1 session finalization ledger (always, additive). Finalization
+          // is the source-of-truth lifecycle for handoff/session-end/recovery
+          // triggers; local consumer markers are cache hints only.
+          const finalizationSql = loadSql('008-session-finalizations.sql', schema);
+          await client.query(finalizationSql); ddlExecuted.push('008-session-finalizations');
+
+          // 10. v1 structured assertion plane (always, additive). This keeps
+          // legacy 004-facts untouched and adds the minimal DB contract for
+          // backing structured assertions, tenant-safe scope ancestry guards,
+          // and compaction coverage fields.
+          const assertionPlaneSql = loadSql('009-v1-assertion-plane.sql', schema);
+          await client.query(assertionPlaneSql); ddlExecuted.push('009-v1-assertion-plane');
+
+          // 11. v1 finalization review and lineage (always, additive). This
+          // stores human review text, minimal SessionStart text, finalization
+          // candidate rows, and row-level created_by_finalization_id lineage.
+          const finalizationReviewSql = loadSql('010-v1-finalization-review.sql', schema);
+          await client.query(finalizationReviewSql); ddlExecuted.push('010-v1-finalization-review');
+
+          // 12. v1 compaction claim/apply guard (always, additive). This adds
+          // a minimal claim token and one-live-apply guard for compaction_runs;
+          // it does not create or promote aggregate memory.
+          const compactionClaimSql = loadSql('011-v1-compaction-claim.sql', schema);
+          await client.query(compactionClaimSql); ddlExecuted.push('011-v1-compaction-claim');
+
+          // 13. v1 compaction claim lease (always, additive). This persists
+          // row-level lease expiry so stale applying claims can be reclaimed
+          // without relying on caller clocks or changing runtime defaults.
+          const compactionLeaseSql = loadSql('012-v1-compaction-lease.sql', schema);
+          await client.query(compactionLeaseSql); ddlExecuted.push('012-v1-compaction-lease');
+
+          // 14. v1 compaction lineage and candidate ledger (always,
+          // additive). This records aggregate candidate outcomes and links
+          // promoted rows back to the compaction run that created them.
+          const compactionLineageSql = loadSql('013-v1-compaction-lineage.sql', schema);
+          await client.query(compactionLineageSql); ddlExecuted.push('013-v1-compaction-lineage');
 
           migrated = true;
         } finally {
@@ -850,9 +933,12 @@ function createAquifer(config = {}) {
         ? (typeof rawMessages === 'string' ? JSON.parse(rawMessages) : rawMessages)
         : null;
       const normalized = messages ? (messages.normalized || messages) : [];
+      const safety = applyEnrichSafetyGate(normalized);
+      const safeNormalized = safety.messages;
+      const safetyGate = safety.meta;
 
       // 2. Extract user turns
-      const turns = storage.extractUserTurns(normalized);
+      const turns = storage.extractUserTurns(safeNormalized);
 
       // Collected across pre-tx and tx phases; any non-empty warnings demote
       // the final status from 'succeeded' to 'partial' (see step 8 below).
@@ -863,7 +949,7 @@ function createAquifer(config = {}) {
       let entityRaw = null;
       let extra = null;
 
-      if (!skipSummary && normalized.length > 0) {
+      if (!skipSummary && safeNormalized.length > 0) {
         // Pre-transaction failures (customSummaryFn / summarize throws) would
         // otherwise bubble out and leave the session stuck in 'processing'
         // until stale reclaim. Capture as a warning so status ends 'partial',
@@ -871,13 +957,13 @@ function createAquifer(config = {}) {
         try {
           if (customSummaryFn) {
             // Custom pipeline: caller handles LLM call and parsing
-            summaryResult = await customSummaryFn(normalized);
+            summaryResult = await customSummaryFn(safeNormalized);
             if (summaryResult && summaryResult.entityRaw) entityRaw = summaryResult.entityRaw;
             if (summaryResult && summaryResult.extra) extra = summaryResult.extra;
           } else {
             // Built-in pipeline
             const doMergeEntities = entitiesEnabled && mergeCall && !skipEntities;
-            summaryResult = await summarize(normalized, {
+            summaryResult = await summarize(safeNormalized, {
               llmFn,
               promptFn: summarizePromptFn,
               mergeEntities: doMergeEntities,
@@ -889,6 +975,11 @@ function createAquifer(config = {}) {
         } catch (e) {
           warnings.push(`summary step failed: ${e.message}`);
           summaryResult = null;
+        }
+        if (summaryResult) {
+          const sanitizedSummary = sanitizeSummaryResult(summaryResult);
+          summaryResult = sanitizedSummary.summaryResult;
+          safetyGate.summary = sanitizedSummary.meta;
         }
       }
 
@@ -921,7 +1012,7 @@ function createAquifer(config = {}) {
           } else if (entityRaw) {
             parsedEntities = entity.parseEntityOutput(entityRaw);
           } else if (llmFn && !customSummaryFn) {
-            parsedEntities = await extractEntities(normalized, { llmFn, promptFn: entityPromptFn });
+            parsedEntities = await extractEntities(safeNormalized, { llmFn, promptFn: entityPromptFn });
           }
         } catch (e) { warnings.push(`entity extraction failed: ${e.message}`); }
       }
@@ -937,7 +1028,7 @@ function createAquifer(config = {}) {
         if (scopedEntities.length > 0) {
           try {
             const { extractStateChanges } = require('../pipeline/extract-state-changes');
-            const result = await extractStateChanges(normalized, {
+            const result = await extractStateChanges(safeNormalized, {
               llmFn,
               promptFn: stateChangesPromptFn,
               entities: scopedEntities.map(e => ({ name: e.name, aliases: e.aliases || [] })),
@@ -969,9 +1060,9 @@ function createAquifer(config = {}) {
             summaryText: summaryResult.summaryText,
             structuredSummary: summaryResult.structuredSummary,
             model: (optModel !== undefined ? optModel : session.model) || null, sourceHash: null,
-            msgCount: normalized.length,
+            msgCount: safeNormalized.length,
             userCount: turns.length,
-            assistantCount: normalized.filter(m => m.role === 'assistant').length,
+            assistantCount: safeNormalized.filter(m => m.role === 'assistant').length,
             startedAt: session.started_at, endedAt: session.ended_at,
             embedding: summaryEmbedding,
           });
@@ -1132,8 +1223,10 @@ function createAquifer(config = {}) {
             turnVectors,
             extra,
             normalized,
+            sanitized: safeNormalized,
             parsedEntities,
             skipped: { summary: skipSummary, entities: skipEntities, turns: skipTurnEmbed },
+            safetyGate,
             turnsEmbedded,
             entitiesFound,
             warnings: [...warnings],  // defensive copy — caller cannot mutate enrich warnings
@@ -1150,6 +1243,7 @@ function createAquifer(config = {}) {
         entitiesFound,
         warnings,
         extra,
+        safetyGate,
         session: {
           id: session.id,
           sessionId,
@@ -1165,6 +1259,14 @@ function createAquifer(config = {}) {
     // --- read path ---
 
     async recall(query, opts = {}) {
+      if (resolveMemoryServingMode(opts) === 'curated') {
+        await ensureMigrated();
+        return aquifer.memory.recall(query, opts);
+      }
+      return aquifer.evidenceRecall(query, opts);
+    },
+
+    async evidenceRecall(query, opts = {}) {
       // Contract (aligned across core / manifest / consumer tools): query must
       // be a non-empty string. Empty strings previously short-circuited to []
       // silently — that masks caller bugs. Callers wanting "recent sessions"
@@ -1600,7 +1702,7 @@ function createAquifer(config = {}) {
     // --- public config accessor ---
 
     getConfig() {
-      return { schema, tenantId };
+      return { schema, tenantId, memoryServingMode };
     },
 
     // v1.2.0: expose the internal pool so host persona layers can reuse it
@@ -1705,6 +1807,9 @@ function createAquifer(config = {}) {
 
     async bootstrap(opts = {}) {
       await ensureMigrated();
+      if (resolveMemoryServingMode(opts) === 'curated') {
+        return aquifer.memory.bootstrap(opts);
+      }
 
       const agentId = opts.agentId || null;
       const source = opts.source || null;
@@ -1823,6 +1928,12 @@ function createAquifer(config = {}) {
   const { createBundles } = require('./bundles');
   const { createEntityState } = require('./entity-state');
   const { createInsights } = require('./insights');
+  const { createMemoryRecords } = require('./memory-records');
+  const { createMemoryPromotion } = require('./memory-promotion');
+  const { createMemoryBootstrap } = require('./memory-bootstrap');
+  const { createMemoryRecall } = require('./memory-recall');
+  const { createMemoryConsolidation } = require('./memory-consolidation');
+  const { createSessionFinalization } = require('./session-finalization');
   const qSchema = qi(schema);
   aquifer.narratives = createNarratives({ pool, schema: qSchema, defaultTenantId: tenantId });
   aquifer.timeline = createTimeline({ pool, schema: qSchema, defaultTenantId: tenantId });
@@ -1850,6 +1961,108 @@ function createAquifer(config = {}) {
       ? config.insights.recencyWindowDays : undefined,
     dedup: config.insights && config.insights.dedup ? config.insights.dedup : undefined,
   });
+
+  const memoryRecords = createMemoryRecords({ pool, schema: qSchema, defaultTenantId: tenantId });
+  const memoryPromotion = createMemoryPromotion({ records: memoryRecords });
+  const memoryBootstrap = createMemoryBootstrap({ records: memoryRecords });
+  const memoryRecall = createMemoryRecall({ pool, schema: qSchema, defaultTenantId: tenantId });
+  const memoryConsolidation = createMemoryConsolidation({
+    pool,
+    schema: qSchema,
+    defaultTenantId: tenantId,
+    records: memoryRecords,
+  });
+  const sessionFinalization = createSessionFinalization({
+    pool,
+    schema,
+    recordsSchema: qSchema,
+    defaultTenantId: tenantId,
+  });
+
+  // v1 curated-memory sidecar. Top-level recall/bootstrap can opt into this
+  // plane through memory.servingMode while legacy/evidence mode remains
+  // available for compatibility and debugging.
+  aquifer.memory = {
+    upsertScope: async (input = {}) => {
+      await ensureMigrated();
+      return memoryRecords.upsertScope(input);
+    },
+    createVersion: async (input = {}) => {
+      await ensureMigrated();
+      return memoryRecords.createVersion(input);
+    },
+    upsertMemory: async (input = {}) => {
+      await ensureMigrated();
+      return memoryRecords.upsertMemory(input);
+    },
+    linkEvidence: async (input = {}) => {
+      await ensureMigrated();
+      return memoryRecords.linkEvidence(input);
+    },
+    recordFeedback: async (input = {}) => {
+      await ensureMigrated();
+      return memoryRecords.recordFeedback(input);
+    },
+    extractCandidates: (input = {}) => memoryPromotion.extractCandidates(input),
+    assessCandidate: (candidate = {}) => memoryPromotion.assessCandidate(candidate),
+    promote: async (candidates = [], opts = {}) => {
+      await ensureMigrated();
+      return memoryPromotion.promote(candidates, opts);
+    },
+    bootstrap: async (opts = {}) => {
+      await ensureMigrated();
+      return memoryBootstrap.bootstrap(opts);
+    },
+    recall: async (query, opts = {}) => {
+      await ensureMigrated();
+      return memoryRecall.recall(query, opts);
+    },
+    consolidation: {
+      plan: memoryConsolidation.plan,
+      distillArchiveSnapshot: memoryConsolidation.distillArchiveSnapshot,
+      recordRun: async (input = {}) => {
+        await ensureMigrated();
+        return memoryConsolidation.recordRun(input);
+      },
+      claimRun: async (input = {}) => {
+        await ensureMigrated();
+        return memoryConsolidation.claimRun(input);
+      },
+      applyPlan: async (input = {}) => {
+        await ensureMigrated();
+        return memoryConsolidation.applyPlan(input);
+      },
+      executePlan: async (input = {}) => {
+        await ensureMigrated();
+        return memoryConsolidation.executePlan(input);
+      },
+    },
+  };
+
+  aquifer.finalization = {
+    createTask: async (input = {}) => {
+      await ensureMigrated();
+      return sessionFinalization.createTask(input);
+    },
+    get: async (input = {}) => {
+      await ensureMigrated();
+      return sessionFinalization.get(input);
+    },
+    list: async (input = {}) => {
+      await ensureMigrated();
+      return sessionFinalization.list(input);
+    },
+    updateStatus: async (input = {}) => {
+      await ensureMigrated();
+      return sessionFinalization.updateStatus(input);
+    },
+    finalizeSession: async (input = {}) => {
+      await ensureMigrated();
+      return sessionFinalization.finalizeSession(input);
+    },
+  };
+
+  aquifer.finalizeSession = aquifer.finalization.finalizeSession;
 
   return aquifer;
 }

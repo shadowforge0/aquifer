@@ -32,6 +32,32 @@ const TURN_NOISE_RE = [
 ];
 
 const VALID_STATUSES = new Set(['pending', 'processing', 'succeeded', 'partial', 'failed', 'skipped']);
+const FINALIZATION_STATUSES = new Set([
+  'pending',
+  'processing',
+  'finalized',
+  'failed',
+  'skipped',
+  'declined',
+  'deferred',
+]);
+const FINALIZATION_MODES = new Set([
+  'handoff',
+  'session_end',
+  'session_start_recovery',
+  'afterburn',
+  'manual',
+]);
+
+function requireField(obj, field) {
+  if (!obj || obj[field] === undefined || obj[field] === null || obj[field] === '') {
+    throw new Error(`${field} is required`);
+  }
+}
+
+function toJson(value, fallback) {
+  return JSON.stringify(value === undefined ? fallback : value);
+}
 
 // ---------------------------------------------------------------------------
 // upsertSession
@@ -312,6 +338,265 @@ async function recordAccess(pool, sessionRowIds, { schema } = {}) {
     WHERE session_row_id = ANY($1)`,
     [sessionRowIds]
   );
+}
+
+// ---------------------------------------------------------------------------
+// Session finalization ledger
+// ---------------------------------------------------------------------------
+
+function normalizeFinalizationStatus(status) {
+  const out = status || 'pending';
+  if (!FINALIZATION_STATUSES.has(out)) throw new Error(`Invalid finalization status: ${out}`);
+  return out;
+}
+
+function normalizeFinalizationMode(mode) {
+  const out = mode || 'handoff';
+  if (!FINALIZATION_MODES.has(out)) throw new Error(`Invalid finalization mode: ${out}`);
+  return out;
+}
+
+async function upsertSessionFinalization(pool, input = {}, { schema, tenantId: defaultTenantId } = {}) {
+  requireField(input, 'sessionRowId');
+  requireField(input, 'sessionId');
+  requireField(input, 'agentId');
+  requireField(input, 'source');
+  requireField(input, 'transcriptHash');
+  const tenantId = input.tenantId || defaultTenantId || 'default';
+  const status = normalizeFinalizationStatus(input.status || 'pending');
+  const mode = normalizeFinalizationMode(input.mode || 'handoff');
+  const phase = input.phase || 'curated_memory_v1';
+  const result = await pool.query(
+    `INSERT INTO ${qi(schema)}.session_finalizations (
+       tenant_id, session_row_id, source, host, agent_id, session_id,
+       transcript_hash, phase, mode, status, finalizer_model, scope_kind,
+       scope_key, context_key, topic_key, summary_row_id, memory_result,
+       summary_text, structured_summary, human_review_text, session_start_text,
+       error, metadata, claimed_at, finalized_at
+     )
+     VALUES (
+       $1,$2,$3,COALESCE($4,'codex'),$5,$6,$7,COALESCE($8,'curated_memory_v1'),
+       $9,$10,$11,$12,$13,$14,$15,$16,COALESCE($17::jsonb,'{}'::jsonb),
+       $18,COALESCE($19::jsonb,'{}'::jsonb),$20,$21,
+       $22,COALESCE($23::jsonb,'{}'::jsonb),$24,$25
+     )
+     ON CONFLICT (tenant_id, source, agent_id, session_id, transcript_hash, phase)
+     DO UPDATE SET
+       session_row_id = EXCLUDED.session_row_id,
+       host = EXCLUDED.host,
+       mode = EXCLUDED.mode,
+       status = EXCLUDED.status,
+       finalizer_model = COALESCE(EXCLUDED.finalizer_model, ${qi(schema)}.session_finalizations.finalizer_model),
+       scope_kind = COALESCE(EXCLUDED.scope_kind, ${qi(schema)}.session_finalizations.scope_kind),
+       scope_key = COALESCE(EXCLUDED.scope_key, ${qi(schema)}.session_finalizations.scope_key),
+       context_key = COALESCE(EXCLUDED.context_key, ${qi(schema)}.session_finalizations.context_key),
+       topic_key = COALESCE(EXCLUDED.topic_key, ${qi(schema)}.session_finalizations.topic_key),
+       summary_row_id = COALESCE(EXCLUDED.summary_row_id, ${qi(schema)}.session_finalizations.summary_row_id),
+       memory_result = COALESCE(NULLIF(EXCLUDED.memory_result, '{}'::jsonb), ${qi(schema)}.session_finalizations.memory_result),
+       summary_text = COALESCE(EXCLUDED.summary_text, ${qi(schema)}.session_finalizations.summary_text),
+       structured_summary = COALESCE(NULLIF(EXCLUDED.structured_summary, '{}'::jsonb), ${qi(schema)}.session_finalizations.structured_summary),
+       human_review_text = COALESCE(EXCLUDED.human_review_text, ${qi(schema)}.session_finalizations.human_review_text),
+       session_start_text = COALESCE(EXCLUDED.session_start_text, ${qi(schema)}.session_finalizations.session_start_text),
+       error = EXCLUDED.error,
+       metadata = COALESCE(NULLIF(EXCLUDED.metadata, '{}'::jsonb), ${qi(schema)}.session_finalizations.metadata),
+       claimed_at = COALESCE(EXCLUDED.claimed_at, ${qi(schema)}.session_finalizations.claimed_at),
+       finalized_at = COALESCE(EXCLUDED.finalized_at, ${qi(schema)}.session_finalizations.finalized_at),
+       updated_at = now()
+     RETURNING *`,
+    [
+      tenantId,
+      input.sessionRowId,
+      input.source,
+      input.host || 'codex',
+      input.agentId,
+      input.sessionId,
+      input.transcriptHash,
+      phase,
+      mode,
+      status,
+      input.finalizerModel || null,
+      input.scopeKind || null,
+      input.scopeKey || null,
+      input.contextKey || null,
+      input.topicKey || null,
+      input.summaryRowId || null,
+      toJson(input.memoryResult, {}),
+      input.summaryText || null,
+      toJson(input.structuredSummary, {}),
+      input.humanReviewText || null,
+      input.sessionStartText || null,
+      input.error || null,
+      toJson(input.metadata, {}),
+      input.claimedAt || (status === 'processing' ? new Date().toISOString() : null),
+      input.finalizedAt || (status === 'finalized' ? new Date().toISOString() : null),
+    ]
+  );
+  return result.rows[0] || null;
+}
+
+async function getSessionFinalization(pool, input = {}, { schema, tenantId: defaultTenantId } = {}) {
+  requireField(input, 'sessionId');
+  requireField(input, 'agentId');
+  requireField(input, 'source');
+  requireField(input, 'transcriptHash');
+  const tenantId = input.tenantId || defaultTenantId || 'default';
+  const phase = input.phase || 'curated_memory_v1';
+  const result = await pool.query(
+    `SELECT *
+       FROM ${qi(schema)}.session_finalizations
+      WHERE tenant_id = $1
+        AND source = $2
+        AND agent_id = $3
+        AND session_id = $4
+        AND transcript_hash = $5
+        AND phase = $6
+      LIMIT 1`,
+    [tenantId, input.source, input.agentId, input.sessionId, input.transcriptHash, phase]
+  );
+  return result.rows[0] || null;
+}
+
+async function updateSessionFinalizationStatus(pool, input = {}, { schema, tenantId: defaultTenantId } = {}) {
+  const status = normalizeFinalizationStatus(input.status);
+  const tenantId = input.tenantId || defaultTenantId || 'default';
+  const params = [
+    tenantId,
+    status,
+    input.error || null,
+    input.finalizerModel || null,
+    toJson(input.memoryResult, {}),
+    toJson(input.metadata, {}),
+  ];
+  let where;
+  if (input.id) {
+    params.push(input.id);
+    where = `id = $${params.length}`;
+  } else {
+    requireField(input, 'sessionId');
+    requireField(input, 'agentId');
+    requireField(input, 'source');
+    requireField(input, 'transcriptHash');
+    params.push(input.source, input.agentId, input.sessionId, input.transcriptHash, input.phase || 'curated_memory_v1');
+    where = `source = $7 AND agent_id = $8 AND session_id = $9 AND transcript_hash = $10 AND phase = $11`;
+  }
+  const result = await pool.query(
+    `UPDATE ${qi(schema)}.session_finalizations
+        SET status = $2,
+            error = $3,
+            finalizer_model = COALESCE($4, finalizer_model),
+            memory_result = COALESCE(NULLIF($5::jsonb, '{}'::jsonb), memory_result),
+            metadata = COALESCE(NULLIF($6::jsonb, '{}'::jsonb), metadata),
+            finalized_at = CASE WHEN $2 = 'finalized' THEN COALESCE(finalized_at, now()) ELSE finalized_at END,
+            updated_at = now()
+      WHERE tenant_id = $1 AND ${where}
+      RETURNING *`,
+    params
+  );
+  return result.rows[0] || null;
+}
+
+async function listSessionFinalizations(pool, input = {}, { schema, tenantId: defaultTenantId } = {}) {
+  const tenantId = input.tenantId || defaultTenantId || 'default';
+  const params = [tenantId];
+  const where = [`tenant_id = $1`];
+  if (input.host) {
+    params.push(input.host);
+    where.push(`host = $${params.length}`);
+  }
+  if (input.status) {
+    const statuses = Array.isArray(input.status) ? input.status : [input.status];
+    for (const status of statuses) normalizeFinalizationStatus(status);
+    params.push(statuses);
+    where.push(`status = ANY($${params.length}::text[])`);
+  }
+  if (input.agentId) {
+    params.push(input.agentId);
+    where.push(`agent_id = $${params.length}`);
+  }
+  if (input.source) {
+    params.push(input.source);
+    where.push(`source = $${params.length}`);
+  }
+  params.push(Math.max(1, Math.min(200, input.limit || 50)));
+  const result = await pool.query(
+    `SELECT *
+       FROM ${qi(schema)}.session_finalizations
+      WHERE ${where.join(' AND ')}
+      ORDER BY updated_at DESC, id DESC
+      LIMIT $${params.length}`,
+    params
+  );
+  return result.rows;
+}
+
+function candidateText(candidate = {}) {
+  if (typeof candidate === 'string') return candidate.trim();
+  const payload = candidate.payload && typeof candidate.payload === 'object' ? candidate.payload : null;
+  for (const key of ['summary', 'title', 'decision', 'item', 'conclusion', 'statement', 'fact', 'text', 'note']) {
+    const text = String(candidate[key] || '').trim();
+    if (text) return text;
+  }
+  if (payload) {
+    for (const key of ['summary', 'title', 'decision', 'item', 'conclusion', 'statement', 'fact', 'text', 'note']) {
+      const text = String(payload[key] || '').trim();
+      if (text) return text;
+    }
+  }
+  return '';
+}
+
+async function upsertFinalizationCandidates(pool, rows = [], input = {}, { schema, tenantId: defaultTenantId } = {}) {
+  if (!Array.isArray(rows) || rows.length === 0) return [];
+  requireField(input, 'finalizationId');
+  const tenantId = input.tenantId || defaultTenantId || 'default';
+  const out = [];
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i] || {};
+    const candidate = row.candidate || {};
+    const memory = row.memory || {};
+    const backingFact = row.backingFact || {};
+    const evidenceRefs = candidate.evidenceRefs || candidate.evidence_refs || [];
+    const result = await pool.query(
+      `INSERT INTO ${qi(schema)}.finalization_candidates (
+         tenant_id, finalization_id, session_id, candidate_index, action, reason,
+         memory_type, canonical_key, summary, payload, provenance,
+         memory_record_id, fact_assertion_id
+       )
+       VALUES (
+         $1,$2,$3,$4,$5,$6,$7,$8,$9,COALESCE($10::jsonb,'{}'::jsonb),COALESCE($11::jsonb,'{}'::jsonb),$12,$13
+       )
+       ON CONFLICT (tenant_id, finalization_id, candidate_index)
+       DO UPDATE SET
+         action = EXCLUDED.action,
+         reason = EXCLUDED.reason,
+         memory_type = COALESCE(EXCLUDED.memory_type, ${qi(schema)}.finalization_candidates.memory_type),
+         canonical_key = COALESCE(EXCLUDED.canonical_key, ${qi(schema)}.finalization_candidates.canonical_key),
+         summary = COALESCE(EXCLUDED.summary, ${qi(schema)}.finalization_candidates.summary),
+         payload = COALESCE(NULLIF(EXCLUDED.payload, '{}'::jsonb), ${qi(schema)}.finalization_candidates.payload),
+         provenance = COALESCE(NULLIF(EXCLUDED.provenance, '{}'::jsonb), ${qi(schema)}.finalization_candidates.provenance),
+         memory_record_id = COALESCE(EXCLUDED.memory_record_id, ${qi(schema)}.finalization_candidates.memory_record_id),
+         fact_assertion_id = COALESCE(EXCLUDED.fact_assertion_id, ${qi(schema)}.finalization_candidates.fact_assertion_id),
+         updated_at = now()
+       RETURNING *`,
+      [
+        tenantId,
+        input.finalizationId,
+        input.sessionId || null,
+        i,
+        row.action || 'skipped',
+        row.reason || null,
+        candidate.memoryType || candidate.memory_type || memory.memory_type || memory.memoryType || null,
+        candidate.canonicalKey || candidate.canonical_key || memory.canonical_key || memory.canonicalKey || null,
+        candidateText(candidate) || candidateText(memory) || null,
+        toJson(candidate.payload || candidate, {}),
+        toJson({ evidenceRefs }, {}),
+        memory.id || memory.memory_id || null,
+        backingFact.id || memory.backing_fact_id || null,
+      ]
+    );
+    out.push(result.rows[0] || null);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -748,6 +1033,11 @@ module.exports = {
   getMessages,
   searchSessions,
   recordAccess,
+  upsertSessionFinalization,
+  getSessionFinalization,
+  updateSessionFinalizationStatus,
+  listSessionFinalizations,
+  upsertFinalizationCandidates,
   extractUserTurns,
   upsertTurnEmbeddings,
   searchTurnEmbeddings,

@@ -40,6 +40,9 @@ const DEFAULTS = {
     },
   },
   rank: { rrf: 0.65, timeDecay: 0.25, access: 0.10, entityBoost: 0.18 },
+  memory: {
+    servingMode: 'legacy',   // 'legacy' | 'curated'
+  },
   rerank: {
     enabled: false,
     provider: null,    // 'tei' | 'jina' | 'openrouter' | 'custom'
@@ -87,6 +90,7 @@ const ENV_MAP = [
   ['AQUIFER_INSIGHTS_DEDUP_MODE',             'insights.dedup.mode'],
   ['AQUIFER_INSIGHTS_DEDUP_COSINE',           'insights.dedup.cosineThreshold', Number],
   ['AQUIFER_INSIGHTS_DEDUP_CLOSE_BAND_FROM',  'insights.dedup.closeBandFrom',   Number],
+  ['AQUIFER_MEMORY_SERVING_MODE', 'memory.servingMode'],
   ['AQUIFER_RERANK_ENABLED',   'rerank.enabled',    Boolean],
   ['AQUIFER_RERANK_PROVIDER',  'rerank.provider'],
   ['AQUIFER_RERANK_BASE_URL',  'rerank.baseUrl'],
