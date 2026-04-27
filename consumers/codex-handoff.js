@@ -64,14 +64,14 @@ function buildHandoffMetadata(payload = {}) {
     if (decision) addUniqueByText(decisions, decision, decision.decision);
   }
   if (next && next !== '無') {
-    addUniqueByText(openLoops, { item: next, owner: 'Miranda', source: 'handoff_next' }, next);
+    addUniqueByText(openLoops, { item: next, owner: 'unknown', source: 'handoff_next' }, next);
   }
   for (const item of normalizeList(payload.openLoops || payload.open_loops)) {
     const loop = normalizeOpenLoop(item);
     if (loop) addUniqueByText(openLoops, loop, loop.item);
   }
   for (const item of normalizeList(payload.todoNew || payload.todo_new)) {
-    const loop = normalizeOpenLoop({ item, owner: 'Miranda' });
+    const loop = normalizeOpenLoop({ item, owner: 'unknown' });
     if (loop) addUniqueByText(openLoops, { ...loop, source: 'todo_new' }, loop.item);
   }
 

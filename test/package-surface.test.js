@@ -17,7 +17,6 @@ describe('package surface', () => {
       '/consumers/codex-handoff',
       '/consumers/claude-code',
       '/consumers/default',
-      '/consumers/miranda',
       '/consumers/openclaw-ext',
       '/consumers/shared/config',
       '/consumers/shared/factory',
@@ -34,15 +33,10 @@ describe('package surface', () => {
     }
   });
 
-  it('keeps consumers/miranda as a deprecated optional-adapter shim', () => {
-    const miranda = require(PKG + '/consumers/miranda');
-
-    assert.equal(miranda.deprecated, true);
-    assert.equal(miranda.adapterPackage, '@mingko/aquifer-miranda-adapter');
-    assert.equal(typeof miranda.mountOnOpenClaw, 'function');
+  it('does not publish private persona adapter shims', () => {
     assert.throws(
-      () => miranda.mountOnOpenClaw({}, {}),
-      /@mingko\/aquifer-miranda-adapter/
+      () => require(PKG + '/consumers/miranda'),
+      /Package subpath '\.\/consumers\/miranda' is not defined/
     );
   });
 
@@ -70,8 +64,8 @@ describe('package surface', () => {
     assert.ok(!paths.has('docs/memory-v1-roadmap.md'));
     assert.ok(!paths.has('scripts/drop-entity-state-history.sql'));
     assert.ok(!paths.has('scripts/drop-insights.sql'));
-    assert.ok(paths.has('consumers/miranda/index.js'));
+    assert.ok(!paths.has('scripts/install-openclaw.sh'));
     const mirandaPaths = [...paths].filter(p => p.startsWith('consumers/miranda/')).sort();
-    assert.deepEqual(mirandaPaths, ['consumers/miranda/index.js']);
+    assert.deepEqual(mirandaPaths, []);
   });
 });

@@ -4,6 +4,32 @@ All notable changes to `@shadowforge0/aquifer-memory` are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project uses semantic versioning.
 
+## [1.6.0] - 2026-04-28
+
+### Added
+
+- Curated memory serving path for `session_recall` and `session_bootstrap`,
+  with active scope config/env/tool arguments and explicit rejection of
+  legacy-only filters in curated mode.
+- `memory_feedback` for append-only curated memory feedback, separate from
+  legacy `session_feedback`.
+- `evidence_recall` as an explicit audit/debug boundary for legacy evidence
+  search.
+- Operator-safe `compact` / compaction jobs for scoped dry-run and apply
+  workflows, plus archive distillation that stays low-authority and invisible
+  until normal promotion gates pass.
+- DB-backed Codex finalization, handoff, import recovery, and SessionStart
+  recovery surfaces.
+
+### Changed
+
+- MCP public surface now exposes eight tools: `session_recall`,
+  `evidence_recall`, `session_feedback`, `memory_feedback`,
+  `feedback_stats`, `session_bootstrap`, `memory_stats`, and
+  `memory_pending`.
+- Package, README, setup docs, config examples, and release gates now describe
+  the curated serving rollout and rollback controls.
+
 ## [1.5.12] - 2026-04-25
 
 ### Changed

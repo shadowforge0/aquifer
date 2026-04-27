@@ -4,7 +4,6 @@
 //
 // Host layout:
 //   $OPENCLAW_HOME/extensions/aquifer-memory/  ← symlink to this directory
-//   (or run `bash scripts/install-openclaw.sh $OPENCLAW_HOME` from the tarball)
 //
 // Behavior:
 //   - Loads $OPENCLAW_HOME/.env so DATABASE_URL / EMBED_PROVIDER /
