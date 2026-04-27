@@ -11,6 +11,27 @@ const TYPE_LABELS = {
   conclusion: '判斷',
 };
 
+const SESSION_START_TYPE_PRIORITY = {
+  state: 0,
+  open_loop: 1,
+  constraint: 2,
+  preference: 3,
+  decision: 4,
+  fact: 5,
+  conclusion: 6,
+  entity_note: 7,
+};
+
+const AUTHORITY_PRIORITY = {
+  user_explicit: 0,
+  executable_evidence: 1,
+  manual: 2,
+  system: 3,
+  verified_summary: 4,
+  llm_inference: 5,
+  raw_transcript: 6,
+};
+
 const MEMORY_KEYS = [
   'summary',
   'title',
@@ -264,6 +285,14 @@ function buildSessionStartContext(records = [], opts = {}) {
   }
 
   active.sort((a, b) => {
+    const aType = SESSION_START_TYPE_PRIORITY[memoryTypeOf(a.record)] ?? 99;
+    const bType = SESSION_START_TYPE_PRIORITY[memoryTypeOf(b.record)] ?? 99;
+    if (aType !== bType) return aType - bType;
+
+    const aAuth = AUTHORITY_PRIORITY[a.record.authority] ?? 99;
+    const bAuth = AUTHORITY_PRIORITY[b.record.authority] ?? 99;
+    if (aAuth !== bAuth) return aAuth - bAuth;
+
     const aAccepted = Date.parse(a.record.acceptedAt || a.record.accepted_at || '') || 0;
     const bAccepted = Date.parse(b.record.acceptedAt || b.record.accepted_at || '') || 0;
     if (aAccepted !== bAccepted) return bAccepted - aAccepted;

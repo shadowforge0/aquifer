@@ -5,7 +5,10 @@ const { extractCandidatesFromStructuredSummary, createMemoryPromotion } = requir
 const { createMemoryRecords } = require('./memory-records');
 
 const ALLOWED_CADENCES = new Set(['session', 'daily', 'weekly', 'monthly', 'manual']);
+const OPERATOR_CADENCES = new Set(['manual', 'daily', 'weekly', 'monthly']);
 const DEFAULT_CLAIM_LEASE_SECONDS = 600;
+const DEFAULT_OPERATOR_SNAPSHOT_LIMIT = 1000;
+const MAX_OPERATOR_SNAPSHOT_LIMIT = 5000;
 
 function stableJson(value) {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
@@ -61,13 +64,108 @@ function requirePeriod(opts = {}) {
   return { cadence, periodStart, periodEnd, startMs, endMs };
 }
 
+function utcDayStart(ms) {
+  const d = new Date(ms);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+}
+
+function utcWeekStart(ms) {
+  const dayStart = utcDayStart(ms);
+  const d = new Date(dayStart);
+  const mondayOffset = (d.getUTCDay() + 6) % 7;
+  return dayStart - (mondayOffset * 86400000);
+}
+
+function utcMonthStart(ms) {
+  const d = new Date(ms);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1);
+}
+
+function resolveOperatorCadence(value) {
+  const cadence = String(value || 'manual').trim().toLowerCase();
+  if (!OPERATOR_CADENCES.has(cadence)) {
+    throw new Error(`memory.consolidation.job invalid cadence: ${cadence}`);
+  }
+  return cadence;
+}
+
+function resolveOperatorAnchorMs(input = {}) {
+  const value = input.anchorTime || input.now || input.asOf || input.snapshotAsOf || Date.now();
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  const parsed = Date.parse(value);
+  if (Number.isFinite(parsed)) return parsed;
+  throw new Error('memory.consolidation.job requires a valid anchorTime');
+}
+
+function resolveOperatorWindow(input = {}) {
+  const cadence = resolveOperatorCadence(input.cadence);
+  const hasExplicitWindow = Boolean(input.periodStart || input.periodEnd || input.from || input.to);
+
+  if (cadence === 'manual' || hasExplicitWindow) {
+    const period = requirePeriod({
+      cadence,
+      periodStart: input.periodStart || input.from || null,
+      periodEnd: input.periodEnd || input.to || null,
+    });
+    return {
+      cadence,
+      periodStart: canonicalInstant(period.periodStart),
+      periodEnd: canonicalInstant(period.periodEnd),
+    };
+  }
+
+  const anchorMs = resolveOperatorAnchorMs(input);
+  let periodStartMs;
+  let periodEndMs;
+
+  if (cadence === 'daily') {
+    periodEndMs = utcDayStart(anchorMs);
+    periodStartMs = periodEndMs - 86400000;
+  } else if (cadence === 'weekly') {
+    periodEndMs = utcWeekStart(anchorMs);
+    periodStartMs = periodEndMs - (7 * 86400000);
+  } else if (cadence === 'monthly') {
+    periodEndMs = utcMonthStart(anchorMs);
+    const d = new Date(periodEndMs);
+    periodStartMs = Date.UTC(d.getUTCFullYear(), d.getUTCMonth() - 1, 1);
+  } else {
+    throw new Error(`memory.consolidation.job invalid cadence: ${cadence}`);
+  }
+
+  return {
+    cadence,
+    periodStart: new Date(periodStartMs).toISOString(),
+    periodEnd: new Date(periodEndMs).toISOString(),
+  };
+}
+
+function normalizeOperatorSnapshotLimit(value) {
+  if (value === null || value === undefined || value === '') return DEFAULT_OPERATOR_SNAPSHOT_LIMIT;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return DEFAULT_OPERATOR_SNAPSHOT_LIMIT;
+  return Math.max(1, Math.min(MAX_OPERATOR_SNAPSHOT_LIMIT, Math.floor(n)));
+}
+
+function normalizeStringList(value) {
+  if (Array.isArray(value)) return value.map(item => String(item || '').trim()).filter(Boolean);
+  if (value === null || value === undefined || value === '') return [];
+  return String(value).split(',').map(item => item.trim()).filter(Boolean);
+}
+
 function recordKey(record) {
   return String(record.canonicalKey || record.canonical_key || record.id || record.memory_id || '');
 }
 
+function normalizeRecordId(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const number = Number(value);
+  if (Number.isSafeInteger(number) && number > 0 && String(number) === String(value)) return number;
+  return value;
+}
+
 function normalizeRecord(record) {
   return {
-    id: record.id || record.memory_id || null,
+    id: normalizeRecordId(record.id || record.memory_id),
     memoryType: record.memoryType || record.memory_type || null,
     canonicalKey: recordKey(record),
     status: record.status || null,
@@ -318,6 +416,15 @@ function normalizeCandidateLineage(candidate = {}) {
   return { payload, sourceMemoryIds, sourceCanonicalKeys };
 }
 
+function classifySkippedRun(existingRun, plan) {
+  if (!existingRun) return 'claim_not_acquired';
+  const sameSnapshot = existingRun.input_hash === plan.inputHash;
+  if (sameSnapshot && existingRun.status === 'applied') return 'already_applied';
+  if (sameSnapshot && existingRun.status === 'applying') return 'already_claimed';
+  if (existingRun.status === 'applied' || existingRun.status === 'applying') return 'window_winner_exists';
+  return 'claim_not_acquired';
+}
+
 function planCompaction(records = [], opts = {}) {
   const { cadence, periodStart, periodEnd, endMs } = requirePeriod(opts);
   const normalized = records.map(normalizeRecord).sort((a, b) => {
@@ -389,7 +496,7 @@ function distillArchiveSnapshot(snapshot = {}, opts = {}) {
       scopeKey: session.scopeKey || (sessionId ? `session:${sessionId}` : opts.scopeKey || 'archive'),
       contextKey: session.contextKey || opts.contextKey || null,
       topicKey: session.topicKey || opts.topicKey || null,
-      authority: opts.authority || 'verified_summary',
+      authority: opts.authority || 'raw_transcript',
       evidenceRefs: [{
         sourceKind: 'external',
         sourceRef,
@@ -937,9 +1044,178 @@ function createMemoryConsolidation({ pool, schema, defaultTenantId, records = nu
     }
   }
 
+  async function loadActiveSnapshot(input = {}) {
+    if (!records || typeof records.listActive !== 'function') {
+      throw new Error('memory.consolidation.runJob requires records.listActive');
+    }
+
+    const tenantId = input.tenantId || defaultTenantId;
+    const scopeKeys = normalizeStringList(
+      input.scopeKeys
+      || input.scopeKey
+      || input.activeScopeKey
+      || input.activeScopePath
+    );
+    const limit = normalizeOperatorSnapshotLimit(input.snapshotLimit ?? input.limit);
+    const rows = await records.listActive({
+      tenantId,
+      scopeId: input.scopeId,
+      scopeKeys: scopeKeys.length > 0 ? scopeKeys : undefined,
+      asOf: input.snapshotAsOf || input.asOf || undefined,
+      limit,
+    });
+    return {
+      rows,
+      scopeKeys,
+      snapshotAsOf: input.snapshotAsOf || input.asOf || null,
+      snapshotLimit: limit,
+      snapshotTruncated: rows.length >= limit,
+    };
+  }
+
+  async function findExistingRun(input = {}) {
+    const tenantId = input.tenantId || defaultTenantId;
+    const plan = input.plan || input;
+    const result = await pool.query(
+      `SELECT *
+         FROM ${schema}.compaction_runs
+        WHERE tenant_id = $1
+          AND cadence = $2
+          AND period_start = $3
+          AND period_end = $4
+          AND policy_version = $5
+        ORDER BY CASE
+                   WHEN input_hash = $6 AND status = 'applied' THEN 0
+                   WHEN status = 'applied' THEN 1
+                   WHEN input_hash = $6 AND status = 'applying' THEN 2
+                   WHEN status = 'applying' THEN 3
+                   WHEN input_hash = $6 AND status = 'planned' THEN 4
+                   ELSE 5
+                 END,
+                 id DESC
+        LIMIT 1`,
+      [
+        tenantId,
+        plan.cadence,
+        plan.periodStart,
+        plan.periodEnd,
+        plan.policyVersion || 'v1',
+        plan.inputHash,
+      ]
+    );
+    return result.rows[0] || null;
+  }
+
+  async function runJob(input = {}) {
+    const job = String(input.job || 'compaction').trim().toLowerCase();
+    if (job === 'archive-distill') {
+      if (input.apply === true || input.promoteCandidates === true) {
+        throw new Error('memory.consolidation.runJob archive-distill is dry-run only');
+      }
+      const archiveSnapshot = input.archiveSnapshot || input.snapshot || null;
+      if (!archiveSnapshot || typeof archiveSnapshot !== 'object') {
+        throw new Error('memory.consolidation.runJob archive-distill requires archiveSnapshot');
+      }
+      const distill = distillArchiveSnapshot(archiveSnapshot, input);
+      return {
+        job,
+        status: 'planned',
+        dryRun: true,
+        inputHash: distill.inputHash,
+        candidates: distill.candidates,
+        meta: distill.meta,
+      };
+    }
+
+    const tenantId = input.tenantId || defaultTenantId;
+    const window = resolveOperatorWindow(input);
+    const snapshot = Array.isArray(input.records)
+      ? {
+          rows: input.records,
+          scopeKeys: normalizeStringList(
+            input.scopeKeys
+            || input.scopeKey
+            || input.activeScopeKey
+            || input.activeScopePath
+          ),
+          snapshotAsOf: input.snapshotAsOf || input.asOf || window.periodEnd,
+          snapshotLimit: Array.isArray(input.records) ? input.records.length : null,
+          snapshotTruncated: false,
+        }
+      : await loadActiveSnapshot({
+          tenantId,
+          scopeId: input.scopeId,
+          scopeKeys: input.scopeKeys || input.scopeKey || input.activeScopePath || input.activeScopeKey,
+          snapshotAsOf: input.snapshotAsOf || input.asOf || window.periodEnd,
+          snapshotLimit: input.snapshotLimit ?? input.limit,
+        });
+    const plan = planCompaction(snapshot.rows, {
+      tenantId,
+      cadence: window.cadence,
+      periodStart: window.periodStart,
+      periodEnd: window.periodEnd,
+      policyVersion: input.policyVersion || 'v1',
+    });
+
+    if (input.apply !== true) {
+      return {
+        job,
+        status: 'planned',
+        dryRun: true,
+        plan,
+        cadence: plan.cadence,
+        periodStart: plan.periodStart,
+        periodEnd: plan.periodEnd,
+        snapshotCount: snapshot.rows.length,
+        snapshotLimit: snapshot.snapshotLimit,
+        snapshotTruncated: snapshot.snapshotTruncated,
+        snapshotAsOf: snapshot.snapshotAsOf,
+        scopeKeys: snapshot.scopeKeys,
+      };
+    }
+
+    const result = input.promoteCandidates === true
+      ? await executePlan({
+          plan,
+          tenantId,
+          workerId: input.workerId,
+          applyToken: input.applyToken,
+          appliedAt: input.appliedAt,
+          promoteCandidates: true,
+          claimLeaseSeconds: input.claimLeaseSeconds,
+          reclaimStaleClaims: input.reclaimStaleClaims,
+        })
+      : await applyPlan({
+          plan,
+          tenantId,
+          workerId: input.workerId,
+          applyToken: input.applyToken,
+          appliedAt: input.appliedAt,
+          claimLeaseSeconds: input.claimLeaseSeconds,
+          reclaimStaleClaims: input.reclaimStaleClaims,
+        });
+    const existingRun = result.run || await findExistingRun({ tenantId, plan });
+    return {
+      ...result,
+      job,
+      dryRun: false,
+      cadence: plan.cadence,
+      periodStart: plan.periodStart,
+      periodEnd: plan.periodEnd,
+      snapshotCount: snapshot.rows.length,
+      snapshotLimit: snapshot.snapshotLimit,
+      snapshotTruncated: snapshot.snapshotTruncated,
+      snapshotAsOf: snapshot.snapshotAsOf,
+      scopeKeys: snapshot.scopeKeys,
+      existingRun,
+      skipReason: result.run ? null : classifySkippedRun(existingRun, plan),
+    };
+  }
+
   return {
     plan: planCompaction,
     distillArchiveSnapshot,
+    runJob,
     recordRun,
     claimRun,
     applyPlan,
@@ -953,6 +1229,7 @@ module.exports = {
   advisoryLockKeys,
   canonicalInstant,
   normalizeClaimLeaseSeconds,
+  resolveOperatorWindow,
   planCompaction,
   distillArchiveSnapshot,
   createMemoryConsolidation,

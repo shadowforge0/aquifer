@@ -34,7 +34,7 @@ const DEFAULT_RECOVERY_MAX_BYTES = 1024 * 1024;
 const DEFAULT_RECOVERY_MAX_MESSAGES = 80;
 const DEFAULT_RECOVERY_MAX_CHARS = 24000;
 const DEFAULT_RECOVERY_MAX_PROMPT_TOKENS = 9000;
-const RECOVERY_DECISIONS = new Set(['declined', 'deferred']);
+const RECOVERY_DECISIONS = new Set(['declined', 'deferred', 'skipped']);
 
 function ensureDirs(...dirs) {
     for (const dir of dirs.filter(Boolean)) fs.mkdirSync(dir, { recursive: true });
@@ -476,10 +476,11 @@ function committedSnapshotMatchesView(session = {}, view = {}) {
 async function needsImport(aquifer, candidate, opts = {}) {
     const { importedDir, agentId = 'main', minImportUserMessages = DEFAULT_MIN_IMPORT_USER_MESSAGES } = opts;
     const norm = candidate.normalized;
-
-    if (norm.userCount < minImportUserMessages || norm.messages.length === 0) return true;
-
     const marker = readMarker(importedDir, candidate.sessionId);
+
+    if (norm.userCount < minImportUserMessages || norm.messages.length === 0) {
+        return !(marker && marker.includes('skip:'));
+    }
     if (!marker) return true;
 
     const existing = await getExistingSession(aquifer, candidate.sessionId, agentId);
@@ -603,6 +604,24 @@ async function importCandidate(aquifer, candidate, opts = {}) {
     const norm = candidate.normalized;
 
     if (norm.userCount < minImportUserMessages || norm.messages.length === 0) {
+        writeMarker(paths.importedDir, candidate.sessionId, 'skip:short-import', {
+            transcriptHash: norm.transcriptHash,
+            filePath: candidate.path,
+            fileSessionId: candidate.fileSessionId,
+            messageCount: norm.messages.length,
+            userCount: norm.userCount,
+            assistantCount: norm.assistantCount,
+            source,
+            agentId,
+            sessionKey,
+            reason: `user_count=${norm.userCount} < min=${minImportUserMessages}`,
+        });
+        writeMarker(paths.afterburnedDir, candidate.sessionId, `skip:short-import user_count=${norm.userCount}`, {
+            transcriptHash: norm.transcriptHash,
+            source,
+            agentId,
+            sessionKey,
+        });
         return { status: 'skipped_empty', sessionId: candidate.sessionId, counts: norm };
     }
 
@@ -715,6 +734,16 @@ async function afterburnCandidate(aquifer, candidate, opts = {}) {
         } catch (err) {
             if (logger && logger.warn) logger.warn(`[codex-consumer] skip failed for ${candidate.sessionId}: ${err.message}`);
         }
+        await markFinalizationSkipped(aquifer, {
+            ...candidate,
+            transcriptHash: candidate.transcriptHash || importedMetadata.transcriptHash || importedMetadata.transcript_hash || null,
+            metadata: importedMetadata,
+        }, {
+            agentId,
+            source,
+            reason: `user_count=${userCount} < min=${minUserMessages}`,
+            mode: 'afterburn',
+        });
         writeMarker(paths.afterburnedDir, candidate.sessionId, `skip:short user_count=${userCount}`);
         return { status: 'skipped_short', sessionId: candidate.sessionId, userCount };
     }
@@ -779,7 +808,14 @@ async function afterburnCandidate(aquifer, candidate, opts = {}) {
         finalizationStatus: result.status,
         transcriptHash: view.transcriptHash,
     });
-    return { status: 'afterburned', sessionId: candidate.sessionId, finalization: result };
+    return {
+        status: 'afterburned',
+        sessionId: candidate.sessionId,
+        finalization: result,
+        reviewText: result.reviewText || result.humanReviewText || '',
+        humanReviewText: result.humanReviewText || '',
+        sessionStartText: result.sessionStartText || '',
+    };
 }
 
 async function readFinalization(aquifer, input = {}) {
@@ -792,9 +828,44 @@ async function readFinalization(aquifer, input = {}) {
     }
 }
 
-function isRecoverySuppressed(finalization) {
+function isRecoverySuppressed(finalization, opts = {}) {
     if (!finalization) return false;
-    return ['finalized', 'declined', 'deferred'].includes(finalization.status);
+    if (finalization.status === 'deferred' && opts.includeDeferredRecovery) return false;
+    return ['finalized', 'skipped', 'declined', 'deferred'].includes(finalization.status);
+}
+
+async function markFinalizationSkipped(aquifer, candidate = {}, opts = {}) {
+    const transcriptHash = candidate.transcriptHash || candidate.metadata?.transcriptHash || candidate.metadata?.transcript_hash || null;
+    if (!aquifer || !aquifer.finalization || !transcriptHash) return null;
+    const input = {
+        sessionId: candidate.sessionId,
+        agentId: opts.agentId || candidate.agentId || candidate.metadata?.agentId || 'main',
+        source: opts.source || candidate.source || candidate.metadata?.source || 'codex',
+        transcriptHash,
+        phase: opts.phase || candidate.phase || 'curated_memory_v1',
+        status: 'skipped',
+        error: opts.reason || 'skipped',
+        metadata: {
+            reason: opts.reason || 'skipped',
+            skippedAt: new Date().toISOString(),
+            ...(opts.metadata || {}),
+        },
+    };
+    try {
+        if (typeof aquifer.finalization.updateStatus === 'function') {
+            const updated = await aquifer.finalization.updateStatus(input);
+            if (updated) return updated;
+        }
+        if (typeof aquifer.finalization.createTask === 'function') {
+            return await aquifer.finalization.createTask({
+                ...input,
+                mode: opts.mode || 'session_start_recovery',
+            });
+        }
+    } catch {
+        return null;
+    }
+    return null;
 }
 
 async function findRecoveryCandidates(aquifer, opts = {}) {
@@ -826,7 +897,7 @@ async function findRecoveryCandidates(aquifer, opts = {}) {
             source: metadata.source || source,
             transcriptHash,
         });
-        if (isRecoverySuppressed(finalization)) continue;
+        if (isRecoverySuppressed(finalization, opts)) continue;
 
         const filePath = metadata.filePath || null;
         if (!filePath) continue;
@@ -839,7 +910,7 @@ async function findRecoveryCandidates(aquifer, opts = {}) {
             metadata,
         };
         const localDecision = readRecoveryDecision(paths, candidatePreview);
-        if (!finalization && isRecoverySuppressed(localDecision)) continue;
+        if (!finalization && isRecoverySuppressed(localDecision, opts)) continue;
 
         if (filePath) seenFiles.add(path.resolve(filePath));
         candidates.push({
@@ -906,7 +977,7 @@ async function findRecoveryCandidates(aquifer, opts = {}) {
             },
         };
         const localDecision = readRecoveryDecision(paths, candidatePreview);
-        if (isRecoverySuppressed(localDecision)) continue;
+        if (isRecoverySuppressed(localDecision, opts)) continue;
         candidates.push({
             ...candidatePreview,
             recoveryDecisionStatus: localDecision ? localDecision.status : null,
@@ -914,6 +985,96 @@ async function findRecoveryCandidates(aquifer, opts = {}) {
         if (candidates.length >= maxRecoveryCandidates) break;
     }
     return candidates;
+}
+
+function dbEligibilityFromRecoveryView(view = {}, opts = {}) {
+    if (!view || view.status !== 'ok') {
+        return { eligible: false, status: view?.status || 'unavailable', reason: view?.reason || null };
+    }
+    const minUserMessages = opts.minUserMessages ?? opts.minImportUserMessages ?? DEFAULT_MIN_IMPORT_USER_MESSAGES;
+    const userCount = Number(view.counts?.userCount || 0);
+    if (userCount < minUserMessages) {
+        return {
+            eligible: false,
+            status: 'skipped_short',
+            reason: `user_count=${userCount} < min=${minUserMessages}`,
+            userCount,
+        };
+    }
+    return { eligible: true, status: 'eligible', userCount };
+}
+
+function candidateFromRecoveryView(candidate = {}, view = {}) {
+    return {
+        ...candidate,
+        sessionId: view.sessionId || candidate.sessionId,
+        fileSessionId: view.fileSessionId || candidate.fileSessionId,
+        filePath: view.filePath || candidate.filePath,
+        transcriptHash: view.transcriptHash || candidate.transcriptHash || null,
+        userCount: view.counts?.userCount ?? candidate.userCount ?? null,
+        messageCount: view.counts?.messageCount ?? candidate.messageCount ?? null,
+        safeMessageCount: view.counts?.safeMessageCount ?? null,
+        assistantCount: view.counts?.assistantCount ?? null,
+        charCount: view.charCount ?? null,
+        approxPromptTokens: view.approxPromptTokens ?? null,
+        metadata: {
+            ...(candidate.metadata || {}),
+            filePath: view.filePath || candidate.filePath || candidate.metadata?.filePath || null,
+            fileSessionId: view.fileSessionId || candidate.fileSessionId || candidate.metadata?.fileSessionId || null,
+            transcriptHash: view.transcriptHash || candidate.transcriptHash || candidate.metadata?.transcriptHash || null,
+            dbRecoveryEligible: true,
+        },
+    };
+}
+
+async function findDbEligibleRecoveryCandidates(aquifer, opts = {}) {
+    const paths = defaultPaths(opts);
+    const maxEligible = Number.isFinite(opts.maxRecoveryCandidates) && opts.maxRecoveryCandidates > 0
+        ? opts.maxRecoveryCandidates
+        : 3;
+    const rawScanLimit = Number.isFinite(opts.maxRecoveryCandidateScan) && opts.maxRecoveryCandidateScan > 0
+        ? opts.maxRecoveryCandidateScan
+        : Math.max(maxEligible * 5, maxEligible);
+    const rawCandidates = await findRecoveryCandidates(aquifer, {
+        ...opts,
+        maxRecoveryCandidates: rawScanLimit,
+    });
+    const eligible = [];
+
+    for (const candidate of rawCandidates) {
+        let view;
+        try {
+            view = materializeRecoveryTranscriptView(candidate, opts);
+        } catch {
+            continue;
+        }
+        const eligibility = dbEligibilityFromRecoveryView(view, opts);
+        if (!eligibility.eligible) continue;
+
+        const enriched = candidateFromRecoveryView(candidate, view);
+        const finalization = await readFinalization(aquifer, {
+            sessionId: enriched.sessionId,
+            agentId: opts.agentId || enriched.agentId || 'main',
+            source: opts.source || enriched.source || 'codex',
+            transcriptHash: enriched.transcriptHash,
+            phase: opts.phase || enriched.phase || 'curated_memory_v1',
+        });
+        if (isRecoverySuppressed(finalization, opts)) continue;
+
+        const canonicalDecision = readRecoveryDecision(paths, enriched);
+        if (isRecoverySuppressed(canonicalDecision, opts)) continue;
+
+        eligible.push({
+            ...enriched,
+            status: 'needs_consent',
+            eligibilityStatus: eligibility.status,
+            finalizationStatus: finalization ? finalization.status : enriched.finalizationStatus || null,
+            recoveryDecisionStatus: canonicalDecision ? canonicalDecision.status : enriched.recoveryDecisionStatus || null,
+        });
+        if (eligible.length >= maxEligible) break;
+    }
+
+    return eligible;
 }
 
 function formatRecoveryTranscript(messages = []) {
@@ -1166,12 +1327,20 @@ async function finalizeTranscriptView(aquifer, view = {}, summary = {}, opts = {
         authority: opts.authority || 'verified_summary',
         metadata,
     });
+    const humanReviewText = result.humanReviewText || '';
+    const sessionStartText = result.sessionStartText || '';
     return {
         status: result.status || 'finalized',
         commit: commitResult,
         finalization: result,
         sessionId: view.sessionId,
         transcriptHash: view.transcriptHash,
+        summary: result.summary || null,
+        memoryResult: result.memoryResult || {},
+        memoryResults: result.memoryResults || [],
+        reviewText: humanReviewText,
+        humanReviewText,
+        sessionStartText,
     };
 }
 
@@ -1232,6 +1401,36 @@ async function prepareSessionStartRecovery(aquifer, opts = {}) {
     const view = materializeRecoveryTranscriptView(candidate, recoveryOpts);
     if (view.status !== 'ok') {
         return { status: view.status, candidate, view };
+    }
+    const minUserMessages = opts.minUserMessages ?? opts.minImportUserMessages ?? DEFAULT_MIN_IMPORT_USER_MESSAGES;
+    const userCount = Number(view.counts?.userCount || 0);
+    if (userCount < minUserMessages) {
+        const skippedCandidate = {
+            ...candidate,
+            sessionId: view.sessionId || candidate.sessionId,
+            fileSessionId: view.fileSessionId || candidate.fileSessionId,
+            filePath: view.filePath || candidate.filePath,
+            transcriptHash: view.transcriptHash,
+            metadata: {
+                ...(candidate.metadata || {}),
+                filePath: view.filePath || candidate.filePath,
+                fileSessionId: view.fileSessionId || candidate.fileSessionId,
+                transcriptHash: view.transcriptHash,
+            },
+        };
+        await recordRecoveryDecision(aquifer, skippedCandidate, 'skipped', {
+            ...recoveryOpts,
+            reason: `user_count=${userCount} < min=${minUserMessages}`,
+            mode: 'session_start_recovery',
+        });
+        if (candidate.origin === 'jsonl_preview') {
+            writeRecoveryDecision(defaultPaths(recoveryOpts), candidate, 'skipped', {
+                reason: `user_count=${userCount} < min=${minUserMessages}`,
+                source: recoveryOpts.source || candidate.source || 'codex',
+                agentId: recoveryOpts.agentId || candidate.agentId || 'main',
+            });
+        }
+        return { status: 'skipped_short', candidate: skippedCandidate, view, userCount };
     }
     return {
         status: 'needs_agent_summary',
@@ -1328,6 +1527,7 @@ module.exports = {
     findImportCandidates,
     findAfterburnCandidates,
     findRecoveryCandidates,
+    findDbEligibleRecoveryCandidates,
     materializeRecoveryTranscriptView,
     buildFinalizationPrompt,
     prepareSessionStartRecovery,

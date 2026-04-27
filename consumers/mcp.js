@@ -7,8 +7,8 @@
  * This is the primary integration surface for Aquifer. Agent hosts (Claude Code,
  * Codex, OpenCode, etc.) should integrate through this MCP server.
  *
- * Tools: session_recall, evidence_recall, session_feedback, feedback_stats,
- * session_bootstrap, memory_stats, memory_pending
+ * Tools: session_recall, evidence_recall, session_feedback, memory_feedback,
+ * feedback_stats, session_bootstrap, memory_stats, memory_pending
  *
  * Usage:
  *   npx aquifer mcp
@@ -19,6 +19,7 @@
  */
 
 const { createAquiferFromConfig } = require('./shared/factory');
+const { version: packageVersion } = require('../package.json');
 
 let _aquifer = null;
 
@@ -59,7 +60,7 @@ async function main() {
 
   const server = new McpServer({
     name: 'aquifer-memory',
-    version: '0.9.0',
+    version: packageVersion,
   });
 
   server.tool(
@@ -76,6 +77,8 @@ async function main() {
       entityMode: z.enum(['any', 'all']).optional().describe('"any" (default, boost) or "all" (only sessions with every entity)'),
       mode: z.enum(['fts', 'hybrid', 'vector']).optional().describe('Recall mode: "fts" (keyword only, no embed needed), "hybrid" (default, FTS + vector), "vector" (vector only)'),
       explain: z.boolean().optional().describe('Include per-result score breakdown (diagnostic)'),
+      activeScopeKey: z.string().optional().describe('Active curated memory scope key'),
+      activeScopePath: z.array(z.string()).optional().describe('Ordered curated scope path'),
     },
     async (params) => {
       try {
@@ -87,6 +90,8 @@ async function main() {
           source: params.source || undefined,
           dateFrom: params.dateFrom || undefined,
           dateTo: params.dateTo || undefined,
+          activeScopeKey: params.activeScopeKey || undefined,
+          activeScopePath: params.activeScopePath || undefined,
         };
         if (params.entities && params.entities.length > 0) {
           recallOpts.entities = params.entities;
@@ -120,6 +125,7 @@ async function main() {
       entityMode: z.enum(['any', 'all']).optional().describe('"any" (default, boost) or "all" (only sessions with every entity)'),
       mode: z.enum(['fts', 'hybrid', 'vector']).optional().describe('Legacy evidence recall mode'),
       explain: z.boolean().optional().describe('Include per-result score breakdown (diagnostic)'),
+      allowUnsafeDebug: z.boolean().optional().describe('Allow broad evidence/debug search without an audit boundary'),
     },
     async (params) => {
       try {
@@ -137,6 +143,7 @@ async function main() {
           recallOpts.entityMode = params.entityMode || 'any';
         }
         if (params.mode) recallOpts.mode = params.mode;
+        if (params.allowUnsafeDebug) recallOpts.allowUnsafeDebug = true;
 
         const results = await aquifer.evidenceRecall(params.query, recallOpts);
         const text = formatResults(results, params.query, params.explain);
@@ -152,7 +159,7 @@ async function main() {
 
   server.tool(
     'session_feedback',
-    'After using session_recall, mark the result helpful if it directly informed your answer, or unhelpful if it was irrelevant/outdated. Include a short note. Sessions with more helpful feedback rank higher in future recalls.',
+    'After using legacy session_recall or bootstrap, mark the recalled session helpful or unhelpful. This only targets legacy session trust, not curated memory rows.',
     {
       sessionId: z.string().min(1).describe('Session ID to give feedback on'),
       verdict: z.enum(['helpful', 'unhelpful']).describe('Was the recalled session useful?'),
@@ -173,6 +180,42 @@ async function main() {
       } catch (err) {
         return {
           content: [{ type: 'text', text: `session_feedback error: ${err.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    'memory_feedback',
+    'Record append-only feedback on a curated memory row. This affects curated ranking/review priority only and does not mutate memory truth.',
+    {
+      memoryId: z.string().min(1).optional().describe('Curated memory record ID to give feedback on'),
+      canonicalKey: z.string().min(1).optional().describe('Canonical key of the active curated memory record'),
+      feedbackType: z.enum(['helpful', 'confirm', 'irrelevant', 'scope_mismatch', 'stale', 'incorrect']).describe('Curated memory feedback event type'),
+      note: z.string().optional().describe('Optional reason'),
+      agentId: z.string().optional().describe('Optional actor/agent label for audit metadata'),
+    },
+    async (params) => {
+      try {
+        if (!params.memoryId && !params.canonicalKey) {
+          throw new Error('memory_feedback requires memoryId or canonicalKey');
+        }
+        const aquifer = getAquifer();
+        const result = await aquifer.memoryFeedback({
+          memoryId: params.memoryId || undefined,
+          canonicalKey: params.canonicalKey || undefined,
+        }, {
+          feedbackType: params.feedbackType,
+          note: params.note || undefined,
+          agentId: params.agentId || undefined,
+        });
+        return {
+          content: [{ type: 'text', text: `Memory feedback: ${result.feedbackType}` }],
+        };
+      } catch (err) {
+        return {
+          content: [{ type: 'text', text: `memory_feedback error: ${err.message}` }],
           isError: true,
         };
       }
@@ -273,6 +316,8 @@ async function main() {
       limit: z.number().int().min(1).max(20).optional().describe('Max sessions (default 5)'),
       lookbackDays: z.number().int().min(1).max(90).optional().describe('How far back in days (default 14)'),
       maxChars: z.number().int().min(500).max(12000).optional().describe('Max output characters (default 4000)'),
+      activeScopeKey: z.string().optional().describe('Active curated memory scope key'),
+      activeScopePath: z.array(z.string()).optional().describe('Ordered curated scope path'),
     },
     async (params) => {
       try {
@@ -282,6 +327,8 @@ async function main() {
           limit: params.limit,
           lookbackDays: params.lookbackDays,
           maxChars: params.maxChars,
+          activeScopeKey: params.activeScopeKey || undefined,
+          activeScopePath: params.activeScopePath || undefined,
           format: 'text',
         });
         return { content: [{ type: 'text', text: result.text }] };

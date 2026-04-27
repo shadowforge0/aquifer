@@ -18,6 +18,24 @@ function formatDateIso(value) {
     return Number.isNaN(d.getTime()) ? 'unknown' : d.toISOString().slice(0, 10);
 }
 
+function isCuratedMemoryResult(result) {
+    return Boolean(result && (
+        result.memoryType || result.memory_type ||
+        result.canonicalKey || result.canonical_key ||
+        result.scopeKey || result.scope_key
+    ));
+}
+
+function curatedTitle(result) {
+    const type = result.memoryType || result.memory_type || 'memory';
+    const title = result.title || result.summary || result.canonicalKey || result.canonical_key || type;
+    return truncate(title, 80);
+}
+
+function resultDate(result) {
+    return result.startedAt || result.acceptedAt || result.accepted_at || result.observedAt || result.observed_at || null;
+}
+
 // Humanize a past timestamp into zh-TW relative form (e.g. "3 天前", "昨天").
 // Bucketed on raw ms-diff — good enough for model intuition, not calendar-precise.
 // Returns null for invalid / future timestamps so callers can fall back.
@@ -48,6 +66,11 @@ const defaultRenderers = {
         return query ? `No results found for "${query}".` : 'No matching sessions found.';
     },
     title(result, index) {
+        if (isCuratedMemoryResult(result)) {
+            const date = formatDateIso(resultDate(result));
+            const scope = result.scopeKey || result.scope_key || 'scope:unknown';
+            return `### ${index + 1}. ${curatedTitle(result)} (${date}, ${scope})`;
+        }
         const ss = result.structuredSummary || {};
         const title = ss.title || truncate(result.summaryText, 60) || '(untitled)';
         const date = formatDateIso(result.startedAt);
@@ -55,6 +78,10 @@ const defaultRenderers = {
         return `### ${index + 1}. ${title} (${date}, ${agent})`;
     },
     body(result) {
+        if (isCuratedMemoryResult(result)) {
+            const text = result.summary || result.title || result.canonicalKey || result.canonical_key || '';
+            return text ? truncate(text, 300) : null;
+        }
         const ss = result.structuredSummary || {};
         const text = ss.overview || result.summaryText || '';
         return text ? truncate(text, 300) : null;

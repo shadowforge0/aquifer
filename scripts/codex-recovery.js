@@ -13,6 +13,7 @@ const VALUE_FLAGS = new Set([
   'agent-id',
   'codex-home',
   'config',
+  'except-session-id',
   'file-path',
   'finalizer-model',
   'idle-ms',
@@ -119,6 +120,7 @@ function buildRecoveryOptions(flags = {}, env = process.env) {
     maxRecoveryChars: parseIntFlag(flags['max-recovery-chars'], undefined),
     maxRecoveryPromptTokens: parseIntFlag(flags['max-recovery-prompt-tokens'], undefined),
     includeJsonlPreviews: flags['include-jsonl-previews'] === true,
+    includeDeferredRecovery: flags['include-deferred'] === true,
     excludeNewest: flags['include-current'] === true ? false : true,
   };
   for (const [key, value] of Object.entries(opts)) {
@@ -138,6 +140,7 @@ function scriptCommand(subcommand, candidate = {}, opts = {}, extra = []) {
   if (opts.agentId) parts.push('--agent-id', opts.agentId);
   if (opts.source) parts.push('--source', opts.source);
   if (opts.sessionKey) parts.push('--session-key', opts.sessionKey);
+  if (opts.maxRecoveryCandidates) parts.push('--max-candidates', String(opts.maxRecoveryCandidates));
   parts.push(...extra);
   return parts.map(shellQuote).join(' ');
 }
@@ -151,6 +154,7 @@ function renderCandidate(candidate = {}) {
   const counts = [];
   if (candidate.userCount !== null && candidate.userCount !== undefined) counts.push(`${candidate.userCount} user turns`);
   if (candidate.messageCount !== null && candidate.messageCount !== undefined) counts.push(`${candidate.messageCount} messages`);
+  if (candidate.approxPromptTokens !== null && candidate.approxPromptTokens !== undefined) counts.push(`~${candidate.approxPromptTokens} prompt tokens`);
   if (candidate.updatedAt) {
     const updated = new Date(candidate.updatedAt);
     if (!Number.isNaN(updated.getTime())) counts.push(`updated ${updated.toISOString()}`);
@@ -158,27 +162,76 @@ function renderCandidate(candidate = {}) {
   return counts.length > 0 ? `${id} (${counts.join(', ')})` : id;
 }
 
-function renderHookContext(candidates = [], opts = {}) {
-  const candidate = candidates[0];
-  if (!candidate) return '';
+function renderFinalizeCommand(candidate = {}, opts = {}, extra = []) {
+  return scriptCommand('finalize', candidate, opts, [
+    ...recoveryArgsForCandidate(candidate),
+    '--summary-stdin',
+    '--mode',
+    'session_start_recovery',
+    ...extra,
+  ]);
+}
 
-  const promptCommand = scriptCommand('prompt', candidate, opts);
-  const finalizeCommand = scriptCommand('finalize', candidate, opts, ['--summary-stdin', '--mode', 'session_start_recovery']);
-  const deferCommand = scriptCommand('decision', candidate, opts, ['--verdict', 'deferred']);
-  const declineCommand = scriptCommand('decision', candidate, opts, ['--verdict', 'declined']);
+function recoveryArgsForCandidate(candidate = {}) {
+  return candidate.origin === 'jsonl_preview' ? ['--include-jsonl-previews'] : [];
+}
+
+function renderHookContext(candidates = [], opts = {}) {
+  if (!candidates.length) return '';
+
+  const sharedArgs = candidates.some(candidate => candidate.origin === 'jsonl_preview')
+    ? ['--include-jsonl-previews']
+    : [];
+  const deferUnselectedCommand = scriptCommand('decision', {}, opts, [
+    ...sharedArgs,
+    '--all',
+    '--except-session-id',
+    'SELECTED_IDS_COMMA_SEPARATED',
+    '--verdict',
+    'deferred',
+    '--reason',
+    'not_selected_at_session_start',
+  ]);
+  const deferAllCommand = scriptCommand('decision', {}, opts, [
+    ...sharedArgs,
+    '--all',
+    '--verdict',
+    'deferred',
+    '--reason',
+    'deferred_by_user_at_session_start',
+  ]);
+  const declineAllCommand = scriptCommand('decision', {}, opts, [
+    ...sharedArgs,
+    '--all',
+    '--verdict',
+    'declined',
+    '--reason',
+    'declined_by_user_at_session_start',
+  ]);
+  const candidateLines = [];
+  candidates.forEach((candidate, index) => {
+    const previewArgs = recoveryArgsForCandidate(candidate);
+    const promptCommand = scriptCommand('prompt', candidate, opts, previewArgs);
+    const finalizeCommand = renderFinalizeCommand(candidate, opts);
+    candidateLines.push(`${index + 1}. ${renderCandidate(candidate)}`);
+    candidateLines.push(`   prompt: ${promptCommand}`);
+    candidateLines.push(`   finalize: ${finalizeCommand}`);
+  });
 
   return [
     '[AQUIFER RECOVERY]',
-    `Aquifer found an unfinalized Codex session: ${renderCandidate(candidate)}.`,
-    'This hook only scanned metadata and the finalization ledger. It has not read the full JSONL transcript.',
-    'If MK agrees to recover it, run:',
-    promptCommand,
-    'Then summarize the sanitized transcript with the current Codex agent and write the JSON result with:',
-    finalizeCommand,
-    'If MK wants to decide later, run:',
-    deferCommand,
-    'If MK does not want to recover this session, run:',
-    declineCommand,
+    `Aquifer found ${candidates.length} Codex JSONL session(s) eligible for DB recovery.`,
+    'This hook scanned local JSONL only to compute eligibility, counts, hashes, and prompt budget. It did not inject transcript text.',
+    'Recover all: process every candidate below one at a time with its prompt command, summarize with the current Codex agent, then write the JSON result with its finalize command.',
+    'Recover selected: process only selected candidates, then mark the rest for manual recovery later with:',
+    deferUnselectedCommand,
+    'Recover none now but keep manual recovery available:',
+    deferAllCommand,
+    'Decline all recovery candidates:',
+    declineAllCommand,
+    'Manual later: rerun preview or prompt with --include-deferred.',
+    '',
+    ...candidateLines,
   ].join('\n');
 }
 
@@ -202,11 +255,20 @@ function compactCandidate(candidate = {}) {
     sessionKey: candidate.sessionKey || null,
     userCount: candidate.userCount || null,
     messageCount: candidate.messageCount || null,
+    safeMessageCount: candidate.safeMessageCount || null,
+    charCount: candidate.charCount || null,
+    approxPromptTokens: candidate.approxPromptTokens || null,
     transcriptHash: candidate.transcriptHash || null,
+    eligibilityStatus: candidate.eligibilityStatus || null,
     finalizationStatus: candidate.finalizationStatus || null,
     recoveryDecisionStatus: candidate.recoveryDecisionStatus || null,
     updatedAt: candidate.updatedAt || null,
   };
+}
+
+function parseIdList(value) {
+  if (!value || value === true) return new Set();
+  return new Set(String(value).split(',').map(part => part.trim()).filter(Boolean));
 }
 
 function readSummaryJson(flags = {}) {
@@ -228,6 +290,16 @@ function readSummaryJson(flags = {}) {
   return { summaryText, structuredSummary };
 }
 
+function finalizationReviewText(result = {}) {
+  return result.humanReviewText
+    || result.human_review_text
+    || result.finalization?.humanReviewText
+    || result.finalization?.human_review_text
+    || result.finalization?.finalization?.humanReviewText
+    || result.finalization?.finalization?.human_review_text
+    || '';
+}
+
 async function withAquifer(fn) {
   let aquifer;
   try {
@@ -245,6 +317,17 @@ async function listCandidates(aquifer, opts) {
   return codex.findRecoveryCandidates(aquifer, opts);
 }
 
+async function listDbEligibleCandidates(aquifer, opts) {
+  return codex.findDbEligibleRecoveryCandidates(aquifer, opts);
+}
+
+async function listOperationalCandidates(aquifer, opts) {
+  if (opts && opts.includeJsonlPreviews) {
+    return listDbEligibleCandidates(aquifer, opts);
+  }
+  return listCandidates(aquifer, opts);
+}
+
 async function cmdPreview(aquifer, flags, opts) {
   const candidates = await listCandidates(aquifer, opts);
   if (flags.json) {
@@ -259,7 +342,15 @@ async function cmdPreview(aquifer, flags, opts) {
 }
 
 async function cmdHookContext(aquifer, flags, opts) {
-  const candidates = await listCandidates(aquifer, { ...opts, maxRecoveryCandidates: 1, includeJsonlPreviews: false });
+  const maxRecoveryCandidates = Number.isFinite(opts.maxRecoveryCandidates)
+    ? Math.max(1, opts.maxRecoveryCandidates)
+    : 1;
+  const candidates = await listDbEligibleCandidates(aquifer, {
+    ...opts,
+    idleMs: opts.idleMs ?? 0,
+    maxRecoveryCandidates,
+    includeJsonlPreviews: true,
+  });
   const context = renderHookContext(candidates, opts);
   if (flags.json) {
     console.log(JSON.stringify({ status: context ? 'needs_consent' : 'none', context, candidates: candidates.map(compactCandidate) }, null, 2));
@@ -269,7 +360,7 @@ async function cmdHookContext(aquifer, flags, opts) {
 }
 
 async function cmdPrompt(aquifer, flags, opts) {
-  const candidates = await listCandidates(aquifer, opts);
+  const candidates = await listOperationalCandidates(aquifer, opts);
   const candidate = selectCandidate(candidates, flags);
   if (!candidate) throw new Error(`No matching Codex recovery candidate: ${flags['session-id'] || '(first)'}`);
   const prepared = await codex.prepareSessionStartRecovery(aquifer, {
@@ -297,11 +388,17 @@ async function cmdPrompt(aquifer, flags, opts) {
     console.log(`Recovery prompt unavailable: ${prepared.status}`);
     return;
   }
-  console.log(prepared.prompt);
+  console.log([
+    prepared.prompt,
+    '',
+    '[AQUIFER FINALIZE]',
+    'After returning the JSON summary, pipe it into:',
+    renderFinalizeCommand(candidate, opts),
+  ].join('\n'));
 }
 
 async function cmdFinalize(aquifer, flags, opts) {
-  const candidates = await listCandidates(aquifer, opts);
+  const candidates = await listOperationalCandidates(aquifer, opts);
   const candidate = selectCandidate(candidates, flags);
   if (!candidate && !flags['file-path']) {
     throw new Error(`No matching Codex recovery candidate: ${flags['session-id'] || '(first)'}`);
@@ -325,6 +422,8 @@ async function cmdFinalize(aquifer, flags, opts) {
     return;
   }
   console.log(`Finalization ${result.status}: ${result.sessionId || flags['session-id'] || '(unknown)'}`);
+  const review = finalizationReviewText(result);
+  if (review) console.log(review);
 }
 
 async function cmdDecision(aquifer, flags, opts) {
@@ -332,7 +431,28 @@ async function cmdDecision(aquifer, flags, opts) {
   if (!['declined', 'deferred'].includes(verdict)) {
     throw new Error('decision requires --verdict declined|deferred');
   }
-  const candidates = await listCandidates(aquifer, opts);
+  const candidates = await listOperationalCandidates(aquifer, opts);
+  if (flags.all === true) {
+    const exceptIds = parseIdList(flags['except-session-id']);
+    const selected = candidates.filter(candidate => {
+      const ids = [candidate.sessionId, candidate.fileSessionId, candidate.transcriptHash].filter(Boolean);
+      return !ids.some(id => exceptIds.has(id));
+    });
+    const results = [];
+    for (const candidate of selected) {
+      results.push(await codex.recordRecoveryDecision(aquifer, candidate, verdict, {
+        ...opts,
+        reason: flags.reason || null,
+        mode: 'session_start_recovery',
+      }));
+    }
+    if (flags.json) {
+      console.log(JSON.stringify({ status: verdict, count: results.length, results }, null, 2));
+      return;
+    }
+    console.log(`Recovery ${verdict}: ${results.length} candidate(s)`);
+    return;
+  }
   const candidate = selectCandidate(candidates, flags);
   if (!candidate) throw new Error(`No matching Codex recovery candidate: ${flags['session-id'] || '(first)'}`);
   const result = await codex.recordRecoveryDecision(aquifer, candidate, verdict, {
@@ -359,7 +479,8 @@ async function main(argv = process.argv.slice(2)) {
   node scripts/codex-recovery.js preview [options]
   node scripts/codex-recovery.js prompt --session-id ID [options]
   node scripts/codex-recovery.js finalize --session-id ID --summary-stdin [options]
-  node scripts/codex-recovery.js decision --session-id ID --verdict declined|deferred [options]`);
+  node scripts/codex-recovery.js decision --session-id ID --verdict declined|deferred [options]
+  node scripts/codex-recovery.js decision --all --verdict declined|deferred [options]`);
     return;
   }
 
@@ -388,8 +509,13 @@ async function main(argv = process.argv.slice(2)) {
 
 module.exports = {
   buildRecoveryOptions,
+  cmdDecision,
+  cmdFinalize,
+  cmdHookContext,
+  cmdPrompt,
   loadCodexEnv,
   parseArgs,
+  renderFinalizeCommand,
   renderHookContext,
   selectCandidate,
 };

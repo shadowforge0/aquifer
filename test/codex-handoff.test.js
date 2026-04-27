@@ -172,6 +172,104 @@ describe('Codex handoff finalization helper', () => {
     assert.equal(calls[0].metadata.handoff.title, 'Aquifer handoff finalization');
   });
 
+  it('surfaces committed core review and SessionStart text for handoff parity', async () => {
+    const view = sampleView();
+    const summary = sampleSummary();
+    const aquifer = {
+      async getSession() {
+        return {
+          session_id: view.sessionId,
+          processing_status: 'pending',
+          msg_count: view.counts.safeMessageCount,
+          user_count: view.counts.userCount,
+          assistant_count: view.counts.assistantCount,
+          messages: {
+            normalized: view.messages,
+            metadata: { transcript_hash: view.transcriptHash },
+          },
+        };
+      },
+      finalization: {
+        async finalizeSession() {
+          return {
+            status: 'finalized',
+            finalization: { id: 43 },
+            summary,
+            memoryResult: { promoted: 1 },
+            memoryResults: [],
+            humanReviewText: '已整理進 DB：handoff wrapper parity smoke',
+            sessionStartText: '下一段只需要帶：\n- 決策：handoff wrapper parity smoke\n',
+          };
+        },
+      },
+    };
+
+    const result = await handoff.finalizeHandoff(aquifer, samplePayload(), {
+      view,
+      ...summary,
+    });
+
+    assert.equal(result.reviewText, '已整理進 DB：handoff wrapper parity smoke');
+    assert.equal(result.humanReviewText, '已整理進 DB：handoff wrapper parity smoke');
+    assert.equal(result.sessionStartText, '下一段只需要帶：\n- 決策：handoff wrapper parity smoke\n');
+  });
+
+  it('returns sanitized committed summary instead of raw handoff input summary', async () => {
+    const view = sampleView();
+    const rawSummary = {
+      summaryText: 'DATABASE_URL=postgresql://user:pass@example/db',
+      structuredSummary: {
+        decisions: [{
+          decision: 'raw secret sk-1234567890abcdefghijklmnop must not echo',
+        }],
+      },
+    };
+    const safeSummary = {
+      summaryText: '[REDACTED_SECRET]',
+      structuredSummary: {
+        decisions: [{
+          decision: 'raw secret [REDACTED_SECRET] must not echo',
+        }],
+      },
+    };
+    const aquifer = {
+      async getSession() {
+        return {
+          session_id: view.sessionId,
+          processing_status: 'pending',
+          msg_count: view.counts.safeMessageCount,
+          user_count: view.counts.userCount,
+          assistant_count: view.counts.assistantCount,
+          messages: {
+            normalized: view.messages,
+            metadata: { transcript_hash: view.transcriptHash },
+          },
+        };
+      },
+      finalization: {
+        async finalizeSession() {
+          return {
+            status: 'finalized',
+            finalization: { id: 44 },
+            summary: safeSummary,
+            memoryResult: { promoted: 1 },
+            humanReviewText: '已整理進 DB：sanitized',
+            sessionStartText: '下一段只需要帶：\n- 決策：sanitized\n',
+          };
+        },
+      },
+    };
+
+    const result = await handoff.finalizeHandoff(aquifer, samplePayload(), {
+      view,
+      ...rawSummary,
+    });
+
+    assert.deepEqual(result.summary, safeSummary);
+    assert.deepEqual(result.structuredSummary, safeSummary.structuredSummary);
+    assert.notDeepEqual(result.structuredSummary, rawSummary.structuredSummary);
+  });
+
   it('refuses stale or invalid transcript views for manual handoff finalization', async () => {
     const calls = [];
     const aquifer = {

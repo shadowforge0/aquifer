@@ -281,11 +281,98 @@ function createAquifer(config = {}) {
 
   const memoryCfg = config.memory || {};
   const memoryServingMode = memoryCfg.servingMode || process.env.AQUIFER_MEMORY_SERVING_MODE || 'legacy';
+  function splitScopePath(value) {
+    if (Array.isArray(value)) return value.map(v => String(v).trim()).filter(Boolean);
+    if (typeof value !== 'string') return null;
+    const parts = value.split(',').map(v => v.trim()).filter(Boolean);
+    return parts.length > 0 ? parts : null;
+  }
+  const defaultActiveScopeKey = memoryCfg.activeScopeKey || process.env.AQUIFER_MEMORY_ACTIVE_SCOPE_KEY || null;
+  const defaultActiveScopePath = splitScopePath(
+    memoryCfg.activeScopePath || process.env.AQUIFER_MEMORY_ACTIVE_SCOPE_PATH || null,
+  );
   function resolveMemoryServingMode(opts = {}) {
     const mode = opts.memoryMode || opts.servingMode || memoryServingMode;
     if (mode === 'legacy' || mode === 'evidence') return 'legacy';
     if (mode === 'curated') return 'curated';
     throw new Error(`Invalid memory serving mode: "${mode}". Must be one of: legacy, curated`);
+  }
+  function withDefaultMemoryScope(opts = {}) {
+    const next = { ...opts };
+    if (!next.activeScopePath && defaultActiveScopePath) next.activeScopePath = defaultActiveScopePath;
+    if (!next.activeScopeKey && defaultActiveScopeKey) next.activeScopeKey = defaultActiveScopeKey;
+    return next;
+  }
+  function assertCuratedRecallOpts(opts = {}) {
+    const unsupported = [];
+    for (const key of ['agentId', 'agentIds', 'source', 'dateFrom', 'dateTo', 'entities', 'entityMode', 'mode', 'weights', 'rerank', 'allowUnsafeDebug', 'unsafeDebug']) {
+      if (opts[key] !== undefined && opts[key] !== null) unsupported.push(key);
+    }
+    if (unsupported.length > 0) {
+      throw new Error(`curated session_recall does not support legacy filters: ${unsupported.join(', ')}. Use activeScopeKey/activeScopePath or evidence_recall.`);
+    }
+  }
+  function assertCuratedBootstrapOpts(opts = {}) {
+    const unsupported = [];
+    for (const key of ['agentId', 'source', 'lookbackDays', 'dateFrom', 'dateTo']) {
+      if (opts[key] !== undefined && opts[key] !== null) unsupported.push(key);
+    }
+    if (unsupported.length > 0) {
+      throw new Error(`curated session_bootstrap does not support legacy filters: ${unsupported.join(', ')}. Use activeScopeKey/activeScopePath.`);
+    }
+  }
+  function hasEvidenceBoundary(opts = {}) {
+    return Boolean(
+      opts.agentId
+      || (Array.isArray(opts.agentIds) && opts.agentIds.length > 0)
+      || opts.source
+      || opts.dateFrom
+      || opts.dateTo
+      || opts.host
+      || opts.sessionId
+      || opts.allowUnsafeDebug === true
+      || opts.unsafeDebug === true
+    );
+  }
+  function curatedRecallTitle(row = {}) {
+    const title = row.title || row.summary || row.canonical_key || row.canonicalKey || row.memory_type || row.memoryType || 'memory';
+    return String(title).trim();
+  }
+  function curatedRecallSummary(row = {}) {
+    const summary = row.summary || row.title || row.canonical_key || row.canonicalKey || '';
+    return String(summary).trim();
+  }
+  function normalizeCuratedRecallRow(row = {}) {
+    const memoryId = row.memoryId || row.memory_id || row.id || null;
+    const canonicalKey = row.canonicalKey || row.canonical_key || null;
+    const memoryType = row.memoryType || row.memory_type || null;
+    const scopeKey = row.scopeKey || row.scope_key || null;
+    const scopeKind = row.scopeKind || row.scope_kind || null;
+    const summaryText = curatedRecallSummary(row) || null;
+    const title = curatedRecallTitle(row) || null;
+    const scoreValue = row.recall_score ?? row.score ?? row.lexical_rank ?? null;
+    const score = scoreValue === null ? null : Number(scoreValue);
+    return {
+      ...row,
+      memoryId: memoryId === null ? null : String(memoryId),
+      canonicalKey,
+      memoryType,
+      scopeKey,
+      scopeKind,
+      title,
+      summaryText,
+      structuredSummary: {
+        title,
+        overview: summaryText,
+      },
+      startedAt: row.acceptedAt || row.accepted_at || row.observedAt || row.observed_at || null,
+      score: Number.isFinite(score) ? score : null,
+      feedbackTarget: {
+        kind: 'memory_feedback',
+        memoryId: memoryId === null ? null : String(memoryId),
+        canonicalKey,
+      },
+    };
   }
 
   // State-change extraction (Q3): off by default. When enabled, enrich() runs
@@ -1260,10 +1347,12 @@ function createAquifer(config = {}) {
 
     async recall(query, opts = {}) {
       if (resolveMemoryServingMode(opts) === 'curated') {
+        assertCuratedRecallOpts(opts);
         await ensureMigrated();
-        return aquifer.memory.recall(query, opts);
+        const rows = await aquifer.memory.recall(query, withDefaultMemoryScope(opts));
+        return rows.map(normalizeCuratedRecallRow);
       }
-      return aquifer.evidenceRecall(query, opts);
+      return aquifer.evidenceRecall(query, { ...opts, allowBroadEvidence: true });
     },
 
     async evidenceRecall(query, opts = {}) {
@@ -1273,6 +1362,9 @@ function createAquifer(config = {}) {
       // should use a dedicated API, not pass empty to recall().
       if (typeof query !== 'string' || query.trim().length === 0) {
         throw new Error('aquifer.recall(query): query must be a non-empty string');
+      }
+      if (opts.allowBroadEvidence !== true && !hasEvidenceBoundary(opts)) {
+        throw new Error('evidence_recall requires an audit boundary filter (agentId, source, dateFrom/dateTo, host, sessionId) or allowUnsafeDebug=true');
       }
 
       const VALID_MODES = ['fts', 'hybrid', 'vector'];
@@ -1660,6 +1752,50 @@ function createAquifer(config = {}) {
       });
     },
 
+    async memoryFeedback(memoryId, opts = {}) {
+      let targetMemoryId = memoryId;
+      let canonicalKey = opts.canonicalKey || null;
+      if (memoryId && typeof memoryId === 'object') {
+        targetMemoryId = memoryId.memoryId || memoryId.id || null;
+        canonicalKey = memoryId.canonicalKey || memoryId.canonical_key || canonicalKey;
+      }
+      if (!targetMemoryId && !canonicalKey) {
+        throw new Error('memoryFeedback(memoryId): memoryId or canonicalKey is required');
+      }
+      const feedbackType = opts.feedbackType || opts.verdict;
+      if (!feedbackType) throw new Error('opts.feedbackType is required');
+      await ensureMigrated();
+      if (!targetMemoryId && canonicalKey) {
+        const rows = await memoryRecords.findActiveByCanonicalKey({
+          tenantId: opts.tenantId || tenantId,
+          canonicalKey,
+        });
+        if (!rows[0]) throw new Error(`Active memory not found: ${canonicalKey}`);
+        targetMemoryId = rows[0].id;
+        canonicalKey = rows[0].canonical_key || rows[0].canonicalKey || canonicalKey;
+      }
+      const result = await aquifer.memory.recordFeedback({
+        tenantId: opts.tenantId || tenantId,
+        targetKind: 'memory_record',
+        targetId: targetMemoryId,
+        feedbackType,
+        actorKind: opts.actorKind || 'user',
+        actorId: opts.actorId || opts.agentId || null,
+        queryFingerprint: opts.queryFingerprint || null,
+        note: opts.note || null,
+        metadata: {
+          ...(opts.metadata || {}),
+          publicSurface: 'memoryFeedback',
+        },
+      });
+      return {
+        ...result,
+        memoryId: targetMemoryId === null ? null : String(targetMemoryId),
+        canonicalKey,
+        feedbackType,
+      };
+    },
+
     async feedbackStats(opts = {}) {
       await ensureMigrated();
       return storage.getFeedbackStats(pool, {
@@ -1808,7 +1944,8 @@ function createAquifer(config = {}) {
     async bootstrap(opts = {}) {
       await ensureMigrated();
       if (resolveMemoryServingMode(opts) === 'curated') {
-        return aquifer.memory.bootstrap(opts);
+        assertCuratedBootstrapOpts(opts);
+        return aquifer.memory.bootstrap(withDefaultMemoryScope(opts));
       }
 
       const agentId = opts.agentId || null;
@@ -2020,6 +2157,10 @@ function createAquifer(config = {}) {
     consolidation: {
       plan: memoryConsolidation.plan,
       distillArchiveSnapshot: memoryConsolidation.distillArchiveSnapshot,
+      runJob: async (input = {}) => {
+        await ensureMigrated();
+        return memoryConsolidation.runJob(input);
+      },
       recordRun: async (input = {}) => {
         await ensureMigrated();
         return memoryConsolidation.recordRun(input);

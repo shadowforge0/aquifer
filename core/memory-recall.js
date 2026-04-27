@@ -1,5 +1,7 @@
 'use strict';
 
+const { resolveApplicableRecords } = require('./memory-bootstrap');
+
 const TYPE_RANK = {
   constraint: 80,
   preference: 70,
@@ -19,6 +21,40 @@ const FEEDBACK_WEIGHT = {
   stale: -0.30,
   incorrect: -0.50,
 };
+
+const TYPE_RANK_SQL = `
+  CASE m.memory_type
+    WHEN 'constraint' THEN 0.80
+    WHEN 'preference' THEN 0.70
+    WHEN 'state' THEN 0.60
+    WHEN 'open_loop' THEN 0.55
+    WHEN 'decision' THEN 0.50
+    WHEN 'fact' THEN 0.40
+    WHEN 'conclusion' THEN 0.30
+    WHEN 'entity_note' THEN 0.20
+    ELSE 0
+  END`;
+
+function feedbackScoreSql(schema) {
+  return `
+    COALESCE((
+      SELECT SUM(
+        CASE f.feedback_type
+          WHEN 'helpful' THEN 0.15
+          WHEN 'confirm' THEN 0.10
+          WHEN 'irrelevant' THEN -0.20
+          WHEN 'scope_mismatch' THEN -0.25
+          WHEN 'stale' THEN -0.30
+          WHEN 'incorrect' THEN -0.50
+          ELSE 0
+        END
+      )
+      FROM ${schema}.feedback f
+      WHERE f.tenant_id = $1
+        AND f.target_kind = 'memory_record'
+        AND f.target_id = m.id::text
+    ), 0)`;
+}
 
 function textOf(record) {
   return [
@@ -57,6 +93,37 @@ function isActiveVisible(record, opts = {}) {
   return status === 'active' && visible === true && isWithinTime(record, opts.asOf);
 }
 
+function activeScopeKeys(opts = {}) {
+  if (Array.isArray(opts.activeScopePath) && opts.activeScopePath.length > 0) {
+    return opts.activeScopePath.map(value => String(value)).filter(Boolean);
+  }
+  if (opts.activeScopeKey) return [String(opts.activeScopeKey)];
+  return null;
+}
+
+function rankValue(record, key) {
+  const value = record[key];
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function sortRecallRows(a, b) {
+  const aTitleMatch = a.title_match === true ? 1 : 0;
+  const bTitleMatch = b.title_match === true ? 1 : 0;
+  if (bTitleMatch !== aTitleMatch) return bTitleMatch - aTitleMatch;
+
+  const aScore = rankValue(a, 'recall_score') || rankValue(a, 'score');
+  const bScore = rankValue(b, 'recall_score') || rankValue(b, 'score');
+  if (bScore !== aScore) return bScore - aScore;
+
+  const aAccepted = Date.parse(a.acceptedAt || a.accepted_at || '') || 0;
+  const bAccepted = Date.parse(b.acceptedAt || b.accepted_at || '') || 0;
+  if (bAccepted !== aAccepted) return bAccepted - aAccepted;
+
+  return getId(a).localeCompare(getId(b));
+}
+
 function feedbackScore(record, feedbackEvents = []) {
   const id = getId(record);
   let score = 0;
@@ -82,9 +149,14 @@ function recallMemoryRecords(records = [], query, opts = {}) {
   if (!q) throw new Error('memory.recall(query): query must be a non-empty string');
   const limit = Math.max(1, Math.min(50, opts.limit || 10));
   const feedbackEvents = opts.feedbackEvents || [];
+  const scopeFiltered = activeScopeKeys(opts)
+    ? resolveApplicableRecords(
+      records.filter(record => isActiveVisible(record, opts)),
+      opts,
+    )
+    : records.filter(record => isActiveVisible(record, opts));
 
-  return records
-    .filter(record => isActiveVisible(record, opts))
+  return scopeFiltered
     .map(record => {
       const haystack = textOf(record).toLowerCase();
       const lexical = lexicalScore(haystack, q);
@@ -97,13 +169,7 @@ function recallMemoryRecords(records = [], query, opts = {}) {
       };
     })
     .filter(record => record._debug.lexical > 0 || opts.includeAll === true)
-    .sort((a, b) => {
-      if (b.score !== a.score) return b.score - a.score;
-      const aAccepted = Date.parse(a.acceptedAt || a.accepted_at || '') || 0;
-      const bAccepted = Date.parse(b.acceptedAt || b.accepted_at || '') || 0;
-      if (bAccepted !== aAccepted) return bAccepted - aAccepted;
-      return getId(a).localeCompare(getId(b));
-    })
+    .sort(sortRecallRows)
     .slice(0, limit);
 }
 
@@ -113,6 +179,9 @@ function createMemoryRecall({ pool, schema, defaultTenantId }) {
     if (!q) throw new Error('memory.recall(query): query must be a non-empty string');
     const tenantId = opts.tenantId || defaultTenantId;
     const limit = Math.max(1, Math.min(50, opts.limit || 10));
+    const scopeKeys = activeScopeKeys(opts);
+    const fetchLimit = Math.max(limit, Math.min(200, scopeKeys ? limit * 4 : limit));
+    const feedbackScoreExpr = feedbackScoreSql(schema);
     const params = [tenantId, q];
     const where = [
       `m.tenant_id = $1`,
@@ -128,6 +197,10 @@ function createMemoryRecall({ pool, schema, defaultTenantId }) {
       params.push(opts.scopeId);
       where.push(`m.scope_id = $${params.length}`);
     }
+    if (scopeKeys) {
+      params.push(scopeKeys);
+      where.push(`s.scope_key = ANY($${params.length}::text[])`);
+    }
     if (opts.asOf) {
       params.push(opts.asOf);
       const at = `$${params.length}::timestamptz`;
@@ -135,23 +208,34 @@ function createMemoryRecall({ pool, schema, defaultTenantId }) {
       where.push(`(m.valid_to IS NULL OR m.valid_to > ${at})`);
       where.push(`(m.stale_after IS NULL OR m.stale_after > ${at})`);
     }
-    params.push(limit);
+    params.push(fetchLimit);
     const result = await pool.query(
       `SELECT
          m.*, s.scope_kind, s.scope_key, s.inheritance_mode AS scope_inheritance_mode,
-         ts_rank(m.search_tsv, plainto_tsquery('simple', $2)) AS lexical_rank
+         (m.title ILIKE '%' || $2 || '%') AS title_match,
+         ts_rank(m.search_tsv, plainto_tsquery('simple', $2)) AS lexical_rank,
+         ${TYPE_RANK_SQL} AS type_rank,
+         ${feedbackScoreExpr} AS feedback_score,
+         ts_rank(m.search_tsv, plainto_tsquery('simple', $2))
+           + ${TYPE_RANK_SQL}
+           + ${feedbackScoreExpr} AS recall_score
        FROM ${schema}.memory_records m
        JOIN ${schema}.scopes s ON s.id = m.scope_id
        WHERE ${where.join(' AND ')}
        ORDER BY
-         (m.title ILIKE '%' || $2 || '%') DESC,
-         lexical_rank DESC,
+         title_match DESC,
+         recall_score DESC,
          m.accepted_at DESC NULLS LAST,
          m.id ASC
        LIMIT $${params.length}`,
       params
     );
-    return result.rows;
+    const applicableRows = scopeKeys
+      ? resolveApplicableRecords(result.rows, opts)
+      : result.rows;
+    return applicableRows
+      .sort(sortRecallRows)
+      .slice(0, limit);
   }
 
   return { recall };

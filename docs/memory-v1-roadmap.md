@@ -302,7 +302,7 @@ Acceptance：
 
 ### Slice 6B：Codex-first Agent-mediated Finalization
 
-狀態：finalization foundation 已有，但不能只用 row count、hook smoke 或 `v1Finalization=finalized` 判定完成。已有 `session_finalizations` ledger、core `finalizeSession()` API、Codex digest marker、normalized transcript hash、metadata-only recovery candidate scan、同意後 sanitized/token-budgeted transcript view、manual handoff finalization、SessionStart recovery 可呼叫 API、decline/defer 去重、ledger-truth 測試、Codex recovery CLI、SessionStart 使用者提示文字，以及本機 hook smoke。尚未完成的 blocking contract 是：finalization 後必須輸出人類可檢查的 committed curated memory 整理結果；SessionStart 只能載最小 active context；錯誤/作廢 memory 不能進 active recall/bootstrap/daily/weekly/monthly；DB-backed import -> finalize -> curated recall/bootstrap 必須端到端可見。
+狀態：finalization foundation 已有，但不能只用 row count、hook smoke 或 `v1Finalization=finalized` 判定完成。已有 `session_finalizations` ledger、core `finalizeSession()` API、Codex digest marker、normalized transcript hash、recovery eligibility scan、同意後 sanitized/token-budgeted transcript view、manual handoff finalization、SessionStart recovery 可呼叫 API、decline/defer 去重、ledger-truth 測試、Codex recovery CLI、SessionStart 使用者提示文字，以及本機 hook smoke。SessionStart recovery 已改成先列出可 DB recovery 的 JSONL 清單，再由使用者選擇全補、挑選補或不補；未補但保留手動入口的項目會標為 `deferred`。尚未完成的 blocking contract 是：finalization 後必須輸出人類可檢查的 committed curated memory 整理結果；SessionStart 只能載最小 active context；錯誤/作廢 memory 不能進 active recall/bootstrap/daily/weekly/monthly；DB-backed import -> finalize -> curated recall/bootstrap 必須端到端可見。
 
 核心判斷：
 
@@ -318,7 +318,7 @@ Codex trigger priority：
 
 1. Manual handoff：使用者明確說 handoff / 收工 / 記一下時，直接 finalization；這是最可靠的收尾訊號。
 2. Codex session-end hook：若 Codex 能提供可靠結束事件，結束時自動 finalization。
-3. Codex SessionStart recovery：新 session 開始時先掃 metadata/task ledger，若發現最近一段可 recovery 但未 finalized 的 Codex session，只提示一次；使用者同意後才讀取上一段 JSONL、跑 Codex normalize、產生 token-budgeted sanitized transcript view，交給當前 CLI agent 完成 finalization。
+3. Codex SessionStart recovery：新 session 開始時先掃 finalization ledger、本機 recovery decisions 與 Codex JSONL，排除 current transcript 後建立「可 DB recovery」清單；提示使用者選擇全補、挑選補、全部延後或全部拒絕。只有使用者選定要補的 session 才能把 sanitized transcript view 交給當前 CLI agent 摘要並完成 finalization。
 4. Afterburn/backfill：operator / maintenance 補漏，不是 day-1 主路徑，也不應出現在 getting-started 的主要動線。
 
 Codex adapter ownership：
@@ -334,24 +334,30 @@ Codex adapter ownership：
 - Local marker key 不得直接使用 raw `session_meta.id`；必須使用安全 digest 或安全編碼，防 path traversal、marker spoofing、collision。
 - Finalization 唯一鍵至少涵蓋 `(tenant, source, agent, session_id, transcript_hash, phase)`，防止 handoff / session-end / recovery / backfill 重複 promotion。
 - Transcript hash 改變時，已 finalized session 可重新進 pending review；同 digest 被拒絕後不得重複提示，直到 digest 改變。
+- Recovery decision 狀態至少包含 `declined`、`deferred`、`skipped`。`declined` 表示使用者拒絕 recovery；`deferred` 表示本次 SessionStart 不補且不再自動打擾，但 operator 可用手動命令與 `--include-deferred` 找回來補；`skipped` 表示 deterministic policy 判定不應進 DB，例如 user turns 不足。
+- Terminal finalization 狀態不得被後續 retry/upsert 降級覆蓋；`finalized`、`skipped`、`declined`、`deferred` 都必須保持 monotonic，除非明確同狀態重寫 metadata。`failed` 可 retry。
 - Human review output 必須由 committed finalization snapshot 產生，且用人話列出記憶語意，不得直接回傳 raw JSON payload 當 user-facing handoff。
 - 錯誤 finalization 必須能標成 `incorrect` / `quarantined` / `superseded` / `revoked` 或等價 lifecycle state，並從 active curated serving、SessionStart、daily/weekly/monthly rollup 移除。
 
 SessionStart recovery safety gate：
 
-- 提示前只能讀 metadata preview，不得讀完整 JSONL、不得 normalize、不得呼叫 LLM、不得寫 DB、不得 promotion。
+- 提示前可讀 Codex JSONL 以做 deterministic eligibility scan，包括 safe session id、workspace/source/agent/sessionKey provenance、message/user counts、normalized transcript hash、safety gate、byte/message/prompt budget 與 short-session policy；但不得把 transcript text 注入本次對話，不得呼叫 LLM，不得寫 DB，不得 promotion。
+- Eligibility scan 必須先篩掉不能 DB recovery 的 JSONL，例如 short session、current transcript、unsafe session id、wrong workspace/source/agent、over-budget、hash mismatch、missing/unreadable/corrupt file 或已被 finalization ledger / decision marker terminal suppress 的項目。Prompt 只能列出可 DB recovery 的候選。
 - 候選必須通過 workspace/project/source/agent/sessionKey provenance match；沒有可驗證 provenance 不提示、不讀 transcript。
-- 使用者同意後才讀 JSONL，且必須排除當前 SessionStart transcript。
+- 使用者同意某一候選後，才可以把該候選的 sanitized transcript view 載入目前 CLI agent context 讓 agent 摘要；仍必須排除當前 SessionStart transcript。
 - Recovery prompt 只能看到 sanitized / token-budgeted transcript view，不能看到 raw tool output、bootstrap 注入、stack trace、env dump、secret-bearing content。
 - Live recovery 必須有硬限制：`maxRecoveryBytes`、`maxRecoveryMessages` 或 turns、`maxRecoveryPromptTokens`。超過限制時降級為 backfill，不偷吃 live session tokens。
 - Recovery transcript view 必須重用 Codex normalize / safety gate，不另寫 raw parser；live prompt 預設只吃 user turns 與可公開 assistant final answer。
+- 多個可 DB recovery JSONL 必須一次列出清單，而不是只提示第一筆。提示必須提供全補、挑選補、全部延後、全部拒絕的操作路徑。
+- 使用者挑選補其中幾筆時，未補的候選必須被標成 `deferred` 或等價可手動恢復狀態，避免下次 SessionStart 重複打擾；手動 preview/prompt 必須能用 `--include-deferred` 或等價選項找回。
+- Raw candidate scan limit 不得先於 eligibility filter 截斷結果；若最新幾個 JSONL 是 short、current、corrupt 或 wrong-provenance，仍必須繼續掃到 configured eligible candidate limit 或 scan budget 耗盡。
 
 Acceptance：
 
 - Codex fresh install 不需要額外 afterburn LLM API，就能透過 handoff 或 session-end hook 讓下一段 bootstrap/recall 看見 curated memory。
 - Manual handoff 完成時，使用者能在同一回合看到簡潔人話版「已整理進 DB」：本段狀態、已接受記憶、未完成事項、已作廢/隔離內容、SessionStart include/exclude。只有 audit footer 可以顯示 id/hash/count。
-- 若前一段未 finalized，下一次 Codex SessionStart 能只靠 metadata 發現最近未 finalized session，提示一次成本，使用者同意後完成 finalization，且本次 session 可受益。
-- 使用者拒絕 recovery 時，系統只記錄 declined/deferred，不讀內容、不寫 DB、不 promotion、不重複提示同 digest。
+- 若前一段或多段未 finalized，下一次 Codex SessionStart 能先列出可 DB recovery 清單；使用者可選擇全補、挑選補、全部延後或全部拒絕。被選中的項目完成 finalization 後，本次 session 可受益。
+- 使用者拒絕或延後 recovery 時，系統只記錄 declined/deferred，不把 transcript text 載入 context、不寫 finalization/promotion、不重複自動提示同 digest；deferred 必須保留手動補回入口。
 - Afterburn/backfill 關閉時，Codex primary path 仍成立；開啟時只做補漏，不與 handoff/session-end/SessionStart recovery 重複 promotion。
 - Finalization crash 或 promotion failure 不會留下「summary 已寫、curated 未寫但狀態已 done」的裂縫，也不破壞既有 active winner。
 - Host-private / session-injected / tool output / secret content 不會被升格成 summary、candidate 或 curated memory。
@@ -362,7 +368,10 @@ Acceptance：
 必測：
 
 - Codex `session_meta.id` 含 `/`、`..`、控制字元、超長字串時拒絕或安全 digest 化，且不寫 unsafe marker path。
-- SessionStart recovery 未同意前，`loadTranscript`、normalize、summary/LLM、`commit`、`finalizeSession`、`memory.promote` call count 都是 0。
+- SessionStart recovery 未選定補某一候選前，transcript text injection、summary/LLM、`commit`、`finalizeSession`、`memory.promote` call count 都是 0。Eligibility scan 可以讀 JSONL 並 normalize 以產生 counts/hash/budget，但其輸出不得包含 transcript text。
+- 多個 JSONL backlog 中，SessionStart prompt 必須列出所有 configured limit 內的 eligible candidates；short/current/corrupt/wrong-provenance candidates 不得出現在清單。
+- 挑選補部分 candidates 後，未補 candidates 必須記為 `deferred`，下一次 SessionStart 預設不再提示；手動 `--include-deferred` 或等價命令可再次找到它們。
+- Raw scan limit 不得造成最新 short/ineligible JSONL 擋住較舊 eligible JSONL。
 - Import 與 recovery 對同一 JSONL 的 normalize 結果、`sessionId`、`userCount`、message count、`transcript_hash` 一致。
 - 不同 project/workspace 的 Codex JSONL 不會出現在當前 recovery 候選。
 - 未傳 self-exclusion 也不會撈到當前啟動中的 transcript。
@@ -377,7 +386,7 @@ Acceptance：
 
 ## Slice 7：Scope-Safe Serving 與 Feedback Split
 
-狀態：未落地。
+狀態：已落地。2026-04-28 agent team 推進後，curated public serving 已有 scope contract、formatter shape、feedback split 與 evidence boundary。
 
 目的：讓 public `session_recall` / `session_bootstrap` 在 curated mode 下有明確 scope contract、穩定 output shape 與 feedback target。
 
@@ -398,9 +407,17 @@ Acceptance：
 - `feedback` table 寫入可被 DB recall ranking 或 review priority 使用。
 - Broad evidence search 不會被誤當 memory recall 使用。
 
+完成證據：
+
+- `core/aquifer.js` 在 curated mode 會注入 config/env/default active scope，並拒絕 `agentId`、`source`、`dateFrom/dateTo`、`entities`、`mode` 等 legacy-only filters；legacy `recall()` 仍保留 compatibility path。
+- `core/memory-recall.js` 的 DB recall 依 `activeScopeKey` / `activeScopePath` 預先限制 scope，並用 applicability resolver 收斂 inherited rows；DB feedback score 會納入 `feedback` table 的 `memory_record` target。
+- `session_feedback` 保留 legacy session trust；新增 public `memory_feedback` MCP/CLI/API surface，寫入 append-only curated feedback event，不修改 memory truth。
+- `evidence_recall` 沒有 `agentId`、`source`、`dateFrom/dateTo`、`host`、`sessionId` 等 audit boundary 時會拒絕，除非明確 `allowUnsafeDebug=true`。
+- `test/consumer-mcp.integration.test.js` 已用真 PostgreSQL 驗過 8-tool MCP surface 與 `memory_feedback` round-trip。
+
 ## Slice 8：Operator Jobs 與 Old DB Archive
 
-狀態：未落地。
+狀態：核心 operator workflow 已落地；old DB archive 仍維持 dry-run candidate distill，不對外宣稱自動 quarantine/import 完成。
 
 目的：把 consolidation / old DB distill 從 pure helper 變成 operator-safe workflow。
 
@@ -421,9 +438,20 @@ Acceptance：
 - Archive 中的 secret、session-injected context、host-private planning docs 會被 quarantine。
 - Distilled candidates 未 promote 前 invisible。
 
+完成證據：
+
+- `core/memory-consolidation.js` 新增 `runJob()`，可用 manual/daily/weekly/monthly window 從 DB owner `records.listActive()` 讀 active scoped snapshot，預設 dry-run，只在 `apply=true` 時走 claim/apply；aggregate promotion 仍須顯式 `promoteCandidates=true`。
+- `consumers/cli.js` 新增 `compact` command，支援 `--cadence`、`--period-start`、`--period-end`、`--active-scope-key/path`、`--apply`、`--promote-candidates`。
+- Archive distill 預設 `raw_transcript` authority、`status='candidate'`、`visibleInBootstrap=false`、`visibleInRecall=false`，promotion 前不進 serving。
+- DB-backed compaction claim integration 覆蓋並行 worker、stale claim reclaim、candidate ledger idempotency、promoted lineage、rollback 與非 active source exclusion。
+
+仍保留的邊界：
+
+- Old DB archive 的 secret/session-injected/host-private quarantine 仍不是自動 import workflow；目前只保證 distill candidate invisible 且低 authority，不宣稱可無審核 promotion。
+
 ## Slice 9：Surface Alignment 與 Release Readiness
 
-狀態：未落地。
+狀態：已落地到 release-readiness gate；尚未 publish。
 
 目的：讓 public surface、package artifact、docs、examples、metadata、rollback story 與 implementation 同步。
 
@@ -442,6 +470,14 @@ Acceptance：
 - README/setup 不 overclaim planner-only consolidation。
 - Real DB MCP integration 有跑，不是 soft skip。
 - Rollback 只需 env/config 切回 legacy，不需要 destructive DB rollback。
+
+完成證據：
+
+- MCP manifest、stdio MCP server、README / README_TW / README_CN、setup docs 與 integration test 對齊 8 tools：`session_recall`、`evidence_recall`、`session_feedback`、`memory_feedback`、`feedback_stats`、`session_bootstrap`、`memory_stats`、`memory_pending`。
+- MCP server version 改用 `package.json` version；`.env.example` 與 `aquifer.config.example.json` 都列出 `AQUIFER_MEMORY_SERVING_MODE` 與 active scope 設定。
+- Package surface 移除 destructive drop SQL，`npm pack --dry-run --json` 測試確認不含 internal v1 planning docs 與 drop helpers。
+- README/setup 寫明 curated rollback 為 `AQUIFER_MEMORY_SERVING_MODE=legacy` + restart，不需破壞性 DB rollback。
+- `AQUIFER_TEST_DB_URL="$DATABASE_URL" npm test` 已跑完整真 DB suite，沒有 soft skip。
 
 ## vNext 明確排除
 
@@ -463,7 +499,7 @@ Acceptance：
 
 ## 下一個可開工 PR
 
-Slice 6B 的下一步不是再證明「有寫進 DB」，而是補齊使用者可驗收的 finalization 閉環：同一份 committed memory 必須能被人檢查、被 curated recall/bootstrap 讀回、被 SessionStart 精簡注入，且錯誤記憶能從 active path 移除。下一段應該把 recovery consent 後的 summary/finalize 操作做成更低摩擦的 UX，並補 DB-backed finalization smoke：
+Slice 6B 的下一步不是再證明「有寫進 DB」，而是補齊使用者可驗收的 finalization 閉環：同一份 committed memory 必須能被人檢查、被 curated recall/bootstrap 讀回、被 SessionStart 精簡注入，且錯誤記憶能從 active path 移除。SessionStart recovery selection 已有基礎：可 DB recovery 清單、全補/挑選/延後/拒絕操作、deferred manual path、short/current exclusion、terminal finalization guard 與 DB-backed full test。2026-04-28 已補 recovery consent 後的低摩擦 prompt -> finalize command 銜接、finalize 後 committed review surface 輸出、terminal row audit 欄位 immutability guard、DB-backed SessionStart minimal active context smoke、incorrect memory serving exclusion smoke，並新增 DB-backed Codex finalization -> curated bootstrap serving smoke。
 
 ```text
 Codex finalization review surface and DB-backed serving smoke
@@ -487,22 +523,26 @@ Codex finalization review surface and DB-backed serving smoke
 - default serving mode
 - release docs / README 主線，直到 Codex path 有 DB-backed executable verification
 
-下一段必須完成：
+已完成的 SessionStart recovery selection gate：
 
 - Codex hook/CLI wrapper 已能呼叫 `prepareSessionStartRecovery()` / `finalizeCodexSession()`；handoff 已能呼叫 core `finalizeSession()`。
 - Manual handoff 已整合到 v1 finalization 路徑，不再依賴 afterburn 的額外 LLM API。
-- SessionStart recovery 提示、同意、拒絕/延後的使用者互動與輸出文案。
-- 同意後由目前 Codex agent 消化 recovery transcript view，產出 `summaryText` / `structuredSummary` 後寫入 core finalization。
-- Handoff/finalization 產生人話 review surface，主內容是 committed curated memory，不是 debug JSON 或 audit ids。
-- SessionStart 只注入 active minimal context；完整 summary、render plan、工具/測試輸出、id/hash/count 不得進前言。
-- 錯誤 finalization / handoff memory 可以 quarantine 或 mark incorrect，且 active recall/bootstrap/rollup 不再讀到。
-- DB-backed smoke：import -> recovery/handoff finalize -> curated recall/bootstrap 可見。
+- SessionStart recovery 提示已從單筆候選改為可 DB recovery 清單，並提供全補、挑選補、全部延後、全部拒絕路徑。
+- Deferred recovery 預設 suppress SessionStart 重複提示，但可用手動 `--include-deferred` 找回。
+- Short session / current transcript / ineligible raw JSONL 不進可補清單；raw scan limit 不得吃掉較舊 eligible JSONL。
+- Consented prompt 會直接附上對應 finalize command，finalize 成功後 CLI 會輸出 core committed human review text。
+- DB-backed smoke 已覆蓋 Codex recovery finalize -> memory promotion -> curated bootstrap serving、Codex handoff finalize -> shared core review/sessionStart/curated bootstrap serving、Codex import/afterburn -> shared core review/sessionStart/curated bootstrap serving、finalization row 的 minimal `session_start_text`、`incorrect` / `quarantined` / `superseded` 不進 curated recall/bootstrap、DB check constraint 防止 non-active visible leak、older state/open_loop 在 bootstrap scope+limit 下不被 newer decisions 或其他 scope 擠掉、daily rollup owner DB path 只用 active source rows promotion，以及 terminal finalization row 在 retry/upsert 下保持 audit 欄位不變。
+
+下一段仍必須完成：
+
+- Slice 6B 目前可關帳；下一段若繼續，轉到 Slice 7：scope-safe serving、curated recall/bootstrap formatter shape、feedback split 與 release/docs/package surface alignment。
 
 驗證：
 
 ```bash
 node --test test/v1-*.test.js test/bootstrap.test.js test/recall-mode.test.js test/shared-normalize.test.js test/feedback-agentid.test.js
-node --test test/codex-handoff.test.js test/codex-recovery-script.test.js test/consumer-codex.test.js test/session-finalization.test.js
+node --test test/codex-handoff.test.js test/codex-recovery-script.test.js test/consumer-codex.test.js test/session-finalization.test.js test/storage-finalization-status.test.js
+AQUIFER_TEST_DB_URL='postgresql://...' node --test test/codex-finalization-serving.integration.test.js
 npm run lint
 ```
 

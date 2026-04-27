@@ -18,6 +18,8 @@ function hasStructuredContent(value) {
   return value && typeof value === 'object' && Object.keys(value).length > 0;
 }
 
+const TERMINAL_SUPPRESSION_STATUSES = new Set(['skipped', 'declined', 'deferred']);
+
 function countByReason(results) {
   const reasons = {};
   for (const result of results || []) {
@@ -157,6 +159,15 @@ function createSessionFinalization({
         await client.query('COMMIT');
         return {
           status: 'already_finalized',
+          finalization: existing,
+          memoryResult: existing.memory_result || {},
+        };
+      }
+      if (existing && TERMINAL_SUPPRESSION_STATUSES.has(existing.status)) {
+        await client.query('COMMIT');
+        return {
+          status: 'suppressed',
+          finalizationStatus: existing.status,
           finalization: existing,
           memoryResult: existing.memory_result || {},
         };

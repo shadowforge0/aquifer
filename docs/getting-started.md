@@ -59,7 +59,8 @@ Once `quickstart` passes, point your MCP client at Aquifer:
       "args": ["--yes", "@shadowforge0/aquifer-memory", "mcp"],
       "env": {
         "DATABASE_URL": "postgresql://aquifer:aquifer@localhost:5432/aquifer",
-        "EMBED_PROVIDER": "ollama"
+        "EMBED_PROVIDER": "ollama",
+        "AQUIFER_MEMORY_SERVING_MODE": "legacy"
       }
     }
   }
@@ -72,6 +73,8 @@ Or run the server directly:
 DATABASE_URL=... EMBED_PROVIDER=ollama npx aquifer mcp
 ```
 
+For first rollout, keep `AQUIFER_MEMORY_SERVING_MODE=legacy`. Switch to `curated` only when you want `session_recall` and `session_bootstrap` to serve active curated memory; `evidence_recall` remains the explicit evidence/debug tool in both modes. Rollback is just setting env or config back to `legacy`.
+
 ## Most common commands
 
 | Goal | Command |
@@ -79,8 +82,11 @@ DATABASE_URL=... EMBED_PROVIDER=ollama npx aquifer mcp
 | Verify setup | `npx aquifer quickstart` |
 | Start MCP server | `npx aquifer mcp` |
 | Search memory | `npx aquifer recall "auth middleware"` |
+| Plan curated compaction | `npx aquifer compact --cadence daily --period-start 2026-04-27T00:00:00Z --period-end 2026-04-28T00:00:00Z` |
 | Show stats | `npx aquifer stats` |
 | Enrich pending sessions | `npx aquifer backfill` |
+
+The default public serving mode is `legacy`. To test scoped curated memory serving, set `AQUIFER_MEMORY_SERVING_MODE=curated` plus `AQUIFER_MEMORY_ACTIVE_SCOPE_KEY` or `AQUIFER_MEMORY_ACTIVE_SCOPE_PATH`. Rollback is config-only: set the serving mode back to `legacy` and restart the MCP/CLI process.
 
 ## If something fails
 

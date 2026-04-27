@@ -41,6 +41,7 @@ const FINALIZATION_STATUSES = new Set([
   'declined',
   'deferred',
 ]);
+const FINALIZATION_TERMINAL_STATUSES = new Set(['finalized', 'skipped', 'declined', 'deferred']);
 const FINALIZATION_MODES = new Set([
   'handoff',
   'session_end',
@@ -350,6 +351,11 @@ function normalizeFinalizationStatus(status) {
   return out;
 }
 
+function finalizationTerminalSql(alias) {
+  const values = [...FINALIZATION_TERMINAL_STATUSES].map(value => `'${value}'`).join(',');
+  return `${alias}.status IN (${values})`;
+}
+
 function normalizeFinalizationMode(mode) {
   const out = mode || 'handoff';
   if (!FINALIZATION_MODES.has(out)) throw new Error(`Invalid finalization mode: ${out}`);
@@ -366,6 +372,8 @@ async function upsertSessionFinalization(pool, input = {}, { schema, tenantId: d
   const status = normalizeFinalizationStatus(input.status || 'pending');
   const mode = normalizeFinalizationMode(input.mode || 'handoff');
   const phase = input.phase || 'curated_memory_v1';
+  const preserveTerminal = `${finalizationTerminalSql(qi(schema) + '.session_finalizations')}
+          AND ${qi(schema)}.session_finalizations.status <> EXCLUDED.status`;
   const result = await pool.query(
     `INSERT INTO ${qi(schema)}.session_finalizations (
        tenant_id, session_row_id, source, host, agent_id, session_id,
@@ -382,26 +390,106 @@ async function upsertSessionFinalization(pool, input = {}, { schema, tenantId: d
      )
      ON CONFLICT (tenant_id, source, agent_id, session_id, transcript_hash, phase)
      DO UPDATE SET
-       session_row_id = EXCLUDED.session_row_id,
-       host = EXCLUDED.host,
-       mode = EXCLUDED.mode,
-       status = EXCLUDED.status,
-       finalizer_model = COALESCE(EXCLUDED.finalizer_model, ${qi(schema)}.session_finalizations.finalizer_model),
-       scope_kind = COALESCE(EXCLUDED.scope_kind, ${qi(schema)}.session_finalizations.scope_kind),
-       scope_key = COALESCE(EXCLUDED.scope_key, ${qi(schema)}.session_finalizations.scope_key),
-       context_key = COALESCE(EXCLUDED.context_key, ${qi(schema)}.session_finalizations.context_key),
-       topic_key = COALESCE(EXCLUDED.topic_key, ${qi(schema)}.session_finalizations.topic_key),
-       summary_row_id = COALESCE(EXCLUDED.summary_row_id, ${qi(schema)}.session_finalizations.summary_row_id),
-       memory_result = COALESCE(NULLIF(EXCLUDED.memory_result, '{}'::jsonb), ${qi(schema)}.session_finalizations.memory_result),
-       summary_text = COALESCE(EXCLUDED.summary_text, ${qi(schema)}.session_finalizations.summary_text),
-       structured_summary = COALESCE(NULLIF(EXCLUDED.structured_summary, '{}'::jsonb), ${qi(schema)}.session_finalizations.structured_summary),
-       human_review_text = COALESCE(EXCLUDED.human_review_text, ${qi(schema)}.session_finalizations.human_review_text),
-       session_start_text = COALESCE(EXCLUDED.session_start_text, ${qi(schema)}.session_finalizations.session_start_text),
-       error = EXCLUDED.error,
-       metadata = COALESCE(NULLIF(EXCLUDED.metadata, '{}'::jsonb), ${qi(schema)}.session_finalizations.metadata),
-       claimed_at = COALESCE(EXCLUDED.claimed_at, ${qi(schema)}.session_finalizations.claimed_at),
-       finalized_at = COALESCE(EXCLUDED.finalized_at, ${qi(schema)}.session_finalizations.finalized_at),
-       updated_at = now()
+       session_row_id = CASE
+         WHEN ${preserveTerminal}
+         THEN ${qi(schema)}.session_finalizations.session_row_id
+         ELSE EXCLUDED.session_row_id
+       END,
+       host = CASE
+         WHEN ${preserveTerminal}
+         THEN ${qi(schema)}.session_finalizations.host
+         ELSE EXCLUDED.host
+       END,
+       mode = CASE
+         WHEN ${preserveTerminal}
+         THEN ${qi(schema)}.session_finalizations.mode
+         ELSE EXCLUDED.mode
+       END,
+       status = CASE
+         WHEN ${preserveTerminal}
+         THEN ${qi(schema)}.session_finalizations.status
+         ELSE EXCLUDED.status
+       END,
+       finalizer_model = CASE
+         WHEN ${preserveTerminal}
+         THEN ${qi(schema)}.session_finalizations.finalizer_model
+         ELSE COALESCE(EXCLUDED.finalizer_model, ${qi(schema)}.session_finalizations.finalizer_model)
+       END,
+       scope_kind = CASE
+         WHEN ${preserveTerminal}
+         THEN ${qi(schema)}.session_finalizations.scope_kind
+         ELSE COALESCE(EXCLUDED.scope_kind, ${qi(schema)}.session_finalizations.scope_kind)
+       END,
+       scope_key = CASE
+         WHEN ${preserveTerminal}
+         THEN ${qi(schema)}.session_finalizations.scope_key
+         ELSE COALESCE(EXCLUDED.scope_key, ${qi(schema)}.session_finalizations.scope_key)
+       END,
+       context_key = CASE
+         WHEN ${preserveTerminal}
+         THEN ${qi(schema)}.session_finalizations.context_key
+         ELSE COALESCE(EXCLUDED.context_key, ${qi(schema)}.session_finalizations.context_key)
+       END,
+       topic_key = CASE
+         WHEN ${preserveTerminal}
+         THEN ${qi(schema)}.session_finalizations.topic_key
+         ELSE COALESCE(EXCLUDED.topic_key, ${qi(schema)}.session_finalizations.topic_key)
+       END,
+       summary_row_id = CASE
+         WHEN ${preserveTerminal}
+         THEN ${qi(schema)}.session_finalizations.summary_row_id
+         ELSE COALESCE(EXCLUDED.summary_row_id, ${qi(schema)}.session_finalizations.summary_row_id)
+       END,
+       memory_result = CASE
+         WHEN ${preserveTerminal}
+         THEN ${qi(schema)}.session_finalizations.memory_result
+         ELSE COALESCE(NULLIF(EXCLUDED.memory_result, '{}'::jsonb), ${qi(schema)}.session_finalizations.memory_result)
+       END,
+       summary_text = CASE
+         WHEN ${preserveTerminal}
+         THEN ${qi(schema)}.session_finalizations.summary_text
+         ELSE COALESCE(EXCLUDED.summary_text, ${qi(schema)}.session_finalizations.summary_text)
+       END,
+       structured_summary = CASE
+         WHEN ${preserveTerminal}
+         THEN ${qi(schema)}.session_finalizations.structured_summary
+         ELSE COALESCE(NULLIF(EXCLUDED.structured_summary, '{}'::jsonb), ${qi(schema)}.session_finalizations.structured_summary)
+       END,
+       human_review_text = CASE
+         WHEN ${preserveTerminal}
+         THEN ${qi(schema)}.session_finalizations.human_review_text
+         ELSE COALESCE(EXCLUDED.human_review_text, ${qi(schema)}.session_finalizations.human_review_text)
+       END,
+       session_start_text = CASE
+         WHEN ${preserveTerminal}
+         THEN ${qi(schema)}.session_finalizations.session_start_text
+         ELSE COALESCE(EXCLUDED.session_start_text, ${qi(schema)}.session_finalizations.session_start_text)
+       END,
+       error = CASE
+         WHEN ${preserveTerminal}
+         THEN ${qi(schema)}.session_finalizations.error
+         ELSE EXCLUDED.error
+       END,
+       metadata = CASE
+         WHEN ${preserveTerminal}
+         THEN ${qi(schema)}.session_finalizations.metadata
+         ELSE COALESCE(NULLIF(EXCLUDED.metadata, '{}'::jsonb), ${qi(schema)}.session_finalizations.metadata)
+       END,
+       claimed_at = CASE
+         WHEN ${preserveTerminal}
+         THEN ${qi(schema)}.session_finalizations.claimed_at
+         ELSE COALESCE(EXCLUDED.claimed_at, ${qi(schema)}.session_finalizations.claimed_at)
+       END,
+       finalized_at = CASE
+         WHEN ${preserveTerminal}
+         THEN ${qi(schema)}.session_finalizations.finalized_at
+         ELSE COALESCE(EXCLUDED.finalized_at, ${qi(schema)}.session_finalizations.finalized_at)
+       END,
+       updated_at = CASE
+         WHEN ${preserveTerminal}
+         THEN ${qi(schema)}.session_finalizations.updated_at
+         ELSE now()
+       END
      RETURNING *`,
     [
       tenantId,
@@ -488,7 +576,12 @@ async function updateSessionFinalizationStatus(pool, input = {}, { schema, tenan
             metadata = COALESCE(NULLIF($6::jsonb, '{}'::jsonb), metadata),
             finalized_at = CASE WHEN $2 = 'finalized' THEN COALESCE(finalized_at, now()) ELSE finalized_at END,
             updated_at = now()
-      WHERE tenant_id = $1 AND ${where}
+      WHERE tenant_id = $1
+        AND ${where}
+        AND (
+          status NOT IN (${[...FINALIZATION_TERMINAL_STATUSES].map(value => `'${value}'`).join(',')})
+          OR status = $2
+        )
       RETURNING *`,
     params
   );

@@ -136,6 +136,21 @@ describe('formatRecallResults — defaults', () => {
         assert.ok(out.includes('(untitled)'));
     });
 
+    it('renders curated memory rows without "(untitled)" or empty body', () => {
+        const r = {
+            id: 42,
+            memory_type: 'decision',
+            canonical_key: 'decision:project:aquifer:scope-safe-serving',
+            scope_key: 'project:aquifer',
+            summary: 'Curated recall must serve scoped active memory rows.',
+            accepted_at: '2026-04-28T00:00:00Z',
+        };
+        const out = formatRecallResults([r], { query: 'curated recall' });
+        assert.ok(!out.includes('(untitled)'));
+        assert.ok(out.includes('Curated recall must serve scoped active memory rows.'));
+        assert.ok(out.includes('project:aquifer'));
+    });
+
     it('numbers multiple results', () => {
         const out = formatRecallResults([sampleResult, sampleResult, sampleResult]);
         assert.ok(out.includes('### 1.'));

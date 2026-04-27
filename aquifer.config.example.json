@@ -9,6 +9,11 @@
     "agentId": "main",
     "source": "api"
   },
+  "memory": {
+    "servingMode": "legacy",
+    "activeScopeKey": null,
+    "activeScopePath": null
+  },
   "embed": {
     "baseUrl": "http://localhost:11434/v1",
     "model": "bge-m3",

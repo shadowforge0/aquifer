@@ -46,7 +46,7 @@ describe('package surface', () => {
     );
   });
 
-  it('packs generic consumer files and only the Miranda shim', () => {
+  it('packs release docs/config while excluding internal and destructive helpers', () => {
     const raw = execFileSync('npm', ['pack', '--dry-run', '--json'], {
       cwd: __dirname + '/..',
       encoding: 'utf8',
@@ -59,11 +59,17 @@ describe('package surface', () => {
     assert.ok(paths.has('consumers/default/index.js'));
     assert.ok(paths.has('consumers/codex-handoff.js'));
     assert.ok(paths.has('scripts/codex-recovery.js'));
+    assert.ok(paths.has('.env.example'));
+    assert.ok(paths.has('README_TW.md'));
+    assert.ok(paths.has('README_CN.md'));
+    assert.ok(paths.has('aquifer.config.example.json'));
     assert.ok(paths.has('docs/getting-started.md'));
     assert.ok(paths.has('docs/postprocess-contract.md'));
     assert.ok(paths.has('docs/setup.md'));
     assert.ok(!paths.has('docs/memory-scope-v1.md'));
     assert.ok(!paths.has('docs/memory-v1-roadmap.md'));
+    assert.ok(!paths.has('scripts/drop-entity-state-history.sql'));
+    assert.ok(!paths.has('scripts/drop-insights.sql'));
     assert.ok(paths.has('consumers/miranda/index.js'));
     const mirandaPaths = [...paths].filter(p => p.startsWith('consumers/miranda/')).sort();
     assert.deepEqual(mirandaPaths, ['consumers/miranda/index.js']);

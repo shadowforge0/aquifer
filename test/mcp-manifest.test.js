@@ -14,13 +14,14 @@ const {
 const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aq-mcp-'));
 
 describe('MCP_TOOL_MANIFEST', () => {
-  it('declares all 7 canonical tools', () => {
+  it('declares all 8 canonical tools', () => {
     const names = MCP_TOOL_MANIFEST.map(t => t.name);
     for (const req of ['session_recall', 'session_feedback', 'memory_stats',
-                       'memory_pending', 'session_bootstrap', 'evidence_recall']) {
+                       'memory_pending', 'session_bootstrap', 'evidence_recall',
+                       'memory_feedback']) {
       assert.ok(names.includes(req), `missing tool ${req}`);
     }
-    assert.equal(names.length, 7);
+    assert.equal(names.length, 8);
   });
 
   it('every tool has name + description + inputSchema', () => {
@@ -39,6 +40,39 @@ describe('MCP_TOOL_MANIFEST', () => {
     assert.equal(tool.inputSchema.properties.query.type, 'string');
   });
 
+  it('declares curated serving scope and memory feedback inputs', () => {
+    const recall = MCP_TOOL_MANIFEST.find(t => t.name === 'session_recall');
+    assert.ok(recall.inputSchema.properties.activeScopeKey);
+    assert.ok(recall.inputSchema.properties.activeScopePath);
+
+    const bootstrap = MCP_TOOL_MANIFEST.find(t => t.name === 'session_bootstrap');
+    assert.ok(bootstrap.inputSchema.properties.activeScopeKey);
+
+    const feedback = MCP_TOOL_MANIFEST.find(t => t.name === 'session_feedback');
+    assert.ok(feedback.inputSchema.properties.sessionId);
+    assert.ok(!feedback.inputSchema.properties.memoryId);
+
+    const memoryFeedback = MCP_TOOL_MANIFEST.find(t => t.name === 'memory_feedback');
+    assert.ok(memoryFeedback.inputSchema.properties.memoryId);
+    assert.ok(memoryFeedback.inputSchema.properties.canonicalKey);
+    assert.ok(memoryFeedback.inputSchema.properties.feedbackType);
+  });
+
+  it('evidence_recall declares an explicit unsafe debug override', () => {
+    const tool = MCP_TOOL_MANIFEST.find(t => t.name === 'evidence_recall');
+    assert.ok(tool.inputSchema.properties.allowUnsafeDebug);
+  });
+
+  it('describes curated recall and evidence recall boundaries', () => {
+    const recall = MCP_TOOL_MANIFEST.find(t => t.name === 'session_recall');
+    const evidence = MCP_TOOL_MANIFEST.find(t => t.name === 'evidence_recall');
+
+    assert.match(recall.description, /curated/i);
+    assert.match(recall.description, /evidence_recall/);
+    assert.match(evidence.description, /legacy\/evidence/i);
+    assert.match(evidence.description, /audit\/debug/i);
+  });
+
   it('manifest is frozen (immutable)', () => {
     assert.ok(Object.isFrozen(MCP_TOOL_MANIFEST));
     assert.throws(() => {
@@ -51,7 +85,7 @@ describe('getMcpManifest', () => {
   it('returns envelope with serverName + tools + generatedAt', () => {
     const m = getMcpManifest();
     assert.equal(m.serverName, MCP_SERVER_NAME);
-    assert.equal(m.tools.length, 7);
+    assert.equal(m.tools.length, 8);
     assert.equal(m.manifestVersion, 1);
     assert.ok(m.generatedAt.match(/^\d{4}-\d{2}-\d{2}T/));
   });
@@ -77,7 +111,7 @@ describe('writeMcpManifestFile', () => {
     assert.ok(fs.existsSync(outFile));
     const parsed = JSON.parse(fs.readFileSync(outFile, 'utf8'));
     assert.equal(parsed.serverName, MCP_SERVER_NAME);
-    assert.equal(parsed.tools.length, 7);
+    assert.equal(parsed.tools.length, 8);
   });
 
   it('creates parent directory if missing', () => {

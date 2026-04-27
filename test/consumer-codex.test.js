@@ -141,6 +141,12 @@ function makeFakeAquifer(existing = {}, fakeOpts = {}) {
                 finalizations.set(finalizationKey(input), row);
                 const session = sessions.get(input.sessionId);
                 if (session) session.processing_status = 'succeeded';
+                if (typeof fakeOpts.finalizeResult === 'function') {
+                    return fakeOpts.finalizeResult(input, row);
+                }
+                if (fakeOpts.finalizeResult) {
+                    return { status: 'finalized', finalization: row, ...fakeOpts.finalizeResult };
+                }
                 return { status: 'finalized', finalization: row, memoryResult: { promoted: 1 } };
             },
         },
@@ -285,6 +291,44 @@ describe('Codex consumer recovery helpers', () => {
         assert.equal(candidates[0].transcriptHash, null);
     });
 
+    it('filters JSONL previews to DB-eligible recovery candidates before prompting', async () => {
+        const root = tmpDir();
+        const sessionsDir = path.join(root, 'sessions');
+        const stateDir = path.join(root, 'state');
+        const eligibleFile = path.join(sessionsDir, 'rollout-eligible.jsonl');
+        const shortFile = path.join(sessionsDir, 'rollout-short.jsonl');
+        writeJsonl(eligibleFile, [
+            sessionMeta('meta-eligible'),
+            user('u1'),
+            assistant('a1'),
+            user('u2'),
+            assistant('a2'),
+            user('u3'),
+            assistant('a3'),
+        ]);
+        writeJsonl(shortFile, [
+            sessionMeta('meta-short-preview'),
+            user('only one user turn'),
+            assistant('short'),
+        ]);
+
+        const candidates = await codex.findDbEligibleRecoveryCandidates(makeFakeAquifer(), {
+            sessionsDir,
+            stateDir,
+            includeJsonlPreviews: true,
+            minSessionBytes: 1,
+            idleMs: 1,
+            excludeNewest: false,
+            minUserMessages: 3,
+        });
+
+        assert.equal(candidates.length, 1);
+        assert.equal(candidates[0].sessionId, 'meta-eligible');
+        assert.equal(candidates[0].fileSessionId, 'rollout-eligible');
+        assert.equal(candidates[0].userCount, 3);
+        assert.match(candidates[0].transcriptHash, /^[a-f0-9]{64}$/);
+    });
+
     it('ignores legacy imported markers that cannot point back to a transcript', async () => {
         const root = tmpDir();
         const stateDir = path.join(root, 'state');
@@ -316,6 +360,27 @@ describe('Codex consumer recovery helpers', () => {
                 return { status: 'finalized' };
             },
         };
+
+        const candidates = await codex.findRecoveryCandidates(aq, {
+            stateDir,
+            sessionsDir: path.join(root, 'sessions'),
+        });
+
+        assert.deepEqual(candidates, []);
+    });
+
+    it('uses skipped finalization status to suppress recovery prompts', async () => {
+        const root = tmpDir();
+        const stateDir = path.join(root, 'state');
+        const importedDir = path.join(stateDir, 'codex-sessions-imported');
+        writeImportedMarker(importedDir, 'meta-ledger-skipped', {
+            transcriptHash: 'b'.repeat(64),
+            filePath: path.join(root, 'missing.jsonl'),
+            source: 'codex',
+            agentId: 'main',
+        });
+        const aq = makeFakeAquifer();
+        aq.finalization.get = async () => ({ status: 'skipped' });
 
         const candidates = await codex.findRecoveryCandidates(aq, {
             stateDir,
@@ -455,6 +520,96 @@ describe('Codex consumer recovery helpers', () => {
         assert.deepEqual(candidates, []);
         assert.equal(aq.calls.commit.length, 0);
         assert.equal(aq.calls.enrich.length, 0);
+        assert.equal(aq.calls.finalization.some(c => c.method === 'finalizeSession'), false);
+    });
+
+    it('deferred recovery is hidden from SessionStart but available for manual include-deferred lookup', async () => {
+        const root = tmpDir();
+        const sessionsDir = path.join(root, 'sessions');
+        const stateDir = path.join(root, 'state');
+        const file = path.join(sessionsDir, 'rollout-deferred.jsonl');
+        writeJsonl(file, [
+            sessionMeta('meta-deferred'),
+            user('u1'),
+            assistant('a1'),
+            user('u2'),
+            assistant('a2'),
+            user('u3'),
+            assistant('a3'),
+        ]);
+        const aq = makeFakeAquifer();
+        const [candidate] = await codex.findDbEligibleRecoveryCandidates(aq, {
+            sessionsDir,
+            stateDir,
+            includeJsonlPreviews: true,
+            minSessionBytes: 1,
+            idleMs: 1,
+            excludeNewest: false,
+        });
+
+        await codex.recordRecoveryDecision(aq, candidate, 'deferred', {
+            stateDir,
+            reason: 'manual_later',
+        });
+
+        const hidden = await codex.findDbEligibleRecoveryCandidates(aq, {
+            sessionsDir,
+            stateDir,
+            includeJsonlPreviews: true,
+            minSessionBytes: 1,
+            idleMs: 1,
+            excludeNewest: false,
+        });
+        const manual = await codex.findDbEligibleRecoveryCandidates(aq, {
+            sessionsDir,
+            stateDir,
+            includeJsonlPreviews: true,
+            includeDeferredRecovery: true,
+            minSessionBytes: 1,
+            idleMs: 1,
+            excludeNewest: false,
+        });
+
+        assert.deepEqual(hidden, []);
+        assert.equal(manual.length, 1);
+        assert.equal(manual[0].sessionId, 'meta-deferred');
+        assert.equal(manual[0].recoveryDecisionStatus, 'deferred');
+    });
+
+    it('records short consented recovery as skipped and suppresses the same preview candidate', async () => {
+        const root = tmpDir();
+        const sessionsDir = path.join(root, 'sessions');
+        const stateDir = path.join(root, 'state');
+        const file = path.join(sessionsDir, 'rollout-short-recovery.jsonl');
+        writeJsonl(file, [
+            sessionMeta('meta-short-recovery'),
+            user('one substantial user turn only'),
+            assistant('one assistant reply'),
+        ]);
+        const aq = makeFakeAquifer();
+
+        const prepared = await codex.prepareSessionStartRecovery(aq, {
+            sessionsDir,
+            stateDir,
+            includeJsonlPreviews: true,
+            minSessionBytes: 1,
+            idleMs: 1,
+            excludeNewest: false,
+            consent: true,
+            minUserMessages: 3,
+        });
+        const candidates = await codex.findRecoveryCandidates(aq, {
+            sessionsDir,
+            stateDir,
+            includeJsonlPreviews: true,
+            minSessionBytes: 1,
+            idleMs: 1,
+            excludeNewest: false,
+        });
+
+        assert.equal(prepared.status, 'skipped_short');
+        assert.equal(prepared.userCount, 1);
+        assert.deepEqual(candidates, []);
         assert.equal(aq.calls.finalization.some(c => c.method === 'finalizeSession'), false);
     });
 
@@ -689,6 +844,56 @@ describe('Codex consumer runSync', () => {
         assert.ok(!fs.existsSync(path.join(stateDir, 'codex-sessions-imported', 'rollout-abc')));
     });
 
+    it('preserves committed review and SessionStart text for import afterburn parity', async () => {
+        const root = tmpDir();
+        const sessionsDir = path.join(root, 'sessions');
+        const stateDir = path.join(root, 'state');
+        writeJsonl(path.join(sessionsDir, 'rollout-afterburn-surface.jsonl'), [
+            sessionMeta('meta-afterburn-surface'),
+            user('u1'),
+            assistant('a1'),
+            user('u2'),
+            assistant('a2'),
+            user('u3'),
+            assistant('a3'),
+        ]);
+        const aq = makeFakeAquifer({}, {
+            finalizeResult: input => ({
+                status: 'finalized',
+                finalization: { id: 99, mode: input.mode },
+                memoryResult: { promoted: 1 },
+                humanReviewText: '已整理進 DB：afterburn wrapper parity smoke',
+                sessionStartText: '下一段只需要帶：\n- 決策：afterburn wrapper parity smoke\n',
+            }),
+        });
+
+        const result = await codex.runSync(aq, {
+            sessionsDir,
+            stateDir,
+            minSessionBytes: 1,
+            idleMs: 1,
+            maxImports: 10,
+            maxAfterburns: 10,
+            summaryFn: makeFinalizationSummary(),
+            logger: { warn() {} },
+        });
+
+        assert.equal(result.afterburned.length, 1);
+        assert.equal(result.afterburned[0].humanReviewText, '已整理進 DB：afterburn wrapper parity smoke');
+        assert.equal(
+            result.afterburned[0].sessionStartText,
+            '下一段只需要帶：\n- 決策：afterburn wrapper parity smoke\n',
+        );
+        assert.equal(
+            result.afterburned[0].finalization.humanReviewText,
+            '已整理進 DB：afterburn wrapper parity smoke',
+        );
+        assert.equal(
+            aq.calls.finalization.find(call => call.method === 'finalizeSession').input.mode,
+            'afterburn',
+        );
+    });
+
     it('re-imports when JSONL contains more messages than an existing DB snapshot', async () => {
         const root = tmpDir();
         const sessionsDir = path.join(root, 'sessions');
@@ -758,6 +963,11 @@ describe('Codex consumer runSync', () => {
         assert.equal(result.skipped.some((r) => r.status === 'skipped_short'), true);
         assert.equal(aq.calls.skip.length, 1);
         assert.match(aq.calls.skip[0].opts.reason, /user_count=1/);
+        assert.ok(aq.calls.finalization.some((c) => {
+            return c.method === 'updateStatus'
+                && c.input.sessionId === 'meta-short'
+                && c.input.status === 'skipped';
+        }));
     });
 
     it('skips short sessions before import by default to match CC import threshold', async () => {
@@ -786,10 +996,23 @@ describe('Codex consumer runSync', () => {
         assert.equal(result.skipped.some((r) => r.status === 'skipped_empty'), true);
         assert.equal(aq.calls.commit.length, 0);
         assert.equal(aq.calls.skip.length, 0);
-        assert.equal(
-            fs.existsSync(path.join(stateDir, 'codex-sessions-imported', 'meta-short-import')),
-            false,
-        );
+        assert.ok(fs.existsSync(codex.markerPath(path.join(stateDir, 'codex-sessions-imported'), 'meta-short-import')));
+        assert.ok(fs.existsSync(codex.markerPath(path.join(stateDir, 'codex-sessions-afterburned'), 'meta-short-import')));
+
+        const second = await codex.runSync(aq, {
+            sessionsDir,
+            stateDir,
+            minSessionBytes: 1,
+            idleMs: 1,
+            maxImports: 10,
+            maxAfterburns: 10,
+            minUserMessages: 3,
+            logger: { warn() {} },
+        });
+        assert.equal(second.imported.length, 0);
+        assert.equal(second.afterburned.length, 0);
+        assert.equal(second.skipped.length, 0);
+        assert.equal(aq.calls.commit.length, 0);
     });
 
     it('retries old local done markers when the finalization ledger is still pending', async () => {

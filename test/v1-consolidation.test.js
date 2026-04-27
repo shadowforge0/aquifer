@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const {
   planCompaction,
   distillArchiveSnapshot,
+  resolveOperatorWindow,
   createMemoryConsolidation,
 } = require('../core/memory-consolidation');
 const { assessCandidate } = require('../core/memory-promotion');
@@ -116,6 +117,24 @@ describe('v1 consolidation and old DB boundary', () => {
         scopeKey: 'project:aquifer',
         summary: 'Superseded memory must not roll up.',
       },
+      {
+        id: 6,
+        memoryType: 'decision',
+        canonicalKey: 'decision:project:aquifer:incorrect',
+        status: 'incorrect',
+        scopeKind: 'project',
+        scopeKey: 'project:aquifer',
+        summary: 'Incorrect memory must not roll up.',
+      },
+      {
+        id: 7,
+        memoryType: 'fact',
+        canonicalKey: 'fact:project:aquifer:quarantined',
+        status: 'quarantined',
+        scopeKind: 'project',
+        scopeKey: 'project:aquifer',
+        summary: 'Quarantined memory must not roll up.',
+      },
     ];
     for (const cadence of ['daily', 'weekly', 'monthly']) {
       const opts = {
@@ -156,6 +175,8 @@ describe('v1 consolidation and old DB boundary', () => {
       assert.ok(aquiferCandidate.evidenceRefs.every(ref => ref.relationKind === 'derived_from'));
       assert.equal(aquiferCandidate.summary.includes('Expired open loop'), false);
       assert.equal(aquiferCandidate.summary.includes('Superseded memory'), false);
+      assert.equal(aquiferCandidate.summary.includes('Incorrect memory'), false);
+      assert.equal(aquiferCandidate.summary.includes('Quarantined memory'), false);
       assert.equal(a.outputCoverage.candidateCount, 2);
     }
   });
@@ -236,6 +257,7 @@ describe('v1 consolidation and old DB boundary', () => {
     assert.ok(distilled.candidates.every(c => c.status === 'candidate'));
     assert.ok(distilled.candidates.every(c => c.visibleInBootstrap === false));
     assert.ok(distilled.candidates.every(c => c.visibleInRecall === false));
+    assert.ok(distilled.candidates.every(c => c.authority === 'raw_transcript'));
     assert.ok(distilled.candidates.every(c => c.evidenceRefs[0].sourceKind === 'external'));
   });
 
@@ -250,6 +272,193 @@ describe('v1 consolidation and old DB boundary', () => {
     const result = assessCandidate(distilled.candidates[0]);
     assert.equal(result.action, 'quarantine');
     assert.equal(result.reason, 'insufficient_authority');
+  });
+
+  it('operator runJob dry-runs from the DB owner record path without mutating rows', async () => {
+    const listed = [];
+    const records = {
+      async listActive(input) {
+        listed.push(input);
+        return [{
+          id: 11,
+          memory_type: 'open_loop',
+          canonical_key: 'open_loop:operator:dry-run',
+          status: 'active',
+          scope_kind: 'project',
+          scope_key: 'project:aquifer',
+          summary: 'Operator dry run should plan stale open-loop closure.',
+          stale_after: '2026-04-27T12:00:00Z',
+        }];
+      },
+      updateMemoryStatusIfCurrent: async () => {
+        throw new Error('dry-run must not update memory status');
+      },
+    };
+    const consolidation = createMemoryConsolidation({
+      pool: { query: async () => ({ rows: [], rowCount: 0 }) },
+      schema: '"aq"',
+      defaultTenantId: 'tenant-a',
+      records,
+    });
+
+    const result = await consolidation.runJob({
+      cadence: 'daily',
+      periodStart: '2026-04-27T00:00:00Z',
+      periodEnd: '2026-04-28T00:00:00Z',
+      activeScopeKey: 'project:aquifer',
+    });
+
+    assert.equal(result.status, 'planned');
+    assert.equal(result.dryRun, true);
+    assert.equal(result.plan.statusUpdates.length, 1);
+    assert.deepEqual(listed[0].scopeKeys, ['project:aquifer']);
+    assert.equal(listed[0].asOf, '2026-04-28T00:00:00.000Z');
+  });
+
+  it('operator window resolves closed daily weekly monthly periods from anchor time', () => {
+    assert.deepEqual(resolveOperatorWindow({
+      cadence: 'daily',
+      anchorTime: '2026-04-28T12:34:56Z',
+    }), {
+      cadence: 'daily',
+      periodStart: '2026-04-27T00:00:00.000Z',
+      periodEnd: '2026-04-28T00:00:00.000Z',
+    });
+    assert.deepEqual(resolveOperatorWindow({
+      cadence: 'weekly',
+      anchorTime: '2026-04-30T12:34:56Z',
+    }), {
+      cadence: 'weekly',
+      periodStart: '2026-04-20T00:00:00.000Z',
+      periodEnd: '2026-04-27T00:00:00.000Z',
+    });
+    assert.deepEqual(resolveOperatorWindow({
+      cadence: 'monthly',
+      anchorTime: '2026-05-15T12:34:56Z',
+    }), {
+      cadence: 'monthly',
+      periodStart: '2026-04-01T00:00:00.000Z',
+      periodEnd: '2026-05-01T00:00:00.000Z',
+    });
+  });
+
+  it('operator archive-distill job remains dry-run and keeps candidates invisible', async () => {
+    const consolidation = createMemoryConsolidation({
+      pool: { query: async () => ({ rows: [], rowCount: 0 }) },
+      schema: '"aq"',
+      defaultTenantId: 'tenant-a',
+      records: {
+        async listActive() {
+          throw new Error('archive-distill must not read live memory rows');
+        },
+      },
+    });
+
+    const result = await consolidation.runJob({
+      job: 'archive-distill',
+      archiveSnapshot: {
+        sessions: [{
+          sessionId: 'archive-1',
+          structuredSummary: {
+            decisions: ['Archive distill candidates stay behind promotion.'],
+          },
+        }],
+      },
+    });
+
+    assert.equal(result.status, 'planned');
+    assert.equal(result.dryRun, true);
+    assert.equal(result.candidates.length, 1);
+    assert.equal(result.candidates[0].visibleInBootstrap, false);
+    assert.equal(result.candidates[0].visibleInRecall, false);
+  });
+
+  it('operator runJob reports existing applied winner when the same snapshot was already applied', async () => {
+    const rows = [{
+      id: 11,
+      memory_type: 'open_loop',
+      canonical_key: 'open_loop:operator:idempotent',
+      status: 'active',
+      scope_kind: 'project',
+      scope_key: 'project:aquifer',
+      summary: 'Existing applied run should be returned to the operator.',
+      stale_after: '2026-04-27T12:00:00Z',
+    }];
+    const window = resolveOperatorWindow({
+      cadence: 'daily',
+      periodStart: '2026-04-27T00:00:00Z',
+      periodEnd: '2026-04-28T00:00:00Z',
+    });
+    const expectedPlan = planCompaction(rows, {
+      tenantId: 'tenant-a',
+      cadence: window.cadence,
+      periodStart: window.periodStart,
+      periodEnd: window.periodEnd,
+      policyVersion: 'v1',
+    });
+    const existingRun = {
+      id: 77,
+      status: 'applied',
+      cadence: expectedPlan.cadence,
+      period_start: expectedPlan.periodStart,
+      period_end: expectedPlan.periodEnd,
+      input_hash: expectedPlan.inputHash,
+      policy_version: 'v1',
+    };
+    const client = {
+      async query(sql) {
+        const text = String(sql);
+        if (text === 'BEGIN' || text === 'COMMIT') return { rows: [], rowCount: 0 };
+        if (text.startsWith('SELECT pg_advisory_xact_lock')) return { rows: [], rowCount: 1 };
+        if (text.startsWith('UPDATE "aq".compaction_runs\n            SET status = \'failed\'')) {
+          return { rows: [], rowCount: 0 };
+        }
+        if (text.startsWith('INSERT INTO "aq".compaction_runs')) {
+          return { rows: [existingRun], rowCount: 1 };
+        }
+        if (text.startsWith('UPDATE "aq".compaction_runs AS cr')) {
+          return { rows: [], rowCount: 0 };
+        }
+        throw new Error(`unexpected sql: ${text}`);
+      },
+      release() {},
+    };
+    const pool = {
+      async connect() {
+        return client;
+      },
+      async query(sql) {
+        const text = String(sql);
+        if (text.startsWith('SELECT *\n         FROM "aq".compaction_runs')) {
+          return { rows: [existingRun], rowCount: 1 };
+        }
+        throw new Error(`unexpected pool sql: ${text}`);
+      },
+    };
+    const consolidation = createMemoryConsolidation({
+      pool,
+      schema: '"aq"',
+      defaultTenantId: 'tenant-a',
+      records: {
+        async listActive() {
+          return rows;
+        },
+        async updateMemoryStatusIfCurrent() {
+          throw new Error('existing applied winner must not re-run lifecycle mutation');
+        },
+      },
+    });
+
+    const result = await consolidation.runJob({
+      cadence: 'daily',
+      periodStart: '2026-04-27T00:00:00Z',
+      periodEnd: '2026-04-28T00:00:00Z',
+      apply: true,
+    });
+
+    assert.equal(result.status, 'skipped');
+    assert.equal(result.skipReason, 'already_applied');
+    assert.equal(result.existingRun.id, 77);
   });
 
   it('rejects invalid cadence and invalid period windows before planning', () => {

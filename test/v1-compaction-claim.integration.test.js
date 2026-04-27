@@ -13,6 +13,7 @@ const assert = require('node:assert/strict');
 const crypto = require('crypto');
 const { Pool } = require('pg');
 const { createAquifer } = require('../index');
+const { createMemoryRecords } = require('../core/memory-records');
 const { requireTestDb } = require('./helpers/require-test-db');
 
 const DB_URL = requireTestDb('v1 compaction claim integration tests');
@@ -538,6 +539,112 @@ describe('v1 compaction claim integration', () => {
     );
     assert.equal(refs.rows.length, 1);
     assert.equal(Number(refs.rows[0].created_by_compaction_run_id), Number(runId));
+  });
+
+  it('excludes non-active DB memories from promoted daily rollup candidates', async () => {
+    const scope = await ownerAq.memory.upsertScope({
+      scopeKind: 'project',
+      scopeKey: 'project:aquifer-rollup-exclusion',
+    });
+    const active = await ownerAq.memory.upsertMemory({
+      memoryType: 'decision',
+      canonicalKey: 'decision:rollup-exclusion-active',
+      scopeId: scope.id,
+      summary: 'Rollup exclusion active memory',
+      status: 'active',
+      authority: 'verified_summary',
+      acceptedAt: '2026-04-25T00:00:00Z',
+      visibleInBootstrap: true,
+      visibleInRecall: true,
+    });
+    for (const status of ['incorrect', 'quarantined', 'superseded']) {
+      await ownerAq.memory.upsertMemory({
+        memoryType: 'decision',
+        canonicalKey: `decision:rollup-exclusion-${status}`,
+        scopeId: scope.id,
+        summary: `Rollup exclusion ${status} memory`,
+        status,
+        authority: 'verified_summary',
+        acceptedAt: '2026-04-25T00:01:00Z',
+        visibleInBootstrap: false,
+        visibleInRecall: false,
+      });
+    }
+
+    const stored = await pool.query(
+      `SELECT status, visible_in_bootstrap, visible_in_recall
+         FROM ${qname(schema, 'memory_records')} m
+         JOIN ${qname(schema, 'scopes')} s ON s.id = m.scope_id
+        WHERE m.tenant_id = $1 AND s.scope_key = $2
+        ORDER BY m.status`,
+      ['test', 'project:aquifer-rollup-exclusion'],
+    );
+    assert.deepEqual(stored.rows.map(row => row.status).sort(), ['active', 'incorrect', 'quarantined', 'superseded']);
+    assert.equal(stored.rows.filter(row => row.status !== 'active').every(row => row.visible_in_bootstrap === false), true);
+    assert.equal(stored.rows.filter(row => row.status !== 'active').every(row => row.visible_in_recall === false), true);
+
+    const records = createMemoryRecords({
+      pool,
+      schema: `"${schema}"`,
+      defaultTenantId: 'test',
+    });
+    const snapshot = await records.listActive({
+      visibleInBootstrap: true,
+      scopeKeys: ['project:aquifer-rollup-exclusion'],
+      limit: 10,
+    });
+    assert.deepEqual(snapshot.map(row => row.canonical_key), [active.canonical_key]);
+
+    const plan = workerAq1.memory.consolidation.plan(snapshot.map(row => ({
+      ...row,
+      memoryType: row.memory_type,
+      canonicalKey: row.canonical_key,
+      scopeKind: row.scope_kind,
+      scopeKey: row.scope_key,
+    })), {
+      tenantId: 'test',
+      cadence: 'daily',
+      periodStart: '2026-04-25T00:00:00Z',
+      periodEnd: '2026-04-26T00:00:00Z',
+      policyVersion: 'v1-rollup-exclusion-smoke',
+    });
+    assert.equal(plan.candidates.length, 1);
+    assert.deepEqual(plan.candidates[0].payload.sourceMemoryIds, [Number(active.id)]);
+    assert.deepEqual(plan.candidates[0].payload.sourceCanonicalKeys, [active.canonical_key]);
+    assert.doesNotMatch(plan.candidates[0].summary, /incorrect|quarantined|superseded/);
+
+    const result = await workerAq1.memory.consolidation.executePlan({
+      plan,
+      workerId: 'rollup-exclusion-worker',
+      applyToken: 'rollup-exclusion-token',
+      appliedAt: '2026-04-26T00:00:00Z',
+      promoteCandidates: true,
+    });
+
+    assert.equal(result.status, 'applied');
+    assert.equal(result.promotionResult.promoted, 1);
+
+    const candidateRows = await pool.query(
+      `SELECT action, source_memory_ids, source_canonical_keys
+         FROM ${qname(schema, 'compaction_candidates')}
+        WHERE tenant_id = $1 AND compaction_run_id = $2`,
+      ['test', result.run.id],
+    );
+    assert.equal(candidateRows.rows.length, 1);
+    assert.equal(candidateRows.rows[0].action, 'promote');
+    assert.deepEqual(candidateRows.rows[0].source_memory_ids.map(Number), [Number(active.id)]);
+    assert.deepEqual(candidateRows.rows[0].source_canonical_keys, [active.canonical_key]);
+
+    const promoted = await pool.query(
+      `SELECT summary
+         FROM ${qname(schema, 'memory_records')}
+        WHERE tenant_id = $1
+          AND canonical_key = $2
+          AND status = 'active'`,
+      ['test', plan.candidates[0].canonicalKey],
+    );
+    assert.equal(promoted.rows.length, 1);
+    assert.doesNotMatch(promoted.rows[0].summary, /incorrect|quarantined|superseded/);
   });
 
   it('replays planned aggregate candidate writes idempotently without promotion', async () => {

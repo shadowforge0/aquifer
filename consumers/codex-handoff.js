@@ -142,7 +142,7 @@ async function finalizeHandoff(aquifer, payload = {}, opts = {}) {
     reviewText,
     humanReviewText: reviewText,
     sessionStartText: coreResult.sessionStartText || result.sessionStartText || '',
-    structuredSummary: summary.structuredSummary || {},
+    structuredSummary: finalSummary.structuredSummary || {},
   };
 }
 

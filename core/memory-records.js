@@ -21,6 +21,31 @@ function advisoryLockKeys(namespace, value) {
   return [digest.readInt32BE(0), digest.readInt32BE(4)];
 }
 
+const BOOTSTRAP_ORDER_SQL = `
+         CASE m.memory_type
+           WHEN 'constraint' THEN 0
+           WHEN 'preference' THEN 1
+           WHEN 'state' THEN 2
+           WHEN 'open_loop' THEN 3
+           WHEN 'decision' THEN 4
+           WHEN 'fact' THEN 5
+           WHEN 'conclusion' THEN 6
+           WHEN 'entity_note' THEN 7
+           ELSE 99
+         END ASC,
+         CASE m.authority
+           WHEN 'user_explicit' THEN 0
+           WHEN 'executable_evidence' THEN 1
+           WHEN 'manual' THEN 2
+           WHEN 'system' THEN 3
+           WHEN 'verified_summary' THEN 4
+           WHEN 'llm_inference' THEN 5
+           WHEN 'raw_transcript' THEN 6
+           ELSE 99
+         END ASC,
+         m.accepted_at DESC NULLS LAST,
+         m.id ASC`;
+
 function createMemoryRecords({ pool, schema, defaultTenantId, inTransaction = false }) {
   const scopes = `${schema}.scopes`;
   const versions = `${schema}.versions`;
@@ -481,6 +506,10 @@ function createMemoryRecords({ pool, schema, defaultTenantId, inTransaction = fa
       params.push(input.scopeId);
       where.push(`m.scope_id = $${params.length}`);
     }
+    if (Array.isArray(input.scopeKeys) && input.scopeKeys.length > 0) {
+      params.push(input.scopeKeys.map(value => String(value)));
+      where.push(`s.scope_key = ANY($${params.length}::text[])`);
+    }
     if (input.visibleInBootstrap !== undefined) {
       params.push(input.visibleInBootstrap === true);
       where.push(`m.visible_in_bootstrap = $${params.length}`);
@@ -490,12 +519,15 @@ function createMemoryRecords({ pool, schema, defaultTenantId, inTransaction = fa
       where.push(`m.visible_in_recall = $${params.length}`);
     }
     params.push(Math.max(1, Math.min(200, input.limit || 50)));
+    const orderBy = input.visibleInBootstrap === true
+      ? BOOTSTRAP_ORDER_SQL
+      : `m.accepted_at DESC NULLS LAST, m.id ASC`;
     const result = await pool.query(
       `SELECT m.*, s.scope_kind, s.scope_key, s.inheritance_mode AS scope_inheritance_mode
        FROM ${memories} m
        JOIN ${scopes} s ON s.id = m.scope_id
        WHERE ${where.join(' AND ')}
-       ORDER BY m.accepted_at DESC NULLS LAST, m.id ASC
+       ORDER BY ${orderBy}
        LIMIT $${params.length}`,
       params
     );

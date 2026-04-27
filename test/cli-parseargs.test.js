@@ -11,9 +11,10 @@ describe('parseArgs', () => {
   });
 
   it('parses value flags', () => {
-    const args = parseArgs(['recall', 'q', '--limit', '10', '--agent-id', 'cc']);
+    const args = parseArgs(['recall', 'q', '--limit', '10', '--agent-id', 'cc', '--mode', 'fts']);
     assert.equal(args.flags.limit, '10');
     assert.equal(args.flags['agent-id'], 'cc');
+    assert.equal(args.flags.mode, 'fts');
   });
 
   it('parses boolean flags', () => {
@@ -77,5 +78,48 @@ describe('parseArgs', () => {
   it('parses --note as value flag', () => {
     const args = parseArgs(['feedback', '--session-id', 'x', '--verdict', 'unhelpful', '--note', 'bad quality']);
     assert.equal(args.flags.note, 'bad quality');
+  });
+
+  it('parses curated memory scope and feedback flags as values', () => {
+    const args = parseArgs([
+      'recall',
+      'curated',
+      '--active-scope-key',
+      'project:aquifer',
+      '--active-scope-path',
+      'global,project:aquifer',
+      '--memory-id',
+      '42',
+      '--feedback-type',
+      'incorrect',
+      '--canonical-key',
+      'decision:project:aquifer:scope-safe-serving',
+    ]);
+    assert.equal(args.flags['active-scope-key'], 'project:aquifer');
+    assert.equal(args.flags['active-scope-path'], 'global,project:aquifer');
+    assert.equal(args.flags['memory-id'], '42');
+    assert.equal(args.flags['feedback-type'], 'incorrect');
+    assert.equal(args.flags['canonical-key'], 'decision:project:aquifer:scope-safe-serving');
+  });
+
+  it('parses compaction operator value flags', () => {
+    const args = parseArgs([
+      'compact',
+      '--cadence',
+      'daily',
+      '--period-start',
+      '2026-04-27T00:00:00Z',
+      '--period-end',
+      '2026-04-28T00:00:00Z',
+      '--policy-version',
+      'v1',
+      '--worker-id',
+      'worker-a',
+    ]);
+    assert.equal(args.flags.cadence, 'daily');
+    assert.equal(args.flags['period-start'], '2026-04-27T00:00:00Z');
+    assert.equal(args.flags['period-end'], '2026-04-28T00:00:00Z');
+    assert.equal(args.flags['policy-version'], 'v1');
+    assert.equal(args.flags['worker-id'], 'worker-a');
   });
 });

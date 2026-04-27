@@ -57,7 +57,8 @@ Claude Code, Claude Desktop, or any MCP-capable client — drop this into `.mcp.
       "args": ["--yes", "@shadowforge0/aquifer-memory", "mcp"],
       "env": {
         "DATABASE_URL": "postgresql://aquifer:aquifer@localhost:5432/aquifer",
-        "EMBED_PROVIDER": "ollama"
+        "EMBED_PROVIDER": "ollama",
+        "AQUIFER_MEMORY_SERVING_MODE": "legacy"
       }
     }
   }
@@ -66,6 +67,8 @@ Claude Code, Claude Desktop, or any MCP-capable client — drop this into `.mcp.
 
 Or run it directly: `DATABASE_URL=... EMBED_PROVIDER=ollama npx aquifer mcp`. The MCP server itself stays strict about env; `quickstart` autodetect is the try-it path, not the production one.
 
+Keep `AQUIFER_MEMORY_SERVING_MODE=legacy` for first rollout. Switch to `curated` only when you want `session_recall` and `session_bootstrap` to serve active curated memory; `evidence_recall` stays the explicit audit/debug lane. Rollback is just flipping env or config back to `legacy`.
+
 ### Common commands
 
 | Goal | Command |
@@ -73,6 +76,7 @@ Or run it directly: `DATABASE_URL=... EMBED_PROVIDER=ollama npx aquifer mcp`. Th
 | Verify setup | `npx aquifer quickstart` |
 | Start the MCP server | `npx aquifer mcp` |
 | Search memory manually | `npx aquifer recall "auth middleware"` |
+| Plan curated memory compaction | `npx aquifer compact --cadence daily --period-start 2026-04-27T00:00:00Z --period-end 2026-04-28T00:00:00Z` |
 | Inspect storage health | `npx aquifer stats` |
 | Enrich pending sessions | `npx aquifer backfill` |
 
@@ -144,6 +148,9 @@ Sessions, summaries, turn-level embeddings, entity graph — all live in one dat
 | `AQUIFER_RERANK_PROVIDER` | No | Reranker provider: `tei`, `jina`, `openrouter` | `tei` |
 | `AQUIFER_RERANK_BASE_URL` | No | Reranker endpoint | `http://localhost:8080` |
 | `AQUIFER_AGENT_ID` | No | Default agent ID | `main` |
+| `AQUIFER_MEMORY_SERVING_MODE` | No | Public serving mode: `legacy` default, or opt-in `curated` | `curated` |
+| `AQUIFER_MEMORY_ACTIVE_SCOPE_KEY` | No | Default active curated scope for recall/bootstrap | `project:aquifer` |
+| `AQUIFER_MEMORY_ACTIVE_SCOPE_PATH` | No | Ordered curated scope path for inheritance | `global,project:aquifer` |
 | `AQUIFER_MIGRATIONS_MODE` | No | Startup handshake mode: `apply` (default), `check`, `off` | `apply` |
 | `AQUIFER_MIGRATION_LOCK_TIMEOUT_MS` | No | Advisory-lock wait before `AQ_MIGRATION_LOCK_TIMEOUT` (default 30000) | `30000` |
 | `AQUIFER_INSIGHTS_DEDUP_MODE` | No | Insights semantic dedup mode: `off` (default), `shadow`, `enforce` — env wins over code for this field only, so operators can kill-switch without redeploy | `shadow` |
@@ -151,6 +158,8 @@ Sessions, summaries, turn-level embeddings, entity graph — all live in one dat
 | `AQUIFER_INSIGHTS_DEDUP_CLOSE_BAND_FROM` | No | Lower bound for close-band logging (`dedupNear`); must be below threshold (default `0.85`) | `0.82` |
 
 Full env-to-config mapping is in [consumers/shared/config.js](consumers/shared/config.js).
+
+Curated serving is opt-in. If a host needs rollback during rollout, set `AQUIFER_MEMORY_SERVING_MODE=legacy` and restart the MCP/CLI process; no destructive DB rollback is required.
 
 ### Insights semantic dedup (1.5.10)
 
@@ -171,7 +180,7 @@ The script is idempotent (`WHERE canonical_key_v2 IS NULL` guard) and race-safe 
 
 ## Host Integration
 
-MCP is the primary integration surface. Agent hosts connect to the Aquifer MCP server, which exposes six tools: `session_recall`, `session_feedback`, `feedback_stats`, `session_bootstrap`, `memory_stats`, `memory_pending`.
+MCP is the primary integration surface. Agent hosts connect to the Aquifer MCP server, which exposes eight tools: `session_recall`, `evidence_recall`, `session_feedback`, `memory_feedback`, `feedback_stats`, `session_bootstrap`, `memory_stats`, `memory_pending`.
 
 | Integration | Route | Status | When to use |
 |-------------|-------|--------|-------------|
@@ -202,7 +211,7 @@ Add to your project's `.claude.json` or user-level MCP config:
 }
 ```
 
-Tools appear as `mcp__aquifer__session_recall`, `mcp__aquifer__session_feedback`, `mcp__aquifer__session_bootstrap`, etc.
+Tools appear as `mcp__aquifer__session_recall`, `mcp__aquifer__evidence_recall`, `mcp__aquifer__session_bootstrap`, `mcp__aquifer__session_feedback`, `mcp__aquifer__memory_feedback`, `mcp__aquifer__feedback_stats`, `mcp__aquifer__memory_stats`, `mcp__aquifer__memory_pending`.
 
 ### OpenClaw
 
@@ -226,7 +235,7 @@ Add to `openclaw.json` under `mcp.servers`:
 }
 ```
 
-Tools materialize as `aquifer__session_recall`, `aquifer__session_feedback`, `aquifer__feedback_stats`, `aquifer__session_bootstrap`, `aquifer__memory_stats`, `aquifer__memory_pending` (server name prefix added by the host).
+Tools materialize as `aquifer__session_recall`, `aquifer__evidence_recall`, `aquifer__session_feedback`, `aquifer__memory_feedback`, `aquifer__feedback_stats`, `aquifer__session_bootstrap`, `aquifer__memory_stats`, `aquifer__memory_pending` (server name prefix added by the host).
 
 The OpenClaw plugin (`consumers/openclaw-plugin.js`) is retained for session capture via `before_reset` but is **not** the recommended tool delivery path. Use MCP.
 

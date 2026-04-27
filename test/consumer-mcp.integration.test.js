@@ -62,7 +62,7 @@ function getToolText(result) {
 
 if (DB_URL && Client && StdioClientTransport) {
 describe('MCP consumer — aquifer mcp tool surface', () => {
-  let schema, pool, aq, client, transport;
+  let schema, pool, aq, client, transport, curatedMemoryId;
 
   before(async () => {
     schema = randomSchema();
@@ -91,6 +91,25 @@ describe('MCP consumer — aquifer mcp tool surface', () => {
         },
       }),
     });
+    const scope = await aq.memory.upsertScope({
+      tenantId: 'test',
+      scopeKind: 'project',
+      scopeKey: 'project:mcp-tool-surface',
+      inheritanceMode: 'defaultable',
+    });
+    const memory = await aq.memory.upsertMemory({
+      tenantId: 'test',
+      scopeId: scope.id,
+      memoryType: 'decision',
+      canonicalKey: 'decision:project:mcp-tool-surface:feedback-split',
+      title: 'Split legacy session feedback from curated memory feedback',
+      summary: 'Curated memory feedback should use its own public target.',
+      status: 'active',
+      authority: 'verified_summary',
+      visibleInRecall: true,
+      acceptedAt: '2026-04-28T00:00:00Z',
+    });
+    curatedMemoryId = String(memory.id);
 
     ({ client, transport } = await connectMcpClient(schema));
   });
@@ -108,7 +127,7 @@ describe('MCP consumer — aquifer mcp tool surface', () => {
     const names = result.tools.map(t => t.name).sort();
     assert.deepEqual(
       names,
-      ['evidence_recall', 'feedback_stats', 'memory_pending', 'memory_stats', 'session_bootstrap', 'session_feedback', 'session_recall']
+      ['evidence_recall', 'feedback_stats', 'memory_feedback', 'memory_pending', 'memory_stats', 'session_bootstrap', 'session_feedback', 'session_recall']
     );
   });
 
@@ -159,6 +178,15 @@ describe('MCP consumer — aquifer mcp tool surface', () => {
     const text = getToolText(result);
     assert.match(text, /Feedback:\s*1 total/);
     assert.match(text, /1 helpful/);
+  });
+
+  it('memory_feedback records curated feedback on a memory row', async () => {
+    const result = await client.callTool({
+      name: 'memory_feedback',
+      arguments: { memoryId: curatedMemoryId, feedbackType: 'confirm', agentId: 'mcp-test' },
+    });
+    const text = getToolText(result);
+    assert.match(text, /Memory feedback:\s*confirm/);
   });
 
   it('memory_pending returns empty after enrich', async () => {

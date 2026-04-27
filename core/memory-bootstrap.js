@@ -170,6 +170,7 @@ function createMemoryBootstrap({ records }) {
     const rows = await records.listActive({
       tenantId: opts.tenantId,
       scopeId: opts.scopeId,
+      scopeKeys: opts.activeScopePath || (opts.activeScopeKey ? [opts.activeScopeKey] : undefined),
       visibleInBootstrap: true,
       asOf: opts.asOf,
       limit: opts.limit || 50,

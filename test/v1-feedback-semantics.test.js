@@ -4,6 +4,7 @@ const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 const { recallMemoryRecords } = require('../core/memory-recall');
 const { assessCandidate } = require('../core/memory-promotion');
+const { createAquifer } = require('../index');
 
 describe('v1 feedback semantics', () => {
   it('feedback can change ranking score without mutating memory truth fields', () => {
@@ -57,5 +58,53 @@ describe('v1 feedback semantics', () => {
     const result = assessCandidate(conflictingCandidate);
     assert.equal(result.action, 'quarantine');
     assert.notEqual(result.action, 'promote');
+  });
+
+  it('public memoryFeedback writes v1 feedback without touching legacy session trust', async () => {
+    const queries = [];
+    const pool = {
+      async query(sql, params) {
+        queries.push({ sql, params });
+        if (String(sql).startsWith('INSERT INTO "aq".feedback')) {
+          return {
+            rows: [{
+              target_kind: params[1],
+              target_id: params[2],
+              feedback_type: params[3],
+              note: params[7],
+            }],
+            rowCount: 1,
+          };
+        }
+        return { rows: [], rowCount: 0 };
+      },
+      async connect() {
+        return {
+          query: async (sql, params) => {
+            queries.push({ sql, params });
+            return { rows: [], rowCount: 0 };
+          },
+          release() {},
+        };
+      },
+    };
+    const aq = createAquifer({
+      db: pool,
+      schema: 'aq',
+      migrations: { mode: 'off' },
+    });
+
+    const result = await aq.memoryFeedback('42', {
+      feedbackType: 'incorrect',
+      agentId: 'main',
+      note: 'Wrong project scope.',
+    });
+
+    assert.equal(result.target_kind, 'memory_record');
+    assert.equal(result.target_id, '42');
+    assert.equal(result.feedback_type, 'incorrect');
+    assert.equal(result.note, 'Wrong project scope.');
+    assert.equal(queries.some(query => String(query.sql).includes('session_summaries')), false);
+    assert.equal(queries.some(query => String(query.sql).includes('sessions')), false);
   });
 });

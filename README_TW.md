@@ -57,7 +57,8 @@ Claude Code、Claude Desktop 或任何支援 MCP 的 client——放進 `.mcp.js
       "args": ["--yes", "@shadowforge0/aquifer-memory", "mcp"],
       "env": {
         "DATABASE_URL": "postgresql://aquifer:aquifer@localhost:5432/aquifer",
-        "EMBED_PROVIDER": "ollama"
+        "EMBED_PROVIDER": "ollama",
+        "AQUIFER_MEMORY_SERVING_MODE": "legacy"
       }
     }
   }
@@ -66,6 +67,8 @@ Claude Code、Claude Desktop 或任何支援 MCP 的 client——放進 `.mcp.js
 
 或直接跑：`DATABASE_URL=... EMBED_PROVIDER=ollama npx aquifer mcp`。MCP server 本身對 env 比較嚴格，`quickstart` 的 autodetect 是試用路徑，不是 production 路徑。
 
+第一輪 rollout 先維持 `AQUIFER_MEMORY_SERVING_MODE=legacy`。只有在你要讓 `session_recall` 跟 `session_bootstrap` 提供 active curated memory 時，才切到 `curated`；`evidence_recall` 會保留為顯式 audit/debug 路徑。要 rollback 只要把 env 或 config 切回 `legacy`。
+
 ### 常用指令
 
 | 目標 | 指令 |
@@ -73,6 +76,7 @@ Claude Code、Claude Desktop 或任何支援 MCP 的 client——放進 `.mcp.js
 | 驗證 setup | `npx aquifer quickstart` |
 | 啟動 MCP server | `npx aquifer mcp` |
 | 手動查記憶 | `npx aquifer recall "auth middleware"` |
+| 規劃 curated memory 壓縮 | `npx aquifer compact --cadence daily --period-start 2026-04-27T00:00:00Z --period-end 2026-04-28T00:00:00Z` |
 | 看儲存狀態 | `npx aquifer stats` |
 | 補跑 pending session | `npx aquifer backfill` |
 
@@ -186,7 +190,7 @@ const results = await aquifer.recall('auth middleware 決定', {
 
 ## 主機整合（Host Integration）
 
-MCP 是主要的整合介面。Agent 主機連接 Aquifer MCP 伺服器，伺服器提供六個工具：`session_recall`、`session_feedback`、`feedback_stats`、`session_bootstrap`、`memory_stats`、`memory_pending`。
+MCP 是主要的整合介面。Agent 主機連接 Aquifer MCP 伺服器，伺服器提供八個工具：`session_recall`、`evidence_recall`、`session_feedback`、`memory_feedback`、`feedback_stats`、`session_bootstrap`、`memory_stats`、`memory_pending`。
 
 | 整合方式 | 路由 | 狀態 | 使用時機 |
 |----------|------|------|----------|
@@ -217,7 +221,7 @@ MCP 是主要的整合介面。Agent 主機連接 Aquifer MCP 伺服器，伺服
 }
 ```
 
-工具會以 `mcp__aquifer__session_recall`、`mcp__aquifer__session_feedback` 等名稱出現。
+工具會以 `mcp__aquifer__session_recall`、`mcp__aquifer__evidence_recall`、`mcp__aquifer__session_bootstrap`、`mcp__aquifer__session_feedback`、`mcp__aquifer__memory_feedback`、`mcp__aquifer__feedback_stats`、`mcp__aquifer__memory_stats`、`mcp__aquifer__memory_pending` 等名稱出現。
 
 ### OpenClaw
 
@@ -241,7 +245,7 @@ MCP 是主要的整合介面。Agent 主機連接 Aquifer MCP 伺服器，伺服
 }
 ```
 
-工具會以 `aquifer__session_recall`、`aquifer__session_feedback`、`aquifer__memory_stats`、`aquifer__memory_pending` 等名稱出現（主機自動加上伺服器名稱前綴）。
+工具會以 `aquifer__session_recall`、`aquifer__evidence_recall`、`aquifer__session_feedback`、`aquifer__memory_feedback`、`aquifer__feedback_stats`、`aquifer__session_bootstrap`、`aquifer__memory_stats`、`aquifer__memory_pending` 等名稱出現（主機自動加上伺服器名稱前綴）。
 
 OpenClaw plugin（`consumers/openclaw-plugin.js`）保留用於 `before_reset` session 擷取，但**不是**建議的工具傳遞方式。請用 MCP。
 
@@ -271,6 +275,9 @@ OpenClaw plugin（`consumers/openclaw-plugin.js`）保留用於 `before_reset` s
 | `AQUIFER_RERANK_PROVIDER` | 否 | Reranker 供應商：`tei`、`jina`、`openrouter` | `tei` |
 | `AQUIFER_RERANK_BASE_URL` | 否 | Reranker 端點 | `http://localhost:8080` |
 | `AQUIFER_AGENT_ID` | 否 | 預設 agent ID | `main` |
+| `AQUIFER_MEMORY_SERVING_MODE` | 否 | 對外 serving mode：預設 `legacy`，可 opt-in `curated` | `curated` |
+| `AQUIFER_MEMORY_ACTIVE_SCOPE_KEY` | 否 | recall/bootstrap 預設 active curated scope | `project:aquifer` |
+| `AQUIFER_MEMORY_ACTIVE_SCOPE_PATH` | 否 | curated scope inheritance 的順序路徑 | `global,project:aquifer` |
 | `AQUIFER_MIGRATIONS_MODE` | 否 | 啟動 handshake 模式：`apply`（預設）、`check`、`off` | `apply` |
 | `AQUIFER_MIGRATION_LOCK_TIMEOUT_MS` | 否 | advisory lock 等待上限，逾時拋 `AQ_MIGRATION_LOCK_TIMEOUT`（預設 30000） | `30000` |
 | `AQUIFER_INSIGHTS_DEDUP_MODE` | 否 | insights 語意去重模式：`off`（預設）、`shadow`、`enforce`——此欄位 env 蓋過程式碼設定，讓 operator 不用重部署就能緊急關閉 | `shadow` |
@@ -278,6 +285,8 @@ OpenClaw plugin（`consumers/openclaw-plugin.js`）保留用於 `before_reset` s
 | `AQUIFER_INSIGHTS_DEDUP_CLOSE_BAND_FROM` | 否 | close-band（`dedupNear` metadata）下界，必須嚴格小於閾值（預設 `0.85`） | `0.82` |
 
 完整的環境變數對應設定在 [consumers/shared/config.js](consumers/shared/config.js)。
+
+Curated serving 是 opt-in。若 rollout 時要回復舊路徑，設定 `AQUIFER_MEMORY_SERVING_MODE=legacy` 並重新啟動 MCP/CLI process 即可，不需要破壞性 DB rollback。
 
 ### Insights 語意去重（1.5.10）
 

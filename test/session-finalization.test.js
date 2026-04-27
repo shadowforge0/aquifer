@@ -4,8 +4,9 @@ const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 const { createSessionFinalization } = require('../core/session-finalization');
 
-function makeFinalizationPool() {
+function makeFinalizationPool(opts = {}) {
   const queries = [];
+  const existingFinalizationStatus = opts.existingFinalizationStatus || null;
   const client = {
     async query(sql, params = []) {
       queries.push({ sql, params });
@@ -29,7 +30,23 @@ function makeFinalizationPool() {
         };
       }
       if (String(sql).includes('FROM "aq".session_finalizations')) {
-        return { rows: [], rowCount: 0 };
+        return {
+          rows: existingFinalizationStatus ? [{
+            id: 70,
+            tenant_id: 'default',
+            session_row_id: 1,
+            source: 'codex',
+            host: 'codex',
+            agent_id: 'main',
+            session_id: 's1',
+            transcript_hash: 'b'.repeat(64),
+            phase: 'curated_memory_v1',
+            mode: 'session_start_recovery',
+            status: existingFinalizationStatus,
+            memory_result: { promoted: 0 },
+          }] : [],
+          rowCount: existingFinalizationStatus ? 1 : 0,
+        };
       }
       if (String(sql).includes('INSERT INTO "aq".session_finalizations')) {
         return {
@@ -112,5 +129,37 @@ describe('session finalization', () => {
     assert.ok(pool.queries.some(query => String(query.sql).includes('INSERT INTO "aq".memory_records')));
     assert.ok(pool.queries.some(query => String(query.sql).includes('INSERT INTO "aq".evidence_refs')));
     assert.ok(pool.queries.some(query => String(query.sql).includes('INSERT INTO "aq".finalization_candidates')));
+  });
+
+  it('does not promote or rewrite terminal suppressed finalizations', async () => {
+    const pool = makeFinalizationPool({ existingFinalizationStatus: 'declined' });
+    const finalization = createSessionFinalization({
+      pool,
+      schema: 'aq',
+      recordsSchema: '"aq"',
+      defaultTenantId: 'default',
+    });
+
+    const result = await finalization.finalizeSession({
+      sessionId: 's1',
+      agentId: 'main',
+      source: 'codex',
+      transcriptHash: 'b'.repeat(64),
+      mode: 'session_start_recovery',
+      summaryText: 'This should not be promoted.',
+      structuredSummary: {
+        facts: [{ subject: 'Aquifer', statement: 'Declined recovery must stay declined.' }],
+      },
+    });
+
+    assert.equal(result.status, 'suppressed');
+    assert.equal(result.finalizationStatus, 'declined');
+    assert.deepEqual(
+      pool.queries.map(query => query.sql).filter(sql => ['BEGIN', 'COMMIT', 'ROLLBACK'].includes(sql)),
+      ['BEGIN', 'COMMIT'],
+    );
+    assert.equal(pool.queries.some(query => String(query.sql).includes('INSERT INTO "aq".session_summaries')), false);
+    assert.equal(pool.queries.some(query => String(query.sql).includes('INSERT INTO "aq".memory_records')), false);
+    assert.equal(pool.queries.some(query => String(query.sql).includes('UPDATE "aq".sessions')), false);
   });
 });

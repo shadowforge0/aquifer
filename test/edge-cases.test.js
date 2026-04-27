@@ -343,7 +343,7 @@ describe('consumers/cli.js', () => {
     const out = captureConsole('log');
     try {
       await cliPrivate.cmdRecall(aquifer, { _: ['recall', 'q'], flags: {} });
-      assert.ok(out.calls.some(line => /\(\?, agent-x\)/.test(line)), 'should print fallback date');
+      assert.ok(out.calls.some(line => /\(unknown, agent-x\)/.test(line)), 'should print fallback date');
     } finally {
       out.restore();
     }

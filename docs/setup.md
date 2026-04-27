@@ -49,12 +49,34 @@ Aquifer reads configuration from three sources (in priority order):
 2. Environment variables (see below)
 3. Programmatic overrides via `createAquifer()`
 
+Default public serving mode is `legacy`. Opt into `curated` only when you want `session_recall` and `session_bootstrap` to read active curated memory. `evidence_recall` remains the explicit audit/debug lane in both modes, and rollback is just setting env or config back to `legacy`.
+
+### Example config file
+
+```json
+{
+  "db": {
+    "url": "postgresql://aquifer:aquifer@localhost:5432/aquifer"
+  },
+  "memory": {
+    "servingMode": "legacy",
+    "activeScopeKey": "project:aquifer",
+    "activeScopePath": ["global", "project:aquifer"]
+  },
+  "embed": {
+    "baseUrl": "http://localhost:11434/v1",
+    "model": "bge-m3"
+  }
+}
+```
+
 ### Minimum env vars for MCP recall
 
 ```bash
 export DATABASE_URL="postgresql://aquifer:aquifer@localhost:5432/aquifer"
 export AQUIFER_EMBED_BASE_URL="http://localhost:11434/v1"
 export AQUIFER_EMBED_MODEL="bge-m3"
+export AQUIFER_MEMORY_SERVING_MODE="legacy"
 ```
 
 ### Optional but common
@@ -69,6 +91,12 @@ export AQUIFER_LLM_MODEL="llama3.1"
 
 # Knowledge graph
 export AQUIFER_ENTITIES_ENABLED="true"
+
+# Optional curated serving rollout. Default remains legacy.
+export AQUIFER_MEMORY_SERVING_MODE="legacy"
+# export AQUIFER_MEMORY_SERVING_MODE="curated"
+# export AQUIFER_MEMORY_ACTIVE_SCOPE_KEY="project:aquifer"
+# export AQUIFER_MEMORY_ACTIVE_SCOPE_PATH="global,project:aquifer"
 ```
 
 Copy `.env.example` from the repo root for a full annotated list.
@@ -153,7 +181,9 @@ Add to `.claude.json` (project-level) or user-level MCP config:
 }
 ```
 
-Tools appear as `mcp__aquifer__session_recall`, `mcp__aquifer__evidence_recall`, `mcp__aquifer__session_bootstrap`, `mcp__aquifer__session_feedback`, `mcp__aquifer__feedback_stats`, `mcp__aquifer__memory_stats`, `mcp__aquifer__memory_pending`.
+Tools appear as `mcp__aquifer__session_recall`, `mcp__aquifer__evidence_recall`, `mcp__aquifer__session_bootstrap`, `mcp__aquifer__session_feedback`, `mcp__aquifer__memory_feedback`, `mcp__aquifer__feedback_stats`, `mcp__aquifer__memory_stats`, `mcp__aquifer__memory_pending`.
+
+`evidence_recall` is an explicit audit/debug tool. Use `session_recall` for normal memory lookup; broad evidence searches require an audit boundary filter such as `agentId`, `source`, or `dateFrom/dateTo`, unless the caller explicitly opts into unsafe debug mode.
 
 ### OpenClaw
 
@@ -177,9 +207,28 @@ Add to `openclaw.json`:
 }
 ```
 
-Tools materialize as `aquifer__session_recall`, `aquifer__evidence_recall`, `aquifer__session_bootstrap`, `aquifer__session_feedback`, `aquifer__feedback_stats`, `aquifer__memory_stats`, `aquifer__memory_pending`.
+Tools materialize as `aquifer__session_recall`, `aquifer__evidence_recall`, `aquifer__session_bootstrap`, `aquifer__session_feedback`, `aquifer__memory_feedback`, `aquifer__feedback_stats`, `aquifer__memory_stats`, `aquifer__memory_pending`.
 
 Do **not** use the OpenClaw plugin (`consumers/openclaw-plugin.js`) for tool delivery. The plugin is retained for session capture via `before_reset` only.
+
+Curated serving rollback is config-only: set `AQUIFER_MEMORY_SERVING_MODE=legacy` and restart the MCP/CLI process. No destructive database rollback is required.
+
+## Release verification gates
+
+For the publish-surface checks:
+
+```bash
+node --test test/package-surface.test.js test/mcp-manifest.test.js
+npm pack --dry-run --json
+```
+
+For the real DB-backed MCP integration gate:
+
+```bash
+AQUIFER_TEST_DB_URL="postgresql://..." node --test test/consumer-mcp.integration.test.js
+```
+
+That DB-backed test is the release proof that the stdio MCP server, current MCP manifest, and PostgreSQL path still line up on a live database.
 
 ## Troubleshooting
 

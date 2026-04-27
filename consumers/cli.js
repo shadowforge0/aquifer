@@ -11,10 +11,13 @@
  *   aquifer backfill [options]          Enrich pending sessions
  *   aquifer stats [options]             Show database statistics
  *   aquifer export [options]            Export sessions
+ *   aquifer operator ...                Run operator-safe consolidation jobs
  *   aquifer mcp                         Start MCP server
  */
 
+const fs = require('fs');
 const { createAquiferFromConfig } = require('./shared/factory');
+const { formatRecallResults } = require('./shared/recall-format');
 
 function formatDate(value, fallback) {
   if (!value) return fallback;
@@ -34,6 +37,18 @@ function parsePositiveInt(value, fallback) {
   const parsed = parseInt(value, 10);
   if (!Number.isFinite(parsed)) return fallback;
   return Math.max(1, parsed);
+}
+
+function parseScopePath(value) {
+  if (!value) return undefined;
+  const parts = String(value).split(',').map(s => s.trim()).filter(Boolean);
+  return parts.length > 0 ? parts : undefined;
+}
+
+function parseCsvList(value) {
+  if (!value) return undefined;
+  const parts = String(value).split(',').map(s => s.trim()).filter(Boolean);
+  return parts.length > 0 ? parts : undefined;
 }
 
 function hasQuickstartEmbedConfig(env) {
@@ -123,7 +138,14 @@ function buildQuickstartRecallHints(err) {
 function parseArgs(argv) {
   const args = { _: [], flags: {} };
   // Flags that take a value (not boolean)
-  const VALUE_FLAGS = new Set(['limit', 'agent-id', 'source', 'date-from', 'date-to', 'output', 'format', 'config', 'status', 'concurrency', 'entities', 'entity-mode', 'session-id', 'verdict', 'note', 'db', 'since', 'min-messages', 'lookback-days', 'max-chars', 'out']);
+  const VALUE_FLAGS = new Set([
+    'limit', 'agent-id', 'source', 'date-from', 'date-to', 'output', 'format', 'config', 'status',
+    'concurrency', 'entities', 'entity-mode', 'mode', 'session-id', 'memory-id', 'canonical-key',
+    'verdict', 'feedback-type', 'note', 'db', 'since', 'min-messages', 'lookback-days', 'max-chars',
+    'out', 'active-scope-key', 'active-scope-path', 'cadence', 'period-start', 'period-end',
+    'policy-version', 'worker-id', 'apply-token', 'claim-lease-seconds', 'snapshot-as-of',
+    'scope-key', 'scope-keys', 'scope-kind', 'context-key', 'topic-key', 'authority', 'input',
+  ]);
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--') { args._.push(...argv.slice(i + 1)); break; }
     if (argv[i].startsWith('--')) {
@@ -156,13 +178,13 @@ async function cmdRecall(aquifer, args) {
     process.exit(1);
   }
 
-  const recallOpts = {
-    limit: parsePositiveInt(args.flags.limit, 5),
-    agentId: args.flags['agent-id'] || undefined,
-    source: args.flags.source || undefined,
-    dateFrom: args.flags['date-from'] || undefined,
-    dateTo: args.flags['date-to'] || undefined,
-  };
+  const recallOpts = { limit: parsePositiveInt(args.flags.limit, 5) };
+  if (args.flags['agent-id']) recallOpts.agentId = args.flags['agent-id'];
+  if (args.flags.source) recallOpts.source = args.flags.source;
+  if (args.flags['date-from']) recallOpts.dateFrom = args.flags['date-from'];
+  if (args.flags['date-to']) recallOpts.dateTo = args.flags['date-to'];
+  if (args.flags['active-scope-key']) recallOpts.activeScopeKey = args.flags['active-scope-key'];
+  if (args.flags['active-scope-path']) recallOpts.activeScopePath = parseScopePath(args.flags['active-scope-path']);
   if (args.flags.entities) {
     recallOpts.entities = args.flags.entities.split(',').map(s => s.trim()).filter(Boolean);
     recallOpts.entityMode = args.flags['entity-mode'] || 'any';
@@ -174,39 +196,20 @@ async function cmdRecall(aquifer, args) {
     return;
   }
 
-  if (results.length === 0) {
-    console.log('No results found.');
-    return;
-  }
-
-  const showExplain = !!args.flags.explain;
-  for (let i = 0; i < results.length; i++) {
-    const r = results[i];
-    const ss = r.structuredSummary || {};
-    const title = ss.title || r.summaryText?.slice(0, 60) || '(untitled)';
-    const date = formatDate(r.startedAt, '?');
-    console.log(`${i + 1}. [${r.score?.toFixed(3)}] ${title} (${date}, ${r.agentId})`);
-    if (ss.overview) console.log(`   ${ss.overview.slice(0, 200)}`);
-    if (r.matchedTurnText) console.log(`   > ${r.matchedTurnText.slice(0, 150)}`);
-    if (showExplain && r._debug) {
-      const d = r._debug;
-      const f = (v) => typeof v === 'number' ? v.toFixed(3) : '?';
-      const parts = [
-        `rrf=${f(d.rrf)}`, `td=${f(d.timeDecay)}`, `access=${f(d.access)}`,
-        `entity=${f(d.entityScore)}`, `trust=${f(d.trustScore)}(\u00d7${f(d.trustMultiplier)})`,
-        `ol=${f(d.openLoopBoost)}`, `\u2192 hybrid=${f(d.hybridScore)}`,
-      ];
-      if (d.rerankApplied) parts.push(`rerank=${f(d.rerankScore)}(${d.rerankReason || '?'})`);
-      else parts.push(`[rerank: off (${d.rerankReason || '?'})]`);
-      console.log(`   ${parts.join(' ')}`);
-    }
-    console.log();
-  }
+  console.log(formatRecallResults(results, {
+    query,
+    showScore: true,
+    showExplain: !!args.flags.explain,
+  }));
 }
 
 async function cmdFeedback(aquifer, args) {
   const sessionId = args.flags['session-id'] || args._[1];
   const verdict = args.flags.verdict;
+  if (args.flags['memory-id'] || args.flags['canonical-key'] || args.flags['feedback-type']) {
+    console.error('Use `aquifer memory-feedback` for curated memory feedback.');
+    process.exit(1);
+  }
 
   if (!sessionId || !verdict) {
     console.error('Usage: aquifer feedback --session-id ID --verdict helpful|unhelpful [--note TEXT] [--agent-id ID]');
@@ -224,6 +227,66 @@ async function cmdFeedback(aquifer, args) {
   } else {
     console.log(`Feedback: ${result.verdict} (trust ${result.trustBefore.toFixed(2)} → ${result.trustAfter.toFixed(2)})`);
   }
+}
+
+async function cmdMemoryFeedback(aquifer, args) {
+  const memoryId = args.flags['memory-id'];
+  const canonicalKey = args.flags['canonical-key'];
+  const feedbackType = args.flags['feedback-type'];
+
+  if ((!memoryId && !canonicalKey) || !feedbackType) {
+    console.error('Usage: aquifer memory-feedback (--memory-id ID | --canonical-key KEY) --feedback-type helpful|confirm|irrelevant|scope_mismatch|stale|incorrect [--note TEXT] [--agent-id ID]');
+    process.exit(1);
+  }
+
+  const result = await aquifer.memoryFeedback({
+    memoryId: memoryId || undefined,
+    canonicalKey: canonicalKey || undefined,
+  }, {
+    feedbackType,
+    agentId: args.flags['agent-id'] || undefined,
+    note: args.flags.note || undefined,
+  });
+
+  if (args.flags.json) {
+    console.log(JSON.stringify(result, null, 2));
+  } else {
+    const target = result.canonicalKey || result.memoryId;
+    console.log(`Memory feedback: ${result.feedbackType} (${target})`);
+  }
+}
+
+async function cmdEvidenceRecall(aquifer, args) {
+  const query = args._.slice(1).join(' ');
+  if (!query) {
+    console.error('Usage: aquifer evidence-recall <query> [--limit N] [--agent-id ID] [--allow-unsafe-debug] [--json]');
+    process.exit(1);
+  }
+
+  const recallOpts = { limit: parsePositiveInt(args.flags.limit, 5) };
+  if (args.flags['agent-id']) recallOpts.agentId = args.flags['agent-id'];
+  if (args.flags.source) recallOpts.source = args.flags.source;
+  if (args.flags['date-from']) recallOpts.dateFrom = args.flags['date-from'];
+  if (args.flags['date-to']) recallOpts.dateTo = args.flags['date-to'];
+  if (args.flags.entities) {
+    recallOpts.entities = args.flags.entities.split(',').map(s => s.trim()).filter(Boolean);
+    recallOpts.entityMode = args.flags['entity-mode'] || 'any';
+  }
+  if (args.flags.mode) recallOpts.mode = args.flags.mode;
+  if (args.flags['allow-unsafe-debug']) recallOpts.allowUnsafeDebug = true;
+
+  const results = await aquifer.evidenceRecall(query, recallOpts);
+
+  if (args.flags.json) {
+    console.log(JSON.stringify(results, null, 2));
+    return;
+  }
+
+  console.log(formatRecallResults(results, {
+    query,
+    showScore: true,
+    showExplain: !!args.flags.explain,
+  }));
 }
 
 async function cmdFeedbackStats(aquifer, args) {
@@ -388,14 +451,17 @@ async function cmdQuickstart(aquifer) {
 }
 
 async function cmdBootstrap(aquifer, args) {
-  const result = await aquifer.bootstrap({
-    agentId: args.flags['agent-id'] || undefined,
-    source: args.flags.source || undefined,
+  const bootstrapOpts = {
     limit: parsePositiveInt(args.flags.limit, 5),
-    lookbackDays: parsePositiveInt(args.flags['lookback-days'], 14),
     maxChars: parsePositiveInt(args.flags['max-chars'], 4000),
     format: args.flags.json ? 'structured' : 'text',
-  });
+  };
+  if (args.flags['agent-id']) bootstrapOpts.agentId = args.flags['agent-id'];
+  if (args.flags.source) bootstrapOpts.source = args.flags.source;
+  if (args.flags['lookback-days']) bootstrapOpts.lookbackDays = parsePositiveInt(args.flags['lookback-days'], 14);
+  if (args.flags['active-scope-key']) bootstrapOpts.activeScopeKey = args.flags['active-scope-key'];
+  if (args.flags['active-scope-path']) bootstrapOpts.activeScopePath = parseScopePath(args.flags['active-scope-path']);
+  const result = await aquifer.bootstrap(bootstrapOpts);
 
   if (args.flags.json) {
     console.log(JSON.stringify(result, null, 2));
@@ -408,6 +474,85 @@ async function cmdBootstrap(aquifer, args) {
       const { text } = formatBootstrapText(result, result.meta?.maxChars || 4000);
       console.log(text);
     }
+  }
+}
+
+async function cmdOperator(aquifer, args) {
+  const operatorVerb = args._[1] || 'compaction';
+  const cadenceVerbs = new Set(['manual', 'daily', 'weekly', 'monthly']);
+
+  if (operatorVerb === 'archive-distill') {
+    const inputPath = args.flags.input || args._[2];
+    if (!inputPath) {
+      console.error('Usage: aquifer operator archive-distill --input /path/to/archive.json [--authority verified_summary] [--json]');
+      process.exit(1);
+    }
+    const archiveSnapshot = JSON.parse(fs.readFileSync(inputPath, 'utf8'));
+    const result = await aquifer.memory.consolidation.runJob({
+      job: 'archive-distill',
+      archiveSnapshot,
+      authority: args.flags.authority || undefined,
+      scopeKind: args.flags['scope-kind'] || undefined,
+      scopeKey: args.flags['scope-key'] || undefined,
+      contextKey: args.flags['context-key'] || undefined,
+      topicKey: args.flags['topic-key'] || undefined,
+    });
+
+    if (args.flags.json) {
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+
+    const sessionCount = Array.isArray(archiveSnapshot.sessions) ? archiveSnapshot.sessions.length : 0;
+    console.log(`Archive distill planned from ${sessionCount} sessions.`);
+    console.log(`Candidates: ${result.candidates.length}`);
+    console.log('Visibility: recall/bootstrap hidden until a separate promotion step.');
+    return;
+  }
+
+  if (operatorVerb !== 'compaction' && operatorVerb !== 'compact' && !cadenceVerbs.has(operatorVerb)) {
+    console.error('Usage: aquifer operator <compaction|archive-distill> [...]');
+    process.exit(1);
+  }
+
+  const cadence = args.flags.cadence
+    || (cadenceVerbs.has(operatorVerb) ? operatorVerb : args._[2])
+    || 'manual';
+  const result = await aquifer.memory.consolidation.runJob({
+    job: 'compaction',
+    cadence,
+    periodStart: args.flags['period-start'] || undefined,
+    periodEnd: args.flags['period-end'] || undefined,
+    policyVersion: args.flags['policy-version'] || undefined,
+    workerId: args.flags['worker-id'] || undefined,
+    applyToken: args.flags['apply-token'] || undefined,
+    claimLeaseSeconds: args.flags['claim-lease-seconds']
+      ? parsePositiveInt(args.flags['claim-lease-seconds'], undefined)
+      : undefined,
+    snapshotAsOf: args.flags['snapshot-as-of'] || undefined,
+    scopeKeys: parseCsvList(args.flags['scope-keys'] || args.flags['scope-key']),
+    limit: parsePositiveInt(args.flags.limit, 1000),
+    apply: args.flags.apply === true,
+  });
+
+  if (args.flags.json) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  console.log(`${result.dryRun ? 'Planned' : 'Executed'} ${result.cadence} compaction window ${result.periodStart} -> ${result.periodEnd}`);
+  console.log(`Snapshot: ${result.snapshotCount} active rows${result.snapshotTruncated ? ' (snapshot limit reached)' : ''}`);
+  console.log(`Plan: ${result.plan.statusUpdates.length} lifecycle updates, ${result.plan.candidates.length} aggregate candidates`);
+  if (result.dryRun) {
+    console.log('Mode: dry-run only. Re-run with --apply to write compaction_runs and lifecycle changes.');
+    return;
+  }
+  if (result.run) {
+    console.log(`Run: #${result.run.id} status=${result.run.status}`);
+  } else if (result.existingRun) {
+    console.log(`Existing run: #${result.existingRun.id} status=${result.existingRun.status} reason=${result.skipReason || 'claim_not_acquired'}`);
+  } else {
+    console.log(`No run claimed: ${result.skipReason || 'claim_not_acquired'}`);
   }
 }
 
@@ -439,6 +584,10 @@ async function cmdExport(aquifer, args) {
   }
 }
 
+async function cmdCompact(aquifer, args) {
+  return cmdOperator(aquifer, { ...args, _: ['operator', 'compaction', ...args._.slice(1)] });
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -452,9 +601,13 @@ Commands:
    quickstart                  Verify end-to-end setup (migrate → commit → enrich → recall)
    migrate                     Run database migrations
   recall <query>              Search sessions (requires embed config)
+  evidence-recall <query>     Search legacy session/evidence plane explicitly
   feedback                    Record trust feedback on a session
+  memory-feedback             Record curated memory feedback
   feedback-stats              Show trust feedback statistics and coverage
   backfill                    Enrich pending sessions
+  operator ...                Run operator-safe consolidation jobs
+  compact                     Plan or apply curated memory compaction
   stats                       Show database statistics
   export                      Export sessions as JSONL
   bootstrap                   Show recent session context (for new session start)
@@ -470,18 +623,37 @@ Options:
   --entities A,B,C            Entity names (comma-separated, recall)
   --entity-mode any|all       Entity match mode (recall, default: any)
   --session-id ID             Session ID (feedback)
+  --memory-id ID              Curated memory record ID (memory-feedback)
+  --canonical-key KEY         Active curated memory canonical key (memory-feedback)
   --verdict helpful|unhelpful Feedback verdict (feedback)
+  --feedback-type TYPE        Curated memory feedback type
   --note TEXT                 Feedback note (feedback)
   --explain                    Show score breakdown per result (recall)
+  --allow-unsafe-debug        Allow broad evidence-recall without audit boundary
   --json                      JSON output
   --dry-run                   Preview only (backfill)
   --output PATH               Output file (export)
   --config PATH               Config file path
   --lookback-days N           How far back in days (bootstrap, default: 14)
   --max-chars N               Max output characters (bootstrap, default: 4000)
+  --active-scope-key KEY      Active curated memory scope key
+  --active-scope-path A,B     Ordered curated scope path
+  --cadence manual|daily|weekly|monthly
+  --period-start ISO          Compaction window start
+  --period-end ISO            Compaction window end
+  --apply                     Apply compaction; default is dry-run
+  --scope-key A,B             Limit compaction snapshot to specific scope keys
+  --snapshot-as-of ISO        Read active snapshot as of a specific instant
+  --claim-lease-seconds N     Override compaction apply lease
+  --input PATH                Archive distill input JSON path
   --db PATH                   OpenCode SQLite path (ingest-opencode)
   --since YYYY-MM-DD          Only ingest sessions after date (ingest-opencode)
-  --min-messages N            Min user messages to ingest (ingest-opencode, default: 3)`);
+  --min-messages N            Min user messages to ingest (ingest-opencode, default: 3)
+
+Operator examples:
+  aquifer operator compaction daily --json
+  aquifer operator compaction manual --period-start 2026-04-27T00:00:00Z --period-end 2026-04-28T00:00:00Z --apply
+  aquifer operator archive-distill --input /tmp/archive-snapshot.json --json`);
     process.exit(0);
   }
 
@@ -555,14 +727,26 @@ Options:
       case 'recall':
         await cmdRecall(aquifer, args);
         break;
+      case 'evidence-recall':
+        await cmdEvidenceRecall(aquifer, args);
+        break;
       case 'feedback':
         await cmdFeedback(aquifer, args);
+        break;
+      case 'memory-feedback':
+        await cmdMemoryFeedback(aquifer, args);
         break;
       case 'feedback-stats':
         await cmdFeedbackStats(aquifer, args);
         break;
       case 'backfill':
         await cmdBackfill(aquifer, args);
+        break;
+      case 'operator':
+        await cmdOperator(aquifer, args);
+        break;
+      case 'compact':
+        await cmdCompact(aquifer, args);
         break;
       case 'stats':
         await cmdStats(aquifer, args);
