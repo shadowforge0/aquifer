@@ -4,6 +4,7 @@ const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 const {
   planCompaction,
+  buildTimerSynthesisInput,
   distillArchiveSnapshot,
   resolveOperatorWindow,
   createMemoryConsolidation,
@@ -153,6 +154,11 @@ describe('v1 consolidation and old DB boundary', () => {
       assert.deepEqual(a.candidates, b.candidates);
       assert.deepEqual(a.meta.outputCoverage, a.outputCoverage);
       assert.equal(a.candidates.length, 2);
+      assert.equal(a.synthesisInput.kind, 'timer_current_memory_synthesis_v1');
+      assert.equal(a.synthesisInput.sourceOfTruth, 'memory_records');
+      assert.equal(a.synthesisInput.promotion.default, 'candidate_only');
+      assert.equal(a.synthesisInput.promotion.requires, 'apply=true and promoteCandidates=true');
+      assert.equal(a.synthesisInput.guards.sessionSummariesExcluded, true);
       const aquiferCandidate = a.candidates.find(candidate => candidate.scopeKey === 'project:aquifer');
       assert.ok(aquiferCandidate);
       assert.equal(aquiferCandidate.memoryType, 'conclusion');
@@ -164,6 +170,9 @@ describe('v1 consolidation and old DB boundary', () => {
       assert.match(aquiferCandidate.canonicalKey, /window:2026-04-25t00:00:00.000z_2026-04-26t00:00:00.000z/);
       assert.equal(aquiferCandidate.status, 'candidate');
       assert.equal(aquiferCandidate.authority, 'system');
+      assert.equal(aquiferCandidate.payload.synthesisKind, 'timer_current_memory_synthesis_v1');
+      assert.equal(aquiferCandidate.payload.currentMemoryRole, `${cadence}_timer_synthesis_candidate`);
+      assert.equal(aquiferCandidate.payload.promotionGate, 'operator_required');
       assert.match(aquiferCandidate.candidateHash, /^[a-f0-9]{64}$/);
       assert.equal(aquiferCandidate.payload.candidateHash, aquiferCandidate.candidateHash);
       assert.deepEqual(aquiferCandidate.payload.sourceMemoryIds, [1, 2]);
@@ -178,6 +187,11 @@ describe('v1 consolidation and old DB boundary', () => {
       assert.equal(aquiferCandidate.summary.includes('Incorrect memory'), false);
       assert.equal(aquiferCandidate.summary.includes('Quarantined memory'), false);
       assert.equal(a.outputCoverage.candidateCount, 2);
+      assert.deepEqual(a.synthesisInput.statusUpdates.map(update => update.memoryId), [3]);
+      assert.deepEqual(a.synthesisInput.candidateProposals.map(candidate => candidate.candidateHash), a.candidates.map(candidate => candidate.candidateHash));
+      assert.equal(a.synthesisInput.sourceCurrentMemory.some(record => record.canonicalKey === 'open_loop:project:aquifer:expired'), false);
+      assert.equal(a.synthesisInput.sourceCurrentMemory.some(record => record.canonicalKey === 'fact:project:aquifer:old'), false);
+      assert.equal(a.synthesisInput.sourceCurrentMemory.some(record => record.canonicalKey === 'decision:project:aquifer:incorrect'), false);
     }
   });
 
@@ -201,6 +215,63 @@ describe('v1 consolidation and old DB boundary', () => {
     assert.deepEqual(planCompaction([
       { ...records[0], status: 'quarantined' },
     ], { ...window, cadence: 'daily' }).candidates, []);
+    assert.equal(planCompaction(records, { ...window, cadence: 'manual' }).synthesisInput, null);
+  });
+
+  it('builds deterministic timer synthesis input without session summaries or inactive memory', () => {
+    const normalized = [
+      {
+        id: 1,
+        memoryType: 'decision',
+        canonicalKey: 'decision:current',
+        status: 'active',
+        scopeKind: 'project',
+        scopeKey: 'project:aquifer',
+        summary: 'Current decision should be eligible for timer synthesis.',
+      },
+      {
+        id: 2,
+        memoryType: 'fact',
+        canonicalKey: 'fact:superseded',
+        status: 'superseded',
+        scopeKind: 'project',
+        scopeKey: 'project:aquifer',
+        summary: 'Superseded memory must not enter synthesis input.',
+      },
+    ];
+    const candidates = [{
+      candidateHash: 'abc123',
+      memoryType: 'conclusion',
+      canonicalKey: 'conclusion:timer',
+      scopeKind: 'project',
+      scopeKey: 'project:aquifer',
+      summary: 'Timer proposal',
+      payload: {
+        sourceMemoryIds: [1],
+        sourceCanonicalKeys: ['decision:current'],
+      },
+    }];
+
+    const a = buildTimerSynthesisInput(normalized, [], candidates, {
+      cadence: 'daily',
+      periodStart: '2026-04-27T00:00:00Z',
+      periodEnd: '2026-04-28T00:00:00Z',
+      policyVersion: 'v1-timer',
+    });
+    const b = buildTimerSynthesisInput([...normalized].reverse(), [], candidates, {
+      cadence: 'daily',
+      periodStart: '2026-04-27T00:00:00Z',
+      periodEnd: '2026-04-28T00:00:00Z',
+      policyVersion: 'v1-timer',
+    });
+
+    assert.deepEqual(a, b);
+    assert.equal(a.policyVersion, 'v1-timer');
+    assert.equal(a.guards.rawTranscriptExcluded, true);
+    assert.equal(a.guards.sessionSummariesExcluded, true);
+    assert.equal(a.sourceCurrentMemory.length, 1);
+    assert.equal(a.sourceCurrentMemory[0].canonicalKey, 'decision:current');
+    assert.equal(a.candidateProposals[0].sourceCanonicalKeys[0], 'decision:current');
   });
 
   it('keeps aggregate canonical keys distinct by context and topic within one scope', () => {

@@ -296,6 +296,9 @@ function buildAggregateCandidates(normalized, statusUpdates, opts) {
       candidateHash,
       payload: {
         kind: 'compaction_rollup',
+        synthesisKind: 'timer_current_memory_synthesis_v1',
+        currentMemoryRole: `${cadence}_timer_synthesis_candidate`,
+        promotionGate: 'operator_required',
         cadence,
         policyVersion,
         periodStart: windowStart,
@@ -326,6 +329,87 @@ function buildAggregateCandidates(normalized, statusUpdates, opts) {
   }
 
   return candidates;
+}
+
+function buildTimerSynthesisInput(normalized, statusUpdates, candidates, opts) {
+  const { cadence, periodStart, periodEnd } = opts;
+  if (!aggregateCandidateCadence(cadence)) return null;
+
+  const staleIds = new Set(statusUpdates.map(update => String(update.memoryId)));
+  const staleKeys = new Set(statusUpdates.map(update => String(update.canonicalKey || '')));
+  const sourceCurrentMemory = normalized
+    .filter(record => record.status === 'active')
+    .filter(record => record.id === null || !staleIds.has(String(record.id)))
+    .filter(record => !staleKeys.has(record.canonicalKey))
+    .filter(record => Boolean(record.canonicalKey))
+    .map(record => ({
+      memoryId: record.id,
+      memoryType: record.memoryType,
+      canonicalKey: record.canonicalKey,
+      scopeKind: record.scopeKind,
+      scopeKey: record.scopeKey,
+      contextKey: record.contextKey,
+      topicKey: record.topicKey,
+      summary: compactSummary(record),
+      acceptedAt: record.acceptedAt,
+      validFrom: record.validFrom,
+      validTo: record.validTo,
+      staleAfter: record.staleAfter,
+    }))
+    .sort((a, b) => {
+      if (a.canonicalKey !== b.canonicalKey) return a.canonicalKey.localeCompare(b.canonicalKey);
+      return String(a.memoryId).localeCompare(String(b.memoryId));
+    });
+
+  const windowStart = canonicalInstant(periodStart);
+  const windowEnd = canonicalInstant(periodEnd);
+  return {
+    kind: 'timer_current_memory_synthesis_v1',
+    sourceOfTruth: 'memory_records',
+    cadence,
+    policyVersion: opts.policyVersion || 'v1',
+    periodStart: windowStart,
+    periodEnd: windowEnd,
+    promotion: {
+      default: 'candidate_only',
+      requires: 'apply=true and promoteCandidates=true',
+    },
+    guards: {
+      rawTranscriptExcluded: true,
+      sessionSummariesExcluded: true,
+      nonActiveMemoryExcluded: true,
+      stalePlannedMemoryExcluded: true,
+    },
+    sourceCurrentMemory,
+    statusUpdates: statusUpdates
+      .map(update => ({
+        memoryId: update.memoryId,
+        canonicalKey: update.canonicalKey,
+        status: update.status,
+        reason: update.reason,
+      }))
+      .sort((a, b) => {
+        if (a.canonicalKey !== b.canonicalKey) return String(a.canonicalKey).localeCompare(String(b.canonicalKey));
+        return String(a.memoryId).localeCompare(String(b.memoryId));
+      }),
+    candidateProposals: candidates
+      .map(candidate => ({
+        candidateHash: candidate.candidateHash,
+        memoryType: candidate.memoryType,
+        canonicalKey: candidate.canonicalKey,
+        scopeKind: candidate.scopeKind,
+        scopeKey: candidate.scopeKey,
+        contextKey: candidate.contextKey,
+        topicKey: candidate.topicKey,
+        summary: compactSummary(candidate),
+        sourceMemoryIds: candidate.payload?.sourceMemoryIds || [],
+        sourceCanonicalKeys: candidate.payload?.sourceCanonicalKeys || [],
+      }))
+      .sort((a, b) => {
+        if (a.canonicalKey !== b.canonicalKey) return String(a.canonicalKey).localeCompare(String(b.canonicalKey));
+        return String(a.candidateHash).localeCompare(String(b.candidateHash));
+      }),
+  };
 }
 
 function buildCoverage(normalized, statusUpdates, candidates) {
@@ -460,6 +544,12 @@ function planCompaction(records = [], opts = {}) {
     periodStart,
     periodEnd,
   });
+  const synthesisInput = buildTimerSynthesisInput(normalized, statusUpdates, candidates, {
+    ...opts,
+    cadence,
+    periodStart,
+    periodEnd,
+  });
   const coverage = buildCoverage(normalized, statusUpdates, candidates);
 
   return {
@@ -469,6 +559,7 @@ function planCompaction(records = [], opts = {}) {
     policyVersion: opts.policyVersion || 'v1',
     inputHash,
     candidates,
+    synthesisInput,
     statusUpdates,
     sourceCoverage: coverage.sourceCoverage,
     outputCoverage: coverage.outputCoverage,
@@ -476,6 +567,7 @@ function planCompaction(records = [], opts = {}) {
       activeConflictRate: 0,
       deterministic: true,
       recordCount: normalized.length,
+      synthesisInput,
       sourceCoverage: coverage.sourceCoverage,
       outputCoverage: coverage.outputCoverage,
     },
@@ -1231,6 +1323,7 @@ module.exports = {
   normalizeClaimLeaseSeconds,
   resolveOperatorWindow,
   planCompaction,
+  buildTimerSynthesisInput,
   distillArchiveSnapshot,
   createMemoryConsolidation,
 };
