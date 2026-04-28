@@ -213,6 +213,45 @@ Do **not** use the OpenClaw plugin (`consumers/openclaw-plugin.js`) for tool del
 
 Curated serving rollback is config-only: set `AQUIFER_MEMORY_SERVING_MODE=legacy` and restart the MCP/CLI process. No destructive database rollback is required.
 
+## Operator compaction and timer synthesis
+
+Compaction jobs are operator-safe by default. A dry-run plans lifecycle updates
+and candidate output without writing active memory:
+
+```bash
+npx aquifer operator compaction daily --include-synthesis-prompt --json
+```
+
+If an operator or external model reviews that prompt and returns timer synthesis
+JSON, attach it back to the plan with:
+
+```bash
+npx aquifer operator compaction daily \
+  --synthesis-summary-file /tmp/timer-summary.json \
+  --apply \
+  --promote-candidates \
+  --json
+```
+
+The summary file must match the normal structured summary shape, for example:
+
+```json
+{
+  "summaryText": "Reviewed timer synthesis.",
+  "structuredSummary": {
+    "states": [
+      { "state": "The reviewed state that should continue into current memory." }
+    ],
+    "decisions": [],
+    "open_loops": []
+  }
+}
+```
+
+Without `--promote-candidates`, synthesis output is recorded as candidate
+ledger material only. The prompt and summary file are producer material; active
+curated memory still requires the explicit promotion gate.
+
 ## Release verification gates
 
 For the publish-surface checks:
@@ -222,13 +261,15 @@ node --test test/package-surface.test.js test/mcp-manifest.test.js
 npm pack --dry-run --json
 ```
 
-For the real DB-backed MCP integration gate:
+For the real DB-backed release gate:
 
 ```bash
-AQUIFER_TEST_DB_URL="postgresql://..." node --test test/consumer-mcp.integration.test.js
+AQUIFER_TEST_DB_URL="postgresql://..." npm run test:release:db
 ```
 
-That DB-backed test is the release proof that the stdio MCP server, current MCP manifest, and PostgreSQL path still line up on a live database.
+That DB-backed test is the release proof that the stdio MCP server, CLI
+consumer, Codex finalization serving path, current MCP manifest, and PostgreSQL
+path still line up on a live database.
 
 ## Troubleshooting
 

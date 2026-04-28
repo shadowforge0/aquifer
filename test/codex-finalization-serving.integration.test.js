@@ -290,6 +290,90 @@ if (DB_URL) {
       assert.doesNotMatch(bootstrap.text, /Payload-only overview|Payload-only next step/);
     });
 
+    it('promotes reviewed handoff synthesis output through core and supersedes lower-authority current memory', async () => {
+      const file = path.join(root, 'rollout-codex-handoff-synthesis.jsonl');
+      writeJsonl(file, [
+        { type: 'session_meta', payload: { id: 'codex-handoff-synthesis-smoke' } },
+        { type: 'event_msg', payload: { type: 'user_message', message: 'Aquifer handoff synthesis smoke start.' } },
+        { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Tracking handoff synthesis promotion.' }] } },
+        { type: 'event_msg', payload: { type: 'user_message', message: 'State: reviewed handoff synthesis output should replace the old lower-authority state.' } },
+      ]);
+
+      const view = codex.materializeRecoveryTranscriptView({ filePath: file }, {
+        maxRecoveryBytes: 1024 * 1024,
+      });
+      assert.equal(view.status, 'ok');
+
+      const scope = await aq.memory.upsertScope({
+        scopeKind: 'project',
+        scopeKey: 'project:aquifer-handoff-synthesis',
+      });
+      await aq.memory.upsertMemory({
+        memoryType: 'state',
+        canonicalKey: 'state:project:aquifer:handoff-synthesis-reviewed',
+        scopeId: scope.id,
+        summary: 'Old lower-authority handoff synthesis state must leave active serving.',
+        status: 'active',
+        authority: 'llm_inference',
+        visibleInBootstrap: true,
+        visibleInRecall: true,
+      });
+
+      const result = await handoff.finalizeHandoff(aq, {
+        title: 'Codex handoff synthesis DB smoke',
+        overview: 'Raw handoff synthesis overview must stay metadata only.',
+        next: 'Raw handoff synthesis next must stay metadata only.',
+      }, {
+        view,
+        synthesisSummary: {
+          summaryText: 'Reviewed handoff synthesis output promotes one state.',
+          structuredSummary: {
+            states: [{ state: 'Reviewed handoff synthesis output should replace the old lower-authority state.' }],
+          },
+          candidates: [{
+            memoryType: 'state',
+            canonicalKey: 'state:project:aquifer:handoff-synthesis-reviewed',
+            scopeKind: 'project',
+            scopeKey: 'project:aquifer-handoff-synthesis',
+            title: 'Reviewed handoff synthesis output should replace the old lower-authority state.',
+            summary: 'Reviewed handoff synthesis output should replace the old lower-authority state.',
+            payload: { state: 'Reviewed handoff synthesis output should replace the old lower-authority state.' },
+            authority: 'verified_summary',
+            evidenceRefs: [{ sourceKind: 'session_summary', sourceRef: view.sessionId, relationKind: 'primary' }],
+          }],
+        },
+        agentId: 'main',
+        source: 'codex-wrapper',
+        sessionKey: 'codex:wrapper:handoff-synthesis',
+        scopeKind: 'project',
+        scopeKey: 'project:aquifer-handoff-synthesis',
+        activeScopePath: ['global', 'project:aquifer-handoff-synthesis'],
+        activeScopeKey: 'project:aquifer-handoff-synthesis',
+      });
+
+      assert.equal(result.status, 'finalized');
+      assert.equal(result.memoryResult.promoted, 1);
+      assert.match(result.sessionStartText, /Reviewed handoff synthesis output/);
+      assert.doesNotMatch(result.sessionStartText, /Raw handoff synthesis overview|Raw handoff synthesis next/);
+
+      const finalizationRow = await aq.finalization.get({
+        sessionId: 'codex-handoff-synthesis-smoke',
+        agentId: 'main',
+        source: 'codex-wrapper',
+        transcriptHash: view.transcriptHash,
+      });
+      assert.equal(finalizationRow.status, 'finalized');
+      assert.equal(finalizationRow.metadata.handoffSynthesis.kind, 'handoff_current_memory_synthesis_v1');
+
+      const bootstrap = await aq.bootstrap({
+        activeScopePath: ['global', 'project:aquifer-handoff-synthesis'],
+        format: 'text',
+        maxChars: 2000,
+      });
+      assert.match(bootstrap.text, /Reviewed handoff synthesis output should replace the old lower-authority state/);
+      assert.doesNotMatch(bootstrap.text, /Old lower-authority handoff synthesis state|Raw handoff synthesis overview|Raw handoff synthesis next/);
+    });
+
     it('serves memory promoted by Codex import afterburn finalization from the same core surface', async () => {
       const sessionsDir = path.join(root, 'afterburn-sessions');
       const stateDir = path.join(root, 'afterburn-state');

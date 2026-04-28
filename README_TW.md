@@ -77,8 +77,12 @@ Claude Code、Claude Desktop 或任何支援 MCP 的 client——放進 `.mcp.js
 | 啟動 MCP server | `npx aquifer mcp` |
 | 手動查記憶 | `npx aquifer recall "auth middleware"` |
 | 規劃 curated memory 壓縮 | `npx aquifer compact --cadence daily --period-start 2026-04-27T00:00:00Z --period-end 2026-04-28T00:00:00Z` |
+| 產生 timer synthesis prompt | `npx aquifer operator compaction daily --include-synthesis-prompt --json` |
+| 套用已審核的 timer synthesis candidates | `npx aquifer operator compaction daily --synthesis-summary-file /tmp/timer-summary.json --apply --promote-candidates --json` |
 | 看儲存狀態 | `npx aquifer stats` |
 | 補跑 pending session | `npx aquifer backfill` |
+
+Timer synthesis output 在 operator 用 `--promote-candidates` apply 前都只是 candidate material；光有 prompt 或 summary file 不會變成 active curated memory。
 
 需要 LLM 摘要、知識圖譜、OpenAI embedding、reranker 或維運細節，就往下看 [環境變數](#環境變數) 跟 [docs/setup.md](docs/setup.md)。
 

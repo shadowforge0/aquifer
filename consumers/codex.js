@@ -1440,6 +1440,8 @@ async function finalizeTranscriptView(aquifer, view = {}, summary = {}, opts = {
         contextKey: opts.contextKey || null,
         topicKey: opts.topicKey || null,
         authority: opts.authority || 'verified_summary',
+        candidates: Array.isArray(opts.candidates) ? opts.candidates : undefined,
+        candidatePayload: opts.candidatePayload || null,
         metadata,
     });
     const humanReviewText = result.humanReviewText || '';

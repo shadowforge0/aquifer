@@ -1,6 +1,6 @@
 {
   "name": "@shadowforge0/aquifer-memory",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "description": "PG-native long-term memory for AI agents. Turn-level embedding, hybrid RRF ranking, optional knowledge graph. MCP server, CLI, and library API.",
   "main": "index.js",
   "files": [

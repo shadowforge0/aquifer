@@ -100,6 +100,29 @@ function buildHandoffMetadata(payload = {}) {
   };
 }
 
+function resolveHandoffSummary(payload = {}, opts = {}) {
+  const synthesisSummary = opts.synthesisSummary
+    || opts.handoffSynthesisSummary
+    || payload.synthesisSummary
+    || payload.handoffSynthesisSummary
+    || null;
+  if (synthesisSummary) {
+    return {
+      summary: synthesisSummary,
+      candidates: Array.isArray(synthesisSummary.candidates) ? synthesisSummary.candidates : undefined,
+      usedSynthesis: true,
+    };
+  }
+  return {
+    summary: opts.summary || payload.summary || {
+      summaryText: opts.summaryText || payload.summaryText,
+      structuredSummary: opts.structuredSummary || payload.structuredSummary,
+    },
+    candidates: Array.isArray(opts.candidates) ? opts.candidates : undefined,
+    usedSynthesis: false,
+  };
+}
+
 function formatHandoffContextBlock(metadata = {}) {
   const handoff = metadata.handoff || {};
   const lines = [
@@ -153,6 +176,7 @@ async function prepareHandoffSynthesis(aquifer, payload = {}, opts = {}) {
   const currentMemory = await resolveCurrentMemoryForFinalization(aquifer, opts);
   return {
     status: 'needs_agent_summary',
+    outputSchemaVersion: 'handoff_current_memory_synthesis_v1',
     view,
     currentMemory,
     prompt: buildHandoffSynthesisPrompt(payload, view, { ...opts, currentMemory }),
@@ -164,14 +188,18 @@ async function finalizeHandoff(aquifer, payload = {}, opts = {}) {
   if (!view || view.status !== 'ok') {
     throw new Error(`Codex handoff finalization requires an ok normalized transcript view; got ${view && view.status ? view.status : 'missing'}`);
   }
-  const summary = opts.summary || payload.summary || {
-    summaryText: opts.summaryText || payload.summaryText,
-    structuredSummary: opts.structuredSummary || payload.structuredSummary,
-  };
+  const { summary, candidates, usedSynthesis } = resolveHandoffSummary(payload, opts);
   const metadata = {
     ...buildHandoffMetadata(payload),
     ...(opts.metadata || {}),
   };
+  if (usedSynthesis) {
+    metadata.handoffSynthesis = {
+      kind: 'handoff_current_memory_synthesis_v1',
+      source: 'operator_reviewed_summary',
+      promotionGate: 'core_finalization',
+    };
+  }
   const currentMemory = await resolveCurrentMemoryForFinalization(aquifer, opts);
   if (currentMemory) metadata.currentMemory = compactCurrentMemorySnapshot(currentMemory, opts);
   const result = await finalizeTranscriptView(aquifer, view, summary, {
@@ -179,7 +207,16 @@ async function finalizeHandoff(aquifer, payload = {}, opts = {}) {
     mode: 'handoff',
     metadataSource: 'codex_handoff',
     metadata,
-    authority: opts.authority || 'manual',
+    authority: opts.authority || (usedSynthesis ? 'verified_summary' : 'manual'),
+    candidates,
+    candidatePayload: usedSynthesis
+      ? {
+          kind: 'handoff_synthesis',
+          synthesisKind: 'handoff_current_memory_synthesis_v1',
+          currentMemoryRole: 'handoff_synthesis_candidate',
+          promotionGate: 'core_finalization',
+        }
+      : opts.candidatePayload || null,
   });
   const coreResult = result.finalization || {};
   const finalSummary = coreResult.summary || {
@@ -216,5 +253,6 @@ module.exports = {
   buildHandoffMetadata,
   buildHandoffSynthesisPrompt,
   prepareHandoffSynthesis,
+  resolveHandoffSummary,
   finalizeHandoff,
 };

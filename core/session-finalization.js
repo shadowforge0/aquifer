@@ -40,6 +40,20 @@ function summarizeMemoryResults(results = [], extra = {}) {
   };
 }
 
+function decorateCandidates(candidates = [], input = {}) {
+  const candidatePayload = input.candidatePayload && typeof input.candidatePayload === 'object'
+    ? input.candidatePayload
+    : null;
+  if (!candidatePayload) return candidates;
+  return candidates.map(candidate => ({
+    ...candidate,
+    payload: {
+      ...(candidate.payload || {}),
+      ...candidatePayload,
+    },
+  }));
+}
+
 function normalizeFinalizationInput(input = {}, defaults = {}) {
   const tenantId = input.tenantId || defaults.defaultTenantId || 'default';
   return {
@@ -227,7 +241,7 @@ function createSessionFinalization({
           phase: base.phase,
         },
       }];
-      const candidates = Array.isArray(input.candidates)
+      const rawCandidates = Array.isArray(input.candidates)
         ? input.candidates
         : promotion.extractCandidates({
             sessionId: base.sessionId,
@@ -239,6 +253,7 @@ function createSessionFinalization({
             authority: input.authority || 'verified_summary',
             evidenceRefs,
           });
+      const candidates = decorateCandidates(rawCandidates, input);
 
       const memoryResults = candidates.length > 0
         ? await promotion.promote(candidates, {

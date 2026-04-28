@@ -4,6 +4,26 @@ All notable changes to `@shadowforge0/aquifer-memory` are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project uses semantic versioning.
 
+## [1.6.1] - 2026-04-28
+
+### Added
+
+- Current-memory projection helpers and producer inputs for Codex recovery,
+  handoff finalization, and timer consolidation.
+- Timer synthesis producer loop for operator workflows: compaction dry-runs can
+  emit a synthesis prompt, operator-reviewed synthesis JSON can be attached back
+  to the plan, and synthesized candidates still pass through the normal
+  candidate ledger / explicit promotion gate.
+- CLI flags for timer synthesis workflows: `--include-synthesis-prompt`,
+  `--synthesis-summary`, `--synthesis-summary-file`, and
+  `--promote-candidates`.
+
+### Changed
+
+- Compaction promotion review now reports synthesized candidate counts,
+  promotion gate state, source canonical keys, and promoted/quarantined/error
+  totals without treating synthesis output as active memory by default.
+
 ## [1.6.0] - 2026-04-28
 
 ### Added

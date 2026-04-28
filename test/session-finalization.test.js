@@ -131,6 +131,41 @@ describe('session finalization', () => {
     assert.ok(pool.queries.some(query => String(query.sql).includes('INSERT INTO "aq".finalization_candidates')));
   });
 
+  it('decorates promoted finalization candidates with producer payload metadata', async () => {
+    const pool = makeFinalizationPool();
+    const finalization = createSessionFinalization({
+      pool,
+      schema: 'aq',
+      recordsSchema: '"aq"',
+      defaultTenantId: 'default',
+    });
+
+    const result = await finalization.finalizeSession({
+      sessionId: 's1',
+      agentId: 'main',
+      source: 'codex',
+      transcriptHash: 'b'.repeat(64),
+      mode: 'handoff',
+      summaryText: 'Handoff synthesis output was reviewed.',
+      structuredSummary: {
+        states: [{ state: 'Handoff synthesis candidates must keep producer lineage.' }],
+      },
+      candidatePayload: {
+        kind: 'handoff_synthesis',
+        synthesisKind: 'handoff_current_memory_synthesis_v1',
+        promotionGate: 'core_finalization',
+      },
+    });
+
+    const memoryInsert = pool.queries.find(query => String(query.sql).includes('INSERT INTO "aq".memory_records'));
+    const payload = JSON.parse(memoryInsert.params[8]);
+    assert.equal(result.memoryResult.promoted, 1);
+    assert.equal(payload.kind, 'handoff_synthesis');
+    assert.equal(payload.synthesisKind, 'handoff_current_memory_synthesis_v1');
+    assert.equal(payload.promotionGate, 'core_finalization');
+    assert.equal(payload.state, 'Handoff synthesis candidates must keep producer lineage.');
+  });
+
   it('does not promote or rewrite terminal suppressed finalizations', async () => {
     const pool = makeFinalizationPool({ existingFinalizationStatus: 'declined' });
     const finalization = createSessionFinalization({

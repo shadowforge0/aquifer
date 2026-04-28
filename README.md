@@ -77,8 +77,14 @@ Keep `AQUIFER_MEMORY_SERVING_MODE=legacy` for first rollout. Switch to `curated`
 | Start the MCP server | `npx aquifer mcp` |
 | Search memory manually | `npx aquifer recall "auth middleware"` |
 | Plan curated memory compaction | `npx aquifer compact --cadence daily --period-start 2026-04-27T00:00:00Z --period-end 2026-04-28T00:00:00Z` |
+| Generate a timer synthesis prompt | `npx aquifer operator compaction daily --include-synthesis-prompt --json` |
+| Apply reviewed timer synthesis candidates | `npx aquifer operator compaction daily --synthesis-summary-file /tmp/timer-summary.json --apply --promote-candidates --json` |
 | Inspect storage health | `npx aquifer stats` |
 | Enrich pending sessions | `npx aquifer backfill` |
+
+Timer synthesis output is candidate material until an operator applies it with
+`--promote-candidates`; it does not become active curated memory from the
+prompt or summary file alone.
 
 Need LLM summarization, the knowledge graph, OpenAI embeddings, reranking, or operations details? See [docs/setup.md](docs/setup.md) and [Environment Variables](#environment-variables).
 

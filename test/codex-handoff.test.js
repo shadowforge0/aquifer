@@ -158,6 +158,14 @@ describe('Codex handoff finalization helper', () => {
     assert.doesNotMatch(prepared.prompt, /memoryId/);
   });
 
+  it('marks the handoff synthesis output schema for operator promotion', async () => {
+    const prepared = await handoff.prepareHandoffSynthesis({
+      memory: { async current() { return { memories: [], meta: { count: 0 } }; } },
+    }, samplePayload(), { view: sampleView() });
+
+    assert.equal(prepared.outputSchemaVersion, 'handoff_current_memory_synthesis_v1');
+  });
+
   it('rejects manual handoff finalization without a real transcript view', async () => {
     const calls = [];
     const aquifer = {
@@ -268,6 +276,81 @@ describe('Codex handoff finalization helper', () => {
     assert.equal(calls[0].metadata.currentMemory.memories[0].summary, 'Existing handoff current memory.');
     assert.equal(calls[0].metadata.currentMemory.memories[0].memoryId, undefined);
     assert.equal(calls[0].metadata.currentMemory.memories[0].evidenceRefs, undefined);
+  });
+
+  it('promotes explicit handoff synthesis output instead of raw handoff payload', async () => {
+    const calls = [];
+    const view = sampleView();
+    const synthesisSummary = {
+      summaryText: 'Reviewed handoff synthesis summary.',
+      structuredSummary: {
+        states: [{ state: 'Reviewed synthesis output should become the candidate source.' }],
+      },
+      candidates: [{
+        memoryType: 'state',
+        canonicalKey: 'state:project:aquifer:handoff-reviewed',
+        scopeKind: 'project',
+        scopeKey: 'project:aquifer',
+        title: 'Reviewed synthesis output should become the candidate source.',
+        summary: 'Reviewed synthesis output should become the candidate source.',
+        payload: { state: 'Reviewed synthesis output should become the candidate source.' },
+        authority: 'verified_summary',
+        evidenceRefs: [{ sourceKind: 'session_summary', sourceRef: view.sessionId, relationKind: 'primary' }],
+      }],
+    };
+    const aquifer = {
+      async getSession() {
+        return {
+          session_id: view.sessionId,
+          processing_status: 'pending',
+          msg_count: view.counts.safeMessageCount,
+          user_count: view.counts.userCount,
+          assistant_count: view.counts.assistantCount,
+          messages: {
+            normalized: view.messages,
+            metadata: { transcript_hash: view.transcriptHash },
+          },
+        };
+      },
+      finalization: {
+        async finalizeSession(input) {
+          calls.push(input);
+          return {
+            status: 'finalized',
+            finalization: { id: 45 },
+            summary: {
+              summaryText: input.summaryText,
+              structuredSummary: input.structuredSummary,
+            },
+            memoryResult: { candidates: input.candidates.length, promoted: input.candidates.length },
+            memoryResults: [],
+            humanReviewText: '已整理進 DB：reviewed handoff synthesis',
+            sessionStartText: '下一段只需要帶：\n- 狀態：reviewed handoff synthesis\n',
+          };
+        },
+      },
+    };
+
+    const result = await handoff.finalizeHandoff(aquifer, samplePayload({
+      summaryText: 'Raw handoff text must stay process metadata only.',
+      structuredSummary: {
+        states: [{ state: 'Raw handoff payload must not become the candidate source.' }],
+      },
+    }), {
+      view,
+      synthesisSummary,
+    });
+
+    assert.equal(result.status, 'finalized');
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].summaryText, 'Reviewed handoff synthesis summary.');
+    assert.equal(calls[0].structuredSummary, synthesisSummary.structuredSummary);
+    assert.equal(calls[0].authority, 'verified_summary');
+    assert.equal(calls[0].metadata.handoffSynthesis.kind, 'handoff_current_memory_synthesis_v1');
+    assert.equal(calls[0].candidatePayload.kind, 'handoff_synthesis');
+    assert.equal(calls[0].candidatePayload.synthesisKind, 'handoff_current_memory_synthesis_v1');
+    assert.equal(calls[0].candidates[0].canonicalKey, 'state:project:aquifer:handoff-reviewed');
+    assert.doesNotMatch(calls[0].summaryText, /Raw handoff/);
   });
 
   it('surfaces committed core review and SessionStart text for handoff parity', async () => {

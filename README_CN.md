@@ -111,6 +111,23 @@ Claude Code、Claude Desktop 或任何支持 MCP 的 client——放进 `.mcp.js
 
 第一轮 rollout 先保持 `AQUIFER_MEMORY_SERVING_MODE=legacy`。只有在你要让 `session_recall` 和 `session_bootstrap` 提供 active curated memory 时，才切到 `curated`；`evidence_recall` 会保留为显式 audit/debug 路径。要 rollback 只要把 env 或 config 切回 `legacy`。
 
+### Common commands
+
+| Goal | Command |
+|---|---|
+| Verify setup | `npx aquifer quickstart` |
+| Start the MCP server | `npx aquifer mcp` |
+| Search memory manually | `npx aquifer recall "auth middleware"` |
+| Plan curated memory compaction | `npx aquifer compact --cadence daily --period-start 2026-04-27T00:00:00Z --period-end 2026-04-28T00:00:00Z` |
+| Generate a timer synthesis prompt | `npx aquifer operator compaction daily --include-synthesis-prompt --json` |
+| Apply reviewed timer synthesis candidates | `npx aquifer operator compaction daily --synthesis-summary-file /tmp/timer-summary.json --apply --promote-candidates --json` |
+| Inspect storage health | `npx aquifer stats` |
+| Enrich pending sessions | `npx aquifer backfill` |
+
+Timer synthesis output is candidate material until an operator applies it with
+`--promote-candidates`; it does not become active curated memory from the
+prompt or summary file alone.
+
 需要 LLM 摘要、知识图谱、OpenAI embedding 或 reranker？往下看 [环境变量](#环境变量) 和 [docs/setup.md](docs/setup.md)。
 
 ---

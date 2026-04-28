@@ -83,8 +83,14 @@ For first rollout, keep `AQUIFER_MEMORY_SERVING_MODE=legacy`. Switch to `curated
 | Start MCP server | `npx aquifer mcp` |
 | Search memory | `npx aquifer recall "auth middleware"` |
 | Plan curated compaction | `npx aquifer compact --cadence daily --period-start 2026-04-27T00:00:00Z --period-end 2026-04-28T00:00:00Z` |
+| Generate a timer synthesis prompt | `npx aquifer operator compaction daily --include-synthesis-prompt --json` |
+| Apply reviewed timer synthesis candidates | `npx aquifer operator compaction daily --synthesis-summary-file /tmp/timer-summary.json --apply --promote-candidates --json` |
 | Show stats | `npx aquifer stats` |
 | Enrich pending sessions | `npx aquifer backfill` |
+
+Timer synthesis is an operator-reviewed candidate workflow. The prompt output
+and summary JSON do not become active curated memory unless the apply step is
+run with `--promote-candidates`.
 
 The default public serving mode is `legacy`. To test scoped curated memory serving, set `AQUIFER_MEMORY_SERVING_MODE=curated` plus `AQUIFER_MEMORY_ACTIVE_SCOPE_KEY` or `AQUIFER_MEMORY_ACTIVE_SCOPE_PATH`. Rollback is config-only: set the serving mode back to `legacy` and restart the MCP/CLI process.
 
