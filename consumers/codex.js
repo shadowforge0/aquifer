@@ -323,11 +323,10 @@ function matchesRecoveryProvenance(metadata = {}, opts = {}, defaults = {}) {
         repoPath: opts.repoPath || null,
     };
     for (const [key, expectedValue] of Object.entries(expected)) {
-        if (!expectedValue || !metadata[key]) continue;
+        if (!expectedValue) continue;
+        if (!metadata[key]) return false;
         if (String(metadata[key]) !== String(expectedValue)) return false;
     }
-    if (metadata.source && metadata.source !== expected.source) return false;
-    if (metadata.agentId && metadata.agentId !== expected.agentId) return false;
     return true;
 }
 
@@ -873,9 +872,18 @@ async function findRecoveryCandidates(aquifer, opts = {}) {
     const {
         agentId = 'main',
         source = 'codex',
+        sessionKey = null,
         maxRecoveryCandidates = 3,
         includeJsonlPreviews = false,
     } = opts;
+    const provenance = {
+        source,
+        agentId,
+        sessionKey,
+        workspace: opts.workspace || opts.workspacePath || null,
+        project: opts.project || opts.projectKey || null,
+        repoPath: opts.repoPath || null,
+    };
     if (!Number.isFinite(maxRecoveryCandidates) || maxRecoveryCandidates <= 0) return [];
     ensureDirs(paths.importedDir, paths.afterburnedDir, paths.claimDir, paths.decisionDir);
 
@@ -961,7 +969,7 @@ async function findRecoveryCandidates(aquifer, opts = {}) {
             transcriptHash: null,
             source,
             agentId,
-            sessionKey: null,
+            sessionKey,
             userCount: null,
             messageCount: null,
             finalizationStatus: null,
@@ -972,8 +980,7 @@ async function findRecoveryCandidates(aquifer, opts = {}) {
                 fileSessionId: safeFileSessionId,
                 size: entry.stat.size,
                 mtimeMs: entry.stat.mtimeMs,
-                source,
-                agentId,
+                ...provenance,
             },
         };
         const localDecision = readRecoveryDecision(paths, candidatePreview);

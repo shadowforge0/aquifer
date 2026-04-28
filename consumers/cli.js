@@ -611,6 +611,7 @@ Commands:
   stats                       Show database statistics
   export                      Export sessions as JSONL
   bootstrap                   Show recent session context (for new session start)
+  codex-recovery ...          Inspect or run Codex SessionStart recovery flow
    ingest-opencode             Import sessions from OpenCode's local SQLite DB
    mcp                         Start MCP server
 
@@ -660,6 +661,11 @@ Operator examples:
   const command = argv[0];
   const args = parseArgs(argv);
   let quickstartDetected = {};
+
+  if (command === 'codex-recovery') {
+    await require('../scripts/codex-recovery').main(argv.slice(1));
+    return;
+  }
 
   // MCP: delegate to mcp.js
   if (command === 'mcp') {

@@ -5,8 +5,10 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { spawnSync } = require('node:child_process');
 
 const recovery = require('../scripts/codex-recovery');
+const CLI_PATH = path.join(__dirname, '..', 'consumers', 'cli.js');
 
 function tmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'aquifer-codex-recovery-'));
@@ -323,5 +325,120 @@ describe('scripts/codex-recovery', () => {
     assert.match(output, /meta-previous/);
     assert.doesNotMatch(output, /meta-short/);
     assert.doesNotMatch(output, /rollout-current/);
+  });
+
+  it('doctor verifies wrapper preflight without printing transcript text', async () => {
+    const root = tmpDir();
+    const sessionsDir = path.join(root, 'sessions');
+    const stateDir = path.join(root, 'state');
+    const previous = path.join(sessionsDir, 'rollout-previous.jsonl');
+    const current = path.join(sessionsDir, 'rollout-current.jsonl');
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    fs.writeFileSync(previous, [
+      '{"type":"session_meta","payload":{"id":"meta-previous"}}',
+      '{"type":"event_msg","payload":{"type":"user_message","message":"private user transcript"}}',
+      '{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"private assistant transcript"}]}}',
+      '{"type":"event_msg","payload":{"type":"user_message","message":"u2"}}',
+      '{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"a2"}]}}',
+      '{"type":"event_msg","payload":{"type":"user_message","message":"u3"}}',
+      '{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"a3"}]}}',
+    ].join('\n') + '\n', 'utf8');
+    fs.writeFileSync(current, '{"type":"session_meta","payload":{"id":"meta-current"}}\n', 'utf8');
+    const now = Date.now();
+    fs.utimesSync(previous, new Date(now - 1000), new Date(now - 1000));
+    fs.utimesSync(current, new Date(now), new Date(now));
+
+    const output = await captureConsoleLog(() => recovery.cmdDoctor({}, {}, {
+      sessionsDir,
+      stateDir,
+      minSessionBytes: 1,
+      excludeNewest: true,
+      agentId: 'main',
+      source: 'codex-wrapper',
+      sessionKey: 'codex:wrapper:run',
+      maxRecoveryCandidates: 3,
+    }, {
+      CODEX_AQUIFER_SOURCE: 'codex-wrapper',
+      CODEX_AQUIFER_SESSION_KEY: 'codex:wrapper:run',
+    }));
+
+    assert.match(output, /Codex recovery doctor: ok/);
+    assert.match(output, /wrapper_env/);
+    assert.match(output, /current_transcript_guard/);
+    assert.match(output, /eligibleCandidates=1/);
+    assert.doesNotMatch(output, /private user transcript/);
+    assert.doesNotMatch(output, /private assistant transcript/);
+    assert.doesNotMatch(output, /meta-current/);
+  });
+
+  it('doctor can fail strict wrapper checks before live deployment', async () => {
+    const report = await recovery.buildDoctorReport({}, {
+      sessionsDir: path.join(tmpDir(), 'sessions'),
+      stateDir: path.join(tmpDir(), 'state'),
+      strictWrapperEnv: true,
+      excludeNewest: false,
+    }, {});
+
+    assert.equal(report.status, 'fail');
+    assert.ok(report.checks.some(check => check.name === 'wrapper_env' && check.status === 'fail'));
+    assert.ok(report.checks.some(check => check.name === 'current_transcript_guard' && check.status === 'fail'));
+  });
+
+  it('doctor reports Aquifer init failures as structured checks', async () => {
+    let report;
+    const previousExitCode = process.exitCode;
+    await captureConsoleLog(async () => {
+      report = await recovery.cmdDoctorInitFailure({}, {
+        sessionsDir: path.join(tmpDir(), 'sessions'),
+        stateDir: path.join(tmpDir(), 'state'),
+        strictWrapperEnv: true,
+      }, new Error('Database URL is required'), {
+        CODEX_AQUIFER_SOURCE: 'codex-wrapper',
+      });
+    });
+    process.exitCode = previousExitCode;
+
+    assert.equal(report.status, 'fail');
+    assert.ok(report.checks.some(check => check.name === 'aquifer_init' && check.status === 'fail'));
+    assert.ok(report.checks.some(check => check.name === 'wrapper_env' && check.status === 'ok'));
+  });
+
+  it('public CLI delegates codex-recovery doctor as structured JSON', () => {
+    const root = tmpDir();
+    const result = spawnSync('node', [
+      CLI_PATH,
+      'codex-recovery',
+      'doctor',
+      '--json',
+      '--strict-wrapper-env',
+      '--sessions-dir',
+      path.join(root, 'sessions'),
+      '--state-dir',
+      path.join(root, 'state'),
+    ], {
+      env: {
+        ...process.env,
+        AQUIFER_CONFIG: '/dev/null',
+        AQUIFER_DB_URL: '',
+        DATABASE_URL: '',
+        CODEX_AQUIFER_SOURCE: 'codex-wrapper',
+        CODEX_AQUIFER_SESSION_KEY: 'codex:wrapper:run',
+      },
+      encoding: 'utf8',
+    });
+
+    assert.equal(result.status, 0);
+    const payload = JSON.parse(result.stdout);
+    assert.ok(['ok', 'warn'].includes(payload.status));
+    assert.ok(payload.checks.some(check => check.name === 'wrapper_env' && check.status === 'ok'));
+    assert.ok(payload.checks.some(check => check.name === 'current_transcript_guard' && check.status === 'ok'));
+    assert.equal(result.stderr, '');
+  });
+
+  it('public CLI help lists codex-recovery', () => {
+    const result = spawnSync('node', [CLI_PATH, '--help'], { encoding: 'utf8' });
+
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /codex-recovery/);
   });
 });

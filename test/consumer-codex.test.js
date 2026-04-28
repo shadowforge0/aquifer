@@ -665,6 +665,82 @@ describe('Codex consumer recovery helpers', () => {
         assert.deepEqual(candidates.map(c => c.sessionId), ['meta-main']);
     });
 
+    it('filters recovery markers with mismatched sessionKey and workspace provenance', async () => {
+        const root = tmpDir();
+        const stateDir = path.join(root, 'state');
+        const importedDir = path.join(stateDir, 'codex-sessions-imported');
+        writeImportedMarker(importedDir, 'meta-current', {
+            transcriptHash: 'a'.repeat(64),
+            filePath: path.join(root, 'current.jsonl'),
+            source: 'codex',
+            agentId: 'main',
+            sessionKey: 'codex:current',
+            workspace: '/workspace/current',
+        });
+        writeImportedMarker(importedDir, 'meta-other-session', {
+            transcriptHash: 'b'.repeat(64),
+            filePath: path.join(root, 'other-session.jsonl'),
+            source: 'codex',
+            agentId: 'main',
+            sessionKey: 'codex:other',
+            workspace: '/workspace/current',
+        });
+        writeImportedMarker(importedDir, 'meta-other-workspace', {
+            transcriptHash: 'c'.repeat(64),
+            filePath: path.join(root, 'other-workspace.jsonl'),
+            source: 'codex',
+            agentId: 'main',
+            sessionKey: 'codex:current',
+            workspace: '/workspace/other',
+        });
+
+        const candidates = await codex.findRecoveryCandidates(makeFakeAquifer(), {
+            stateDir,
+            sessionsDir: path.join(root, 'sessions'),
+            agentId: 'main',
+            source: 'codex',
+            sessionKey: 'codex:current',
+            workspace: '/workspace/current',
+        });
+
+        assert.deepEqual(candidates.map(c => c.sessionId), ['meta-current']);
+    });
+
+    it('attaches wrapper provenance to JSONL preview recovery candidates', async () => {
+        const root = tmpDir();
+        const sessionsDir = path.join(root, 'sessions');
+        const stateDir = path.join(root, 'state');
+        fs.mkdirSync(sessionsDir, { recursive: true });
+        writeJsonl(path.join(sessionsDir, 'rollout-preview.jsonl'), [
+            sessionMeta('meta-preview'),
+            user('u1'),
+            assistant('a1'),
+            user('u2'),
+            assistant('a2'),
+            user('u3'),
+            assistant('a3'),
+        ]);
+
+        const candidates = await codex.findDbEligibleRecoveryCandidates(makeFakeAquifer(), {
+            stateDir,
+            sessionsDir,
+            includeJsonlPreviews: true,
+            minSessionBytes: 1,
+            idleMs: 0,
+            excludeNewest: false,
+            source: 'codex-wrapper',
+            agentId: 'main',
+            sessionKey: 'codex:wrapper:run',
+            workspace: '/workspace/current',
+            maxRecoveryCandidates: 3,
+        });
+
+        assert.equal(candidates.length, 1);
+        assert.equal(candidates[0].source, 'codex-wrapper');
+        assert.equal(candidates[0].sessionKey, 'codex:wrapper:run');
+        assert.equal(candidates[0].metadata.workspace, '/workspace/current');
+    });
+
     it('prepares an agent prompt after consent and finalizes through core without enrich', async () => {
         const root = tmpDir();
         const file = path.join(root, 'rollout-finalize.jsonl');

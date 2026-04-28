@@ -36,6 +36,11 @@ const VALUE_FLAGS = new Set([
   'summary-json',
   'summary-text',
   'verdict',
+  'workspace',
+  'workspace-path',
+  'project',
+  'project-key',
+  'repo-path',
 ]);
 
 function parseArgs(argv) {
@@ -109,6 +114,9 @@ function buildRecoveryOptions(flags = {}, env = process.env) {
     agentId: flags['agent-id'] || envDefault(env, 'CODEX_AQUIFER_AGENT_ID', 'AQUIFER_AGENT_ID') || 'main',
     source: flags.source || envDefault(env, 'CODEX_AQUIFER_SOURCE', 'AQUIFER_SOURCE') || 'codex',
     sessionKey: flags['session-key'] || envDefault(env, 'CODEX_AQUIFER_SESSION_KEY') || 'codex:cli',
+    workspace: flags.workspace || flags['workspace-path'] || envDefault(env, 'CODEX_AQUIFER_WORKSPACE', 'CODEX_WORKSPACE') || undefined,
+    project: flags.project || flags['project-key'] || envDefault(env, 'CODEX_AQUIFER_PROJECT', 'CODEX_PROJECT') || undefined,
+    repoPath: flags['repo-path'] || envDefault(env, 'CODEX_AQUIFER_REPO_PATH', 'CODEX_REPO_PATH') || undefined,
     codexHome: flags['codex-home'] || envDefault(env, 'CODEX_HOME') || undefined,
     stateDir: flags['state-dir'] || undefined,
     sessionsDir: flags['sessions-dir'] || undefined,
@@ -122,11 +130,16 @@ function buildRecoveryOptions(flags = {}, env = process.env) {
     includeJsonlPreviews: flags['include-jsonl-previews'] === true,
     includeDeferredRecovery: flags['include-deferred'] === true,
     excludeNewest: flags['include-current'] === true ? false : true,
+    strictWrapperEnv: flags['strict-wrapper-env'] === true,
   };
   for (const [key, value] of Object.entries(opts)) {
     if (value === undefined) delete opts[key];
   }
   return opts;
+}
+
+function addDoctorCheck(checks, name, status, detail, extra = {}) {
+  checks.push({ name, status, detail, ...extra });
 }
 
 function shellQuote(value) {
@@ -263,6 +276,81 @@ function compactCandidate(candidate = {}) {
     finalizationStatus: candidate.finalizationStatus || null,
     recoveryDecisionStatus: candidate.recoveryDecisionStatus || null,
     updatedAt: candidate.updatedAt || null,
+  };
+}
+
+function compactDoctorOptions(opts = {}) {
+  return {
+    agentId: opts.agentId || 'main',
+    source: opts.source || 'codex',
+    sessionKey: opts.sessionKey || 'codex:cli',
+    workspace: opts.workspace || null,
+    project: opts.project || null,
+    repoPath: opts.repoPath || null,
+    codexHome: opts.codexHome || null,
+    sessionsDir: opts.sessionsDir || null,
+    stateDir: opts.stateDir || null,
+    excludeNewest: opts.excludeNewest !== false,
+    includeDeferredRecovery: opts.includeDeferredRecovery === true,
+    maxRecoveryCandidates: opts.maxRecoveryCandidates || null,
+  };
+}
+
+async function buildDoctorReport(aquifer, opts = {}, env = process.env) {
+  const checks = [];
+  const hasWrapperEnv = Boolean(
+    env.CODEX_AQUIFER_AGENT_ID
+      || env.CODEX_AQUIFER_SOURCE
+      || env.CODEX_AQUIFER_SESSION_KEY
+      || env.CODEX_HOME
+      || env.CODEX_ENV_PATH,
+  );
+  if (hasWrapperEnv) {
+    addDoctorCheck(checks, 'wrapper_env', 'ok', 'Codex wrapper env is present.');
+  } else if (opts.strictWrapperEnv) {
+    addDoctorCheck(checks, 'wrapper_env', 'fail', 'Strict wrapper env requested, but no CODEX_AQUIFER_* or CODEX_HOME env was found.');
+  } else {
+    addDoctorCheck(checks, 'wrapper_env', 'warn', 'Using CLI defaults; pass --strict-wrapper-env for live wrapper deployment checks.');
+  }
+
+  if (opts.excludeNewest === false) {
+    addDoctorCheck(checks, 'current_transcript_guard', 'fail', 'Current/newest transcript exclusion is disabled.');
+  } else {
+    addDoctorCheck(checks, 'current_transcript_guard', 'ok', 'Newest transcript exclusion is enabled.');
+  }
+
+  let candidates = [];
+  try {
+    candidates = await listDbEligibleCandidates(aquifer, {
+      ...opts,
+      idleMs: opts.idleMs ?? 0,
+      includeJsonlPreviews: true,
+      maxRecoveryCandidates: opts.maxRecoveryCandidates || 1,
+    });
+    addDoctorCheck(
+      checks,
+      'sessionstart_preflight',
+      'ok',
+      `Metadata-only recovery scan completed; eligibleCandidates=${candidates.length}.`,
+      { eligibleCandidates: candidates.length },
+    );
+  } catch (err) {
+    addDoctorCheck(
+      checks,
+      'sessionstart_preflight',
+      'fail',
+      err && err.message ? err.message : String(err),
+    );
+  }
+
+  const status = checks.some(check => check.status === 'fail')
+    ? 'fail'
+    : checks.some(check => check.status === 'warn') ? 'warn' : 'ok';
+  return {
+    status,
+    checks,
+    options: compactDoctorOptions(opts),
+    candidates: candidates.map(compactCandidate),
   };
 }
 
@@ -467,6 +555,42 @@ async function cmdDecision(aquifer, flags, opts) {
   console.log(`Recovery ${verdict}: ${candidate.sessionId}`);
 }
 
+async function cmdDoctor(aquifer, flags, opts, env = process.env) {
+  const report = await buildDoctorReport(aquifer, opts, env);
+  printDoctorReport(report, flags);
+  return report;
+}
+
+function printDoctorReport(report = {}, flags = {}) {
+  if (flags.json) {
+    console.log(JSON.stringify(report, null, 2));
+  } else {
+    console.log(`Codex recovery doctor: ${report.status}`);
+    for (const check of report.checks || []) {
+      console.log(`- ${check.status} ${check.name}: ${check.detail}`);
+    }
+  }
+  if (report.status === 'fail') process.exitCode = 1;
+}
+
+async function cmdDoctorInitFailure(flags, opts, err, env = process.env) {
+  let report = await buildDoctorReport(null, opts, env);
+  report = {
+    ...report,
+    status: 'fail',
+    checks: [
+      {
+        name: 'aquifer_init',
+        status: 'fail',
+        detail: err && err.message ? err.message : String(err),
+      },
+      ...(report.checks || []),
+    ],
+  };
+  printDoctorReport(report, flags);
+  return report;
+}
+
 async function main(argv = process.argv.slice(2)) {
   const args = parseArgs(argv);
   const command = args._[0] || 'help';
@@ -480,7 +604,19 @@ async function main(argv = process.argv.slice(2)) {
   node scripts/codex-recovery.js prompt --session-id ID [options]
   node scripts/codex-recovery.js finalize --session-id ID --summary-stdin [options]
   node scripts/codex-recovery.js decision --session-id ID --verdict declined|deferred [options]
-  node scripts/codex-recovery.js decision --all --verdict declined|deferred [options]`);
+  node scripts/codex-recovery.js decision --all --verdict declined|deferred [options]
+  node scripts/codex-recovery.js doctor [--strict-wrapper-env] [--json]`);
+    return;
+  }
+
+  if (command === 'doctor') {
+    try {
+      await withAquifer(async (aquifer) => {
+        await cmdDoctor(aquifer, args.flags, opts);
+      });
+    } catch (err) {
+      await cmdDoctorInitFailure(args.flags, opts, err);
+    }
     return;
   }
 
@@ -508,12 +644,16 @@ async function main(argv = process.argv.slice(2)) {
 }
 
 module.exports = {
+  buildDoctorReport,
   buildRecoveryOptions,
   cmdDecision,
+  cmdDoctor,
+  cmdDoctorInitFailure,
   cmdFinalize,
   cmdHookContext,
   cmdPrompt,
   loadCodexEnv,
+  main,
   parseArgs,
   renderFinalizeCommand,
   renderHookContext,
