@@ -4,7 +4,7 @@ All notable changes to `@shadowforge0/aquifer-memory` are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project uses semantic versioning.
 
-## [1.6.1] - 2026-04-28
+## [1.7.0] - 2026-04-29
 
 ### Added
 
