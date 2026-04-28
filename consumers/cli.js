@@ -51,6 +51,38 @@ function parseCsvList(value) {
   return parts.length > 0 ? parts : undefined;
 }
 
+function readJsonFlagValue(value, label) {
+  if (!value || value === true) {
+    throw new Error(`${label} requires a JSON value`);
+  }
+  try {
+    return JSON.parse(String(value));
+  } catch (err) {
+    throw new Error(`${label} must be valid JSON: ${err.message}`);
+  }
+}
+
+function readJsonFlagFile(filePath, label) {
+  if (!filePath || filePath === true) {
+    throw new Error(`${label} requires a file path`);
+  }
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch (err) {
+    throw new Error(`${label} must point to valid JSON: ${err.message}`);
+  }
+}
+
+function readSynthesisSummaryFromFlags(flags = {}) {
+  if (flags['synthesis-summary-file']) {
+    return readJsonFlagFile(flags['synthesis-summary-file'], '--synthesis-summary-file');
+  }
+  if (flags['synthesis-summary']) {
+    return readJsonFlagValue(flags['synthesis-summary'], '--synthesis-summary');
+  }
+  return undefined;
+}
+
 function hasQuickstartEmbedConfig(env) {
   return !!(
     env.EMBED_PROVIDER
@@ -145,6 +177,7 @@ function parseArgs(argv) {
     'out', 'active-scope-key', 'active-scope-path', 'cadence', 'period-start', 'period-end',
     'policy-version', 'worker-id', 'apply-token', 'claim-lease-seconds', 'snapshot-as-of',
     'scope-key', 'scope-keys', 'scope-kind', 'context-key', 'topic-key', 'authority', 'input',
+    'synthesis-summary', 'synthesis-summary-file',
   ]);
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--') { args._.push(...argv.slice(i + 1)); break; }
@@ -518,6 +551,7 @@ async function cmdOperator(aquifer, args) {
   const cadence = args.flags.cadence
     || (cadenceVerbs.has(operatorVerb) ? operatorVerb : args._[2])
     || 'manual';
+  const synthesisSummary = readSynthesisSummaryFromFlags(args.flags);
   const result = await aquifer.memory.consolidation.runJob({
     job: 'compaction',
     cadence,
@@ -531,8 +565,17 @@ async function cmdOperator(aquifer, args) {
       : undefined,
     snapshotAsOf: args.flags['snapshot-as-of'] || undefined,
     scopeKeys: parseCsvList(args.flags['scope-keys'] || args.flags['scope-key']),
+    scopeKind: args.flags['scope-kind'] || undefined,
+    scopeKey: args.flags['scope-key'] || undefined,
+    contextKey: args.flags['context-key'] || undefined,
+    topicKey: args.flags['topic-key'] || undefined,
+    activeScopeKey: args.flags['active-scope-key'] || undefined,
+    activeScopePath: parseScopePath(args.flags['active-scope-path']),
     limit: parsePositiveInt(args.flags.limit, 1000),
     apply: args.flags.apply === true,
+    promoteCandidates: args.flags['promote-candidates'] === true,
+    includeSynthesisPrompt: args.flags['include-synthesis-prompt'] === true,
+    synthesisSummary,
   });
 
   if (args.flags.json) {
@@ -542,7 +585,14 @@ async function cmdOperator(aquifer, args) {
 
   console.log(`${result.dryRun ? 'Planned' : 'Executed'} ${result.cadence} compaction window ${result.periodStart} -> ${result.periodEnd}`);
   console.log(`Snapshot: ${result.snapshotCount} active rows${result.snapshotTruncated ? ' (snapshot limit reached)' : ''}`);
-  console.log(`Plan: ${result.plan.statusUpdates.length} lifecycle updates, ${result.plan.candidates.length} aggregate candidates`);
+  console.log(`Plan: ${result.plan.statusUpdates.length} lifecycle updates, ${result.plan.candidates.length} candidates`);
+  if (result.synthesisPrompt) {
+    console.log('\nSynthesis prompt:\n');
+    console.log(result.synthesisPrompt);
+  }
+  if (result.promotionReview) {
+    console.log(`\n${result.promotionReview}`);
+  }
   if (result.dryRun) {
     console.log('Mode: dry-run only. Re-run with --apply to write compaction_runs and lifecycle changes.');
     return;
@@ -643,7 +693,12 @@ Options:
   --period-start ISO          Compaction window start
   --period-end ISO            Compaction window end
   --apply                     Apply compaction; default is dry-run
+  --promote-candidates        Promote compaction/synthesis candidates when applying
+  --include-synthesis-prompt  Include timer synthesis prompt in operator output
+  --synthesis-summary JSON    Timer synthesis summary JSON to attach to a compaction plan
+  --synthesis-summary-file P  Read timer synthesis summary JSON from file
   --scope-key A,B             Limit compaction snapshot to specific scope keys
+  --scope-kind KIND           Explicit synthesis target scope kind
   --snapshot-as-of ISO        Read active snapshot as of a specific instant
   --claim-lease-seconds N     Override compaction apply lease
   --input PATH                Archive distill input JSON path
@@ -653,7 +708,9 @@ Options:
 
 Operator examples:
   aquifer operator compaction daily --json
+  aquifer operator compaction daily --include-synthesis-prompt --json
   aquifer operator compaction manual --period-start 2026-04-27T00:00:00Z --period-end 2026-04-28T00:00:00Z --apply
+  aquifer operator compaction daily --synthesis-summary-file /tmp/timer-summary.json --apply --promote-candidates --json
   aquifer operator archive-distill --input /tmp/archive-snapshot.json --json`);
     process.exit(0);
   }
@@ -778,7 +835,11 @@ Operator examples:
 }
 
 // Export for testing; execute only when run directly
-module.exports = { parseArgs };
+module.exports = {
+  parseArgs,
+  cmdOperator,
+  readSynthesisSummaryFromFlags,
+};
 
 if (require.main === module) {
   main().catch(err => {

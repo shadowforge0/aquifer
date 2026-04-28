@@ -3,6 +3,7 @@
 const crypto = require('crypto');
 const { extractCandidatesFromStructuredSummary, createMemoryPromotion } = require('./memory-promotion');
 const { createMemoryRecords } = require('./memory-records');
+const { sanitizeSummaryResult } = require('./memory-safety-gate');
 
 const ALLOWED_CADENCES = new Set(['session', 'daily', 'weekly', 'monthly', 'manual']);
 const OPERATOR_CADENCES = new Set(['manual', 'daily', 'weekly', 'monthly']);
@@ -432,6 +433,190 @@ function buildTimerSynthesisPrompt(plan = {}, opts = {}) {
     stableJson(synthesisInput),
     '</timer_synthesis_input>',
   ].join('\n');
+}
+
+function normalizeTimerSynthesisSummary(input = {}) {
+  const raw = input && typeof input === 'object'
+    ? {
+        summaryText: input.summaryText || input.summary || '',
+        structuredSummary: input.structuredSummary || input.structured_summary || {},
+      }
+    : {
+        summaryText: '',
+        structuredSummary: {},
+      };
+  const sanitized = sanitizeSummaryResult(raw);
+  return {
+    summary: sanitized.summaryResult || raw,
+    safetyGate: sanitized.meta || {},
+  };
+}
+
+function inferTimerSynthesisScope(synthesisInput = {}, opts = {}) {
+  if (opts.scopeKind && opts.scopeKey) {
+    return {
+      scopeKind: opts.scopeKind,
+      scopeKey: opts.scopeKey,
+      contextKey: opts.contextKey || null,
+      topicKey: opts.topicKey || null,
+    };
+  }
+  const scoped = new Map();
+  for (const row of synthesisInput.sourceCurrentMemory || []) {
+    const scopeKind = row.scopeKind || 'unspecified';
+    const scopeKey = row.scopeKey || 'unspecified';
+    const contextKey = row.contextKey || null;
+    const topicKey = row.topicKey || null;
+    scoped.set(stableJson({ scopeKind, scopeKey, contextKey, topicKey }), {
+      scopeKind,
+      scopeKey,
+      contextKey,
+      topicKey,
+    });
+  }
+  if (scoped.size === 1) return [...scoped.values()][0];
+  if (scoped.size === 0 && opts.activeScopeKey) {
+    return {
+      scopeKind: opts.activeScopeKind || 'project',
+      scopeKey: opts.activeScopeKey,
+      contextKey: opts.contextKey || null,
+      topicKey: opts.topicKey || null,
+    };
+  }
+  throw new Error('memory.consolidation.timer_synthesis requires scopeKind/scopeKey for multi-scope synthesis');
+}
+
+function sourceLineageFromSynthesisInput(synthesisInput = {}) {
+  const rows = Array.isArray(synthesisInput.sourceCurrentMemory) ? synthesisInput.sourceCurrentMemory : [];
+  const pairs = rows
+    .map(row => ({
+      id: Number(row.memoryId),
+      key: String(row.canonicalKey || '').trim(),
+    }))
+    .filter(row => Number.isSafeInteger(row.id) && row.id > 0 && row.key);
+  pairs.sort((a, b) => {
+    if (a.key !== b.key) return a.key.localeCompare(b.key);
+    return a.id - b.id;
+  });
+  return {
+    sourceMemoryIds: pairs.map(row => row.id),
+    sourceCanonicalKeys: pairs.map(row => row.key),
+  };
+}
+
+function buildTimerSynthesisCandidates(plan = {}, synthesisSummary = {}, opts = {}) {
+  const synthesisInput = plan.synthesisInput || plan.meta?.synthesisInput || null;
+  if (!synthesisInput) {
+    throw new Error('memory.consolidation.timer_synthesis requires a timer synthesisInput');
+  }
+  const { summary, safetyGate } = normalizeTimerSynthesisSummary(synthesisSummary);
+  const structuredSummary = summary.structuredSummary || {};
+  const scope = inferTimerSynthesisScope(synthesisInput, opts);
+  const lineage = sourceLineageFromSynthesisInput(synthesisInput);
+  const synthesisHash = hashSnapshot({
+    summary,
+    lineage,
+    cadence: plan.cadence,
+    periodStart: canonicalInstant(plan.periodStart),
+    periodEnd: canonicalInstant(plan.periodEnd),
+    policyVersion: plan.policyVersion || 'v1',
+  });
+  const evidenceRefs = [{
+    sourceKind: 'external',
+    sourceRef: `timer_synthesis:${synthesisHash}`,
+    relationKind: 'derived_from',
+    metadata: {
+      cadence: plan.cadence,
+      periodStart: canonicalInstant(plan.periodStart),
+      periodEnd: canonicalInstant(plan.periodEnd),
+      policyVersion: plan.policyVersion || 'v1',
+      sourceCanonicalKeys: lineage.sourceCanonicalKeys,
+    },
+  }];
+  const extracted = extractCandidatesFromStructuredSummary({
+    structuredSummary,
+    scopeKind: scope.scopeKind,
+    scopeKey: scope.scopeKey,
+    contextKey: scope.contextKey,
+    topicKey: scope.topicKey,
+    subject: opts.subject || `timer:${plan.cadence || 'manual'}`,
+    authority: opts.authority || 'verified_summary',
+    evidenceRefs,
+  });
+  const candidates = extracted.map((candidate, index) => ({
+    ...candidate,
+    candidateHash: hashSnapshot({
+      synthesisHash,
+      index,
+      canonicalKey: candidate.canonicalKey,
+      summary: candidate.summary,
+    }),
+    payload: {
+      ...(candidate.payload || {}),
+      kind: 'timer_synthesis',
+      synthesisKind: synthesisInput.kind || 'timer_current_memory_synthesis_v1',
+      currentMemoryRole: `${plan.cadence || 'manual'}_timer_synthesis_candidate`,
+      promotionGate: 'operator_required',
+      cadence: plan.cadence,
+      policyVersion: plan.policyVersion || 'v1',
+      periodStart: canonicalInstant(plan.periodStart),
+      periodEnd: canonicalInstant(plan.periodEnd),
+      synthesisHash,
+      sourceMemoryIds: lineage.sourceMemoryIds,
+      sourceCanonicalKeys: lineage.sourceCanonicalKeys,
+      safetyGate,
+    },
+  }));
+
+  return {
+    summary,
+    safetyGate,
+    synthesisHash,
+    candidates,
+    sourceMemoryIds: lineage.sourceMemoryIds,
+    sourceCanonicalKeys: lineage.sourceCanonicalKeys,
+  };
+}
+
+function attachTimerSynthesis(plan = {}, synthesisSummary = {}, opts = {}) {
+  const synthesis = buildTimerSynthesisCandidates(plan, synthesisSummary, opts);
+  const includeAggregateCandidates = opts.includeAggregateCandidates === true;
+  const candidates = includeAggregateCandidates
+    ? [...(Array.isArray(plan.candidates) ? plan.candidates : []), ...synthesis.candidates]
+    : synthesis.candidates;
+  const outputCoverage = {
+    ...(plan.outputCoverage || plan.meta?.outputCoverage || {}),
+    candidateCount: candidates.length,
+    synthesizedCandidateCount: synthesis.candidates.length,
+  };
+  const inputHash = hashSnapshot({
+    baseInputHash: plan.inputHash,
+    synthesisHash: synthesis.synthesisHash,
+    candidateHashes: candidates.map(candidate => candidate.candidateHash || hashSnapshot(candidate)),
+  });
+  return {
+    ...plan,
+    inputHash,
+    candidates,
+    synthesisResult: {
+      summary: synthesis.summary,
+      safetyGate: synthesis.safetyGate,
+      synthesisHash: synthesis.synthesisHash,
+      candidateCount: synthesis.candidates.length,
+      sourceMemoryIds: synthesis.sourceMemoryIds,
+      sourceCanonicalKeys: synthesis.sourceCanonicalKeys,
+    },
+    outputCoverage,
+    meta: {
+      ...(plan.meta || {}),
+      outputCoverage,
+      synthesisResult: {
+        synthesisHash: synthesis.synthesisHash,
+        candidateCount: synthesis.candidates.length,
+        safetyGate: synthesis.safetyGate,
+      },
+    },
+  };
 }
 
 function buildPromotionReview(input = {}, opts = {}) {
@@ -1303,20 +1488,27 @@ function createMemoryConsolidation({ pool, schema, defaultTenantId, records = nu
       periodEnd: window.periodEnd,
       policyVersion: input.policyVersion || 'v1',
     });
+    const synthesisSummary = input.synthesisSummary || input.timerSynthesisSummary || null;
+    const effectivePlan = synthesisSummary
+      ? attachTimerSynthesis(plan, synthesisSummary, {
+          ...input,
+          tenantId,
+        })
+      : plan;
 
     if (input.apply !== true) {
       return {
         job,
         status: 'planned',
         dryRun: true,
-        plan,
-        synthesisPrompt: input.includeSynthesisPrompt === true && plan.synthesisInput
-          ? buildTimerSynthesisPrompt(plan, input)
+        plan: effectivePlan,
+        synthesisPrompt: input.includeSynthesisPrompt === true && effectivePlan.synthesisInput
+          ? buildTimerSynthesisPrompt(effectivePlan, input)
           : undefined,
-        promotionReview: buildPromotionReview({ plan }),
-        cadence: plan.cadence,
-        periodStart: plan.periodStart,
-        periodEnd: plan.periodEnd,
+        promotionReview: buildPromotionReview({ plan: effectivePlan }),
+        cadence: effectivePlan.cadence,
+        periodStart: effectivePlan.periodStart,
+        periodEnd: effectivePlan.periodEnd,
         snapshotCount: snapshot.rows.length,
         snapshotLimit: snapshot.snapshotLimit,
         snapshotTruncated: snapshot.snapshotTruncated,
@@ -1327,7 +1519,7 @@ function createMemoryConsolidation({ pool, schema, defaultTenantId, records = nu
 
     const result = input.promoteCandidates === true
       ? await executePlan({
-          plan,
+          plan: effectivePlan,
           tenantId,
           workerId: input.workerId,
           applyToken: input.applyToken,
@@ -1337,7 +1529,7 @@ function createMemoryConsolidation({ pool, schema, defaultTenantId, records = nu
           reclaimStaleClaims: input.reclaimStaleClaims,
         })
       : await applyPlan({
-          plan,
+          plan: effectivePlan,
           tenantId,
           workerId: input.workerId,
           applyToken: input.applyToken,
@@ -1345,27 +1537,27 @@ function createMemoryConsolidation({ pool, schema, defaultTenantId, records = nu
           claimLeaseSeconds: input.claimLeaseSeconds,
           reclaimStaleClaims: input.reclaimStaleClaims,
         });
-    const existingRun = result.run || await findExistingRun({ tenantId, plan });
+    const existingRun = result.run || await findExistingRun({ tenantId, plan: effectivePlan });
     return {
       ...result,
       job,
       dryRun: false,
       promotionReview: buildPromotionReview({
-        plan,
+        plan: effectivePlan,
         promotionResult: result.promotionResult,
         applyResult: result.applyResult,
         promoteCandidates: input.promoteCandidates === true,
       }),
-      cadence: plan.cadence,
-      periodStart: plan.periodStart,
-      periodEnd: plan.periodEnd,
+      cadence: effectivePlan.cadence,
+      periodStart: effectivePlan.periodStart,
+      periodEnd: effectivePlan.periodEnd,
       snapshotCount: snapshot.rows.length,
       snapshotLimit: snapshot.snapshotLimit,
       snapshotTruncated: snapshot.snapshotTruncated,
       snapshotAsOf: snapshot.snapshotAsOf,
       scopeKeys: snapshot.scopeKeys,
       existingRun,
-      skipReason: result.run ? null : classifySkippedRun(existingRun, plan),
+      skipReason: result.run ? null : classifySkippedRun(existingRun, effectivePlan),
     };
   }
 
@@ -1390,6 +1582,8 @@ module.exports = {
   planCompaction,
   buildTimerSynthesisInput,
   buildTimerSynthesisPrompt,
+  buildTimerSynthesisCandidates,
+  attachTimerSynthesis,
   buildPromotionReview,
   distillArchiveSnapshot,
   createMemoryConsolidation,

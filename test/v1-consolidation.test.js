@@ -6,6 +6,7 @@ const {
   planCompaction,
   buildTimerSynthesisInput,
   buildTimerSynthesisPrompt,
+  attachTimerSynthesis,
   buildPromotionReview,
   distillArchiveSnapshot,
   resolveOperatorWindow,
@@ -311,6 +312,86 @@ describe('v1 consolidation and old DB boundary', () => {
     assert.match(prompt, /Timer prompt source current memory/);
     assert.match(prompt, /Promotion still requires the normal operator promotion gate/);
     assert.doesNotMatch(prompt, /Incorrect memory must not enter timer prompt/);
+  });
+
+  it('attaches timer synthesis output as promoted candidates with source lineage and a new input hash', () => {
+    const plan = planCompaction([
+      {
+        id: 11,
+        memoryType: 'decision',
+        canonicalKey: 'decision:timer:source',
+        status: 'active',
+        scopeKind: 'project',
+        scopeKey: 'project:aquifer',
+        summary: 'Timer synthesis source memory.',
+      },
+    ], {
+      tenantId: 'tenant-a',
+      cadence: 'daily',
+      periodStart: '2026-04-27T00:00:00Z',
+      periodEnd: '2026-04-28T00:00:00Z',
+    });
+    const synthesized = attachTimerSynthesis(plan, {
+      summaryText: 'Timer synthesis produced current memory candidates.',
+      structuredSummary: {
+        states: [{ state: 'Timer producer end-to-end is now ready for operator review.' }],
+        decisions: [{ decision: 'Timer synthesis output must still pass promotion gate.' }],
+      },
+    });
+    const repeated = attachTimerSynthesis(plan, {
+      summaryText: 'Timer synthesis produced current memory candidates.',
+      structuredSummary: {
+        states: [{ state: 'Timer producer end-to-end is now ready for operator review.' }],
+        decisions: [{ decision: 'Timer synthesis output must still pass promotion gate.' }],
+      },
+    });
+
+    assert.notEqual(synthesized.inputHash, plan.inputHash);
+    assert.equal(synthesized.inputHash, repeated.inputHash);
+    assert.equal(synthesized.candidates.length, 2);
+    assert.equal(synthesized.outputCoverage.synthesizedCandidateCount, 2);
+    assert.equal(synthesized.synthesisResult.sourceMemoryIds[0], 11);
+    assert.equal(synthesized.synthesisResult.sourceCanonicalKeys[0], 'decision:timer:source');
+    assert.ok(synthesized.candidates.every(candidate => candidate.payload.kind === 'timer_synthesis'));
+    assert.ok(synthesized.candidates.every(candidate => candidate.payload.sourceMemoryIds[0] === 11));
+    assert.ok(synthesized.candidates.every(candidate => candidate.evidenceRefs[0].sourceRef.startsWith('timer_synthesis:')));
+    assert.ok(synthesized.candidates.some(candidate => candidate.memoryType === 'state'));
+    assert.ok(synthesized.candidates.some(candidate => candidate.memoryType === 'decision'));
+  });
+
+  it('refuses ambiguous multi-scope timer synthesis without an explicit target scope', () => {
+    const plan = planCompaction([
+      {
+        id: 1,
+        memoryType: 'decision',
+        canonicalKey: 'decision:scope:a',
+        status: 'active',
+        scopeKind: 'project',
+        scopeKey: 'project:a',
+        summary: 'Scope A',
+      },
+      {
+        id: 2,
+        memoryType: 'decision',
+        canonicalKey: 'decision:scope:b',
+        status: 'active',
+        scopeKind: 'project',
+        scopeKey: 'project:b',
+        summary: 'Scope B',
+      },
+    ], {
+      tenantId: 'tenant-a',
+      cadence: 'weekly',
+      periodStart: '2026-04-20T00:00:00Z',
+      periodEnd: '2026-04-27T00:00:00Z',
+    });
+
+    assert.throws(
+      () => attachTimerSynthesis(plan, {
+        structuredSummary: { decisions: ['Multi-scope synthesis needs an explicit scope.'] },
+      }),
+      /requires scopeKind\/scopeKey/,
+    );
   });
 
   it('renders promotion review without turning candidates into active truth', () => {
@@ -1501,6 +1582,12 @@ describe('v1 consolidation and old DB boundary', () => {
       cadence: 'weekly',
       periodStart: '2026-04-20T00:00:00Z',
       periodEnd: '2026-04-27T00:00:00Z',
+      synthesisSummary: {
+        summaryText: 'Timer synthesis promoted one state.',
+        structuredSummary: {
+          states: [{ state: 'Timer runJob end-to-end promoted synthesized state.' }],
+        },
+      },
       apply: true,
       promoteCandidates: true,
       workerId: 'timer-worker',
@@ -1512,6 +1599,10 @@ describe('v1 consolidation and old DB boundary', () => {
     assert.match(result.promotionReview, /candidates: planned=1 promoted=1 quarantined=0 errored=0/);
     assert.match(result.promotionReview, /sources=decision:project:aquifer:runjob-promote/);
     assert.equal(queries.some(query => String(query.sql).startsWith('INSERT INTO "aq".memory_records')), true);
+    const candidateInsert = queries.find(query => String(query.sql).startsWith('INSERT INTO "aq".compaction_candidates'));
+    assert.equal(candidateInsert.params[6], 'state');
+    assert.equal(JSON.parse(candidateInsert.params[13]).kind, 'timer_synthesis');
+    assert.deepEqual(candidateInsert.params[14], [11]);
   });
 
   it('runJob promotion review keeps apply-only candidates planned without promotion', async () => {
@@ -1570,6 +1661,12 @@ describe('v1 consolidation and old DB boundary', () => {
       cadence: 'weekly',
       periodStart: '2026-04-20T00:00:00Z',
       periodEnd: '2026-04-27T00:00:00Z',
+      synthesisSummary: {
+        summaryText: 'Timer synthesis planned one state.',
+        structuredSummary: {
+          states: [{ state: 'Timer runJob apply-only keeps synthesized state planned.' }],
+        },
+      },
       apply: true,
       workerId: 'timer-worker',
       applyToken: 'timer-token',
@@ -1579,6 +1676,10 @@ describe('v1 consolidation and old DB boundary', () => {
     assert.match(result.promotionReview, /candidates: planned=1 promoted=0 quarantined=0 errored=0/);
     assert.match(result.promotionReview, /sources=decision:project:aquifer:runjob-planned/);
     assert.equal(queries.some(query => String(query.sql).startsWith('INSERT INTO "aq".memory_records')), false);
+    const candidateInsert = queries.find(query => String(query.sql).startsWith('INSERT INTO "aq".compaction_candidates'));
+    assert.equal(candidateInsert.params[6], 'state');
+    assert.equal(JSON.parse(candidateInsert.params[13]).kind, 'timer_synthesis');
+    assert.deepEqual(candidateInsert.params[14], [11]);
   });
 
   it('executePlan refuses non-DB operation because promotion lineage must be transactional', async () => {

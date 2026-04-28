@@ -2,7 +2,14 @@
 
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
-const { parseArgs } = require('../consumers/cli');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const {
+  parseArgs,
+  cmdOperator,
+  readSynthesisSummaryFromFlags,
+} = require('../consumers/cli');
 
 describe('parseArgs', () => {
   it('parses positional args', () => {
@@ -121,5 +128,94 @@ describe('parseArgs', () => {
     assert.equal(args.flags['period-end'], '2026-04-28T00:00:00Z');
     assert.equal(args.flags['policy-version'], 'v1');
     assert.equal(args.flags['worker-id'], 'worker-a');
+  });
+
+  it('parses timer synthesis operator flags', () => {
+    const args = parseArgs([
+      'operator',
+      'compaction',
+      'daily',
+      '--include-synthesis-prompt',
+      '--synthesis-summary-file',
+      '/tmp/timer-summary.json',
+      '--promote-candidates',
+    ]);
+    assert.equal(args.flags['include-synthesis-prompt'], true);
+    assert.equal(args.flags['synthesis-summary-file'], '/tmp/timer-summary.json');
+    assert.equal(args.flags['promote-candidates'], true);
+  });
+
+  it('reads synthesis summary JSON from a flag file', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aquifer-cli-'));
+    const filePath = path.join(dir, 'summary.json');
+    fs.writeFileSync(filePath, JSON.stringify({
+      summaryText: 'Timer summary',
+      structuredSummary: { states: [{ state: 'CLI can read timer synthesis JSON.' }] },
+    }));
+    const summary = readSynthesisSummaryFromFlags({ 'synthesis-summary-file': filePath });
+    assert.equal(summary.summaryText, 'Timer summary');
+    assert.equal(summary.structuredSummary.states[0].state, 'CLI can read timer synthesis JSON.');
+  });
+
+  it('passes timer synthesis producer controls into operator runJob', async () => {
+    const args = parseArgs([
+      'operator',
+      'compaction',
+      'daily',
+      '--scope-kind',
+      'project',
+      '--scope-key',
+      'project:aquifer',
+      '--synthesis-summary',
+      '{"summaryText":"Timer","structuredSummary":{"states":[{"state":"CLI end-to-end timer producer state."}]}}',
+      '--include-synthesis-prompt',
+      '--apply',
+      '--promote-candidates',
+    ]);
+    let receivedInput = null;
+    const fakeAquifer = {
+      memory: {
+        consolidation: {
+          async runJob(input) {
+            receivedInput = input;
+            return {
+              dryRun: false,
+              cadence: input.cadence,
+              periodStart: '2026-04-27T00:00:00.000Z',
+              periodEnd: '2026-04-28T00:00:00.000Z',
+              snapshotCount: 1,
+              snapshotTruncated: false,
+              plan: {
+                statusUpdates: [],
+                candidates: [{ memoryType: 'state' }],
+              },
+              synthesisPrompt: 'timer prompt',
+              promotionReview: 'Promotion review:\ncandidates: planned=1 promoted=1 quarantined=0 errored=0',
+              run: { id: 7, status: 'applied' },
+            };
+          },
+        },
+      },
+    };
+    const logs = [];
+    const originalLog = console.log;
+    console.log = (...items) => logs.push(items.join(' '));
+    try {
+      await cmdOperator(fakeAquifer, args);
+    } finally {
+      console.log = originalLog;
+    }
+
+    assert.equal(receivedInput.job, 'compaction');
+    assert.equal(receivedInput.cadence, 'daily');
+    assert.equal(receivedInput.scopeKind, 'project');
+    assert.equal(receivedInput.scopeKey, 'project:aquifer');
+    assert.equal(receivedInput.includeSynthesisPrompt, true);
+    assert.equal(receivedInput.apply, true);
+    assert.equal(receivedInput.promoteCandidates, true);
+    assert.equal(receivedInput.synthesisSummary.summaryText, 'Timer');
+    assert.equal(receivedInput.synthesisSummary.structuredSummary.states[0].state, 'CLI end-to-end timer producer state.');
+    assert.match(logs.join('\n'), /Synthesis prompt/);
+    assert.match(logs.join('\n'), /Promotion review/);
   });
 });
