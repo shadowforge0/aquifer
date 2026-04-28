@@ -81,6 +81,83 @@ describe('Codex handoff finalization helper', () => {
     assert.equal(metadata.handoff.topics[0].summary, 'handoff 只可作為 finalization trigger');
   });
 
+  it('builds handoff synthesis prompt from transcript, handoff context, and current memory', () => {
+    const prompt = handoff.buildHandoffSynthesisPrompt(samplePayload(), sampleView(), {
+      currentMemory: {
+        memories: [{
+          memoryType: 'state',
+          canonicalKey: 'state:handoff:current',
+          scopeKey: 'project:aquifer',
+          summary: 'Existing current memory must be reconciled.',
+          memoryId: '42',
+          evidenceRefs: [{ sourceRef: 'private' }],
+        }],
+        meta: {
+          source: 'memory_records',
+          servingContract: 'current_memory_v1',
+          count: 1,
+        },
+      },
+    });
+
+    assert.match(prompt, /handoff_context/);
+    assert.match(prompt, /handoff_synthesis_rules/);
+    assert.match(prompt, /process material, not current truth/);
+    assert.match(prompt, /Existing current memory must be reconciled/);
+    assert.match(prompt, /sanitized_transcript/);
+    assert.match(prompt, /Return compact JSON/);
+    assert.doesNotMatch(prompt, /memoryId/);
+    assert.doesNotMatch(prompt, /evidenceRefs/);
+  });
+
+  it('prepares handoff synthesis with compact current memory snapshot', async () => {
+    const view = sampleView();
+    const currentCalls = [];
+    const aquifer = {
+      memory: {
+        async current(input) {
+          currentCalls.push(input);
+          return {
+            memories: [{
+              memoryType: 'decision',
+              scopeKey: 'project:aquifer',
+              summary: 'Current memory enters prompt only as compact text.',
+              memoryId: '99',
+            }, {
+              memoryType: 'state',
+              scopeKey: 'project:other',
+              summary: input.activeScopeKey === 'project:other'
+                ? 'Other project memory would be a scope leak.'
+                : '',
+            }],
+            meta: {
+              source: 'memory_records',
+              servingContract: 'current_memory_v1',
+              count: 1,
+            },
+          };
+        },
+      },
+    };
+
+    const prepared = await handoff.prepareHandoffSynthesis(aquifer, samplePayload(), {
+      view,
+      activeScopeKey: 'project:aquifer',
+      activeScopePath: ['global', 'project:aquifer'],
+      scopeId: 12,
+    });
+
+    assert.equal(prepared.status, 'needs_agent_summary');
+    assert.equal(prepared.view, view);
+    assert.deepEqual(currentCalls[0].activeScopePath, ['global', 'project:aquifer']);
+    assert.equal(currentCalls[0].activeScopeKey, 'project:aquifer');
+    assert.equal(currentCalls[0].scopeId, 12);
+    assert.equal(prepared.currentMemory.meta.servingContract, 'current_memory_v1');
+    assert.match(prepared.prompt, /Current memory enters prompt only as compact text/);
+    assert.doesNotMatch(prepared.prompt, /Other project memory would be a scope leak/);
+    assert.doesNotMatch(prepared.prompt, /memoryId/);
+  });
+
   it('rejects manual handoff finalization without a real transcript view', async () => {
     const calls = [];
     const aquifer = {

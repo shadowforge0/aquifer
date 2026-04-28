@@ -5,6 +5,8 @@ const assert = require('node:assert/strict');
 const {
   planCompaction,
   buildTimerSynthesisInput,
+  buildTimerSynthesisPrompt,
+  buildPromotionReview,
   distillArchiveSnapshot,
   resolveOperatorWindow,
   createMemoryConsolidation,
@@ -274,6 +276,73 @@ describe('v1 consolidation and old DB boundary', () => {
     assert.equal(a.candidateProposals[0].sourceCanonicalKeys[0], 'decision:current');
   });
 
+  it('builds a timer synthesis prompt from current-memory synthesis input only', () => {
+    const plan = planCompaction([
+      {
+        id: 1,
+        memoryType: 'decision',
+        canonicalKey: 'decision:timer:source',
+        status: 'active',
+        scopeKind: 'project',
+        scopeKey: 'project:aquifer',
+        summary: 'Timer prompt source current memory.',
+      },
+      {
+        id: 2,
+        memoryType: 'fact',
+        canonicalKey: 'fact:timer:incorrect',
+        status: 'incorrect',
+        scopeKind: 'project',
+        scopeKey: 'project:aquifer',
+        summary: 'Incorrect memory must not enter timer prompt.',
+      },
+    ], {
+      tenantId: 'tenant-a',
+      cadence: 'daily',
+      periodStart: '2026-04-27T00:00:00Z',
+      periodEnd: '2026-04-28T00:00:00Z',
+    });
+
+    const prompt = buildTimerSynthesisPrompt(plan);
+
+    assert.match(prompt, /timer current-memory synthesis proposal/);
+    assert.match(prompt, /timer_synthesis_input/);
+    assert.match(prompt, /"sourceOfTruth":"memory_records"/);
+    assert.match(prompt, /Timer prompt source current memory/);
+    assert.match(prompt, /Promotion still requires the normal operator promotion gate/);
+    assert.doesNotMatch(prompt, /Incorrect memory must not enter timer prompt/);
+  });
+
+  it('renders promotion review without turning candidates into active truth', () => {
+    const plan = planCompaction([
+      {
+        id: 1,
+        memoryType: 'decision',
+        canonicalKey: 'decision:promotion-review',
+        status: 'active',
+        scopeKind: 'project',
+        scopeKey: 'project:aquifer',
+        summary: 'Promotion review candidate stays behind the gate.',
+      },
+    ], {
+      tenantId: 'tenant-a',
+      cadence: 'weekly',
+      periodStart: '2026-04-20T00:00:00Z',
+      periodEnd: '2026-04-27T00:00:00Z',
+    });
+
+    const review = buildPromotionReview({
+      plan,
+      promotionResult: { promoted: 0, quarantined: 0, errored: 0 },
+      applyResult: { applied: 0, skipped: 0 },
+    });
+
+    assert.match(review, /Promotion review/);
+    assert.match(review, /candidate-only unless promoteCandidates=true/);
+    assert.match(review, /Promotion review candidate stays behind the gate/);
+    assert.match(review, /candidates: planned=1 promoted=0/);
+  });
+
   it('keeps aggregate canonical keys distinct by context and topic within one scope', () => {
     const plan = planCompaction([
       {
@@ -377,11 +446,14 @@ describe('v1 consolidation and old DB boundary', () => {
       periodStart: '2026-04-27T00:00:00Z',
       periodEnd: '2026-04-28T00:00:00Z',
       activeScopeKey: 'project:aquifer',
+      includeSynthesisPrompt: true,
     });
 
     assert.equal(result.status, 'planned');
     assert.equal(result.dryRun, true);
     assert.equal(result.plan.statusUpdates.length, 1);
+    assert.match(result.synthesisPrompt, /timer_synthesis_input/);
+    assert.match(result.promotionReview, /candidate-only unless promoteCandidates=true/);
     assert.deepEqual(listed[0].scopeKeys, ['project:aquifer']);
     assert.equal(listed[0].asOf, '2026-04-28T00:00:00.000Z');
   });
@@ -1358,6 +1430,155 @@ describe('v1 consolidation and old DB boundary', () => {
     assert.equal(candidateInsert.params[4], 'planned');
     assert.equal(candidateInsert.params[5], 'promotion_not_requested');
     assert.equal(candidateInsert.params[16], null);
+  });
+
+  it('runJob promotion review reflects explicit operator promotion', async () => {
+    const rows = [{
+      id: 11,
+      memoryType: 'decision',
+      canonicalKey: 'decision:project:aquifer:runjob-promote',
+      status: 'active',
+      scopeKind: 'project',
+      scopeKey: 'project:aquifer',
+      summary: 'runJob promotion review must reflect promoted candidates.',
+    }];
+    const queries = [];
+    const client = {
+      async query(sql, params) {
+        queries.push({ sql, params });
+        const text = String(sql);
+        if (text.startsWith('INSERT INTO "aq".compaction_runs')) {
+          return { rows: [{ id: 7, status: params[6] }], rowCount: 1 };
+        }
+        if (text.startsWith('UPDATE "aq".compaction_runs AS cr')) {
+          return { rows: [{ id: 7, status: 'applying', apply_token: params[8], worker_id: params[7] }], rowCount: 1 };
+        }
+        if (text.includes('claim lease expired before finalize')) {
+          return { rows: [], rowCount: 0 };
+        }
+        if (text.startsWith('SELECT pg_advisory_xact_lock')) {
+          return { rows: [], rowCount: 0 };
+        }
+        if (text.includes('FROM "aq".memory_records m')) {
+          return { rows: [], rowCount: 0 };
+        }
+        if (text.startsWith('INSERT INTO "aq".scopes')) {
+          return { rows: [{ id: 22, scope_kind: params[1], scope_key: params[2] }], rowCount: 1 };
+        }
+        if (text.startsWith('INSERT INTO "aq".memory_records')) {
+          return { rows: [{ id: 33, status: 'active', created_by_compaction_run_id: params[25] }], rowCount: 1 };
+        }
+        if (text.startsWith('INSERT INTO "aq".evidence_refs')) {
+          return { rows: [{ id: 34, created_by_compaction_run_id: params[9] }], rowCount: 1 };
+        }
+        if (text.startsWith('INSERT INTO "aq".compaction_candidates')) {
+          return { rows: [{ id: 35, action: params[4], memory_record_id: params[16] }], rowCount: 1 };
+        }
+        if (text.startsWith('UPDATE "aq".compaction_runs')) {
+          return { rows: [{ id: params[1], status: params[3], output: JSON.parse(params[4]) }], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 0 };
+      },
+      release() {},
+    };
+    const pool = { async connect() { return client; } };
+    const consolidation = createMemoryConsolidation({
+      pool,
+      schema: '"aq"',
+      defaultTenantId: 'tenant-a',
+      records: {
+        async listActive(input) {
+          assert.equal(input.tenantId, 'tenant-a');
+          return rows;
+        },
+        async updateMemoryStatusIfCurrent() {
+          return null;
+        },
+      },
+    });
+
+    const result = await consolidation.runJob({
+      cadence: 'weekly',
+      periodStart: '2026-04-20T00:00:00Z',
+      periodEnd: '2026-04-27T00:00:00Z',
+      apply: true,
+      promoteCandidates: true,
+      workerId: 'timer-worker',
+      applyToken: 'timer-token',
+    });
+
+    assert.equal(result.promotionResult.promoted, 1);
+    assert.match(result.promotionReview, /operator promotion requested/);
+    assert.match(result.promotionReview, /candidates: planned=1 promoted=1 quarantined=0 errored=0/);
+    assert.match(result.promotionReview, /sources=decision:project:aquifer:runjob-promote/);
+    assert.equal(queries.some(query => String(query.sql).startsWith('INSERT INTO "aq".memory_records')), true);
+  });
+
+  it('runJob promotion review keeps apply-only candidates planned without promotion', async () => {
+    const rows = [{
+      id: 11,
+      memoryType: 'decision',
+      canonicalKey: 'decision:project:aquifer:runjob-planned',
+      status: 'active',
+      scopeKind: 'project',
+      scopeKey: 'project:aquifer',
+      summary: 'runJob apply-only review must stay candidate-only.',
+    }];
+    const queries = [];
+    const client = {
+      async query(sql, params) {
+        queries.push({ sql, params });
+        const text = String(sql);
+        if (text.startsWith('INSERT INTO "aq".compaction_runs')) {
+          return { rows: [{ id: 7, status: params[6] }], rowCount: 1 };
+        }
+        if (text.startsWith('UPDATE "aq".compaction_runs AS cr')) {
+          return { rows: [{ id: 7, status: 'applying', apply_token: params[8], worker_id: params[7] }], rowCount: 1 };
+        }
+        if (text.includes('claim lease expired before finalize')) {
+          return { rows: [], rowCount: 0 };
+        }
+        if (text.startsWith('SELECT pg_advisory_xact_lock')) {
+          return { rows: [], rowCount: 0 };
+        }
+        if (text.startsWith('INSERT INTO "aq".compaction_candidates')) {
+          return { rows: [{ id: 35, action: params[4], memory_record_id: params[16] }], rowCount: 1 };
+        }
+        if (text.startsWith('UPDATE "aq".compaction_runs')) {
+          return { rows: [{ id: params[1], status: params[3] }], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 0 };
+      },
+      release() {},
+    };
+    const pool = { async connect() { return client; } };
+    const consolidation = createMemoryConsolidation({
+      pool,
+      schema: '"aq"',
+      defaultTenantId: 'tenant-a',
+      records: {
+        async listActive() {
+          return rows;
+        },
+        async updateMemoryStatusIfCurrent() {
+          throw new Error('candidate-only run must not mutate memory status');
+        },
+      },
+    });
+
+    const result = await consolidation.runJob({
+      cadence: 'weekly',
+      periodStart: '2026-04-20T00:00:00Z',
+      periodEnd: '2026-04-27T00:00:00Z',
+      apply: true,
+      workerId: 'timer-worker',
+      applyToken: 'timer-token',
+    });
+
+    assert.match(result.promotionReview, /candidate-only unless promoteCandidates=true/);
+    assert.match(result.promotionReview, /candidates: planned=1 promoted=0 quarantined=0 errored=0/);
+    assert.match(result.promotionReview, /sources=decision:project:aquifer:runjob-planned/);
+    assert.equal(queries.some(query => String(query.sql).startsWith('INSERT INTO "aq".memory_records')), false);
   });
 
   it('executePlan refuses non-DB operation because promotion lineage must be transactional', async () => {

@@ -1,6 +1,7 @@
 'use strict';
 
 const {
+  buildFinalizationPrompt,
   finalizeTranscriptView,
   resolveCurrentMemoryForFinalization,
   compactCurrentMemorySnapshot,
@@ -99,6 +100,65 @@ function buildHandoffMetadata(payload = {}) {
   };
 }
 
+function formatHandoffContextBlock(metadata = {}) {
+  const handoff = metadata.handoff || {};
+  const lines = [
+    `<handoff_context source="${metadata.source || 'codex_handoff'}">`,
+    `title: ${handoff.title || 'untitled'}`,
+    `overview: ${handoff.overview || 'none'}`,
+    `status: ${handoff.status || 'unknown'}`,
+    `lastStep: ${handoff.lastStep || 'none'}`,
+    `next: ${handoff.next || 'none'}`,
+  ];
+  for (const decision of handoff.decisions || []) {
+    lines.push(`decision: ${decision.decision}${decision.reason ? ` | ${decision.reason}` : ''}`);
+  }
+  for (const loop of handoff.openLoops || []) {
+    lines.push(`open_loop: ${loop.item}${loop.owner ? ` | owner=${loop.owner}` : ''}`);
+  }
+  for (const topic of handoff.topics || []) {
+    const name = normalizeText(topic && (topic.name || topic.topic || topic.title));
+    const summary = normalizeText(topic && (topic.summary || topic.text));
+    if (name || summary) lines.push(`topic: ${name || 'topic'}${summary ? ` | ${summary}` : ''}`);
+  }
+  lines.push('</handoff_context>');
+  return lines.join('\n');
+}
+
+function buildHandoffSynthesisPrompt(payload = {}, view = {}, opts = {}) {
+  if (!view || view.status !== 'ok') {
+    throw new Error(`Codex handoff synthesis requires an ok normalized transcript view; got ${view && view.status ? view.status : 'missing'}`);
+  }
+  const metadata = buildHandoffMetadata(payload);
+  const basePrompt = buildFinalizationPrompt(view, opts);
+  const handoffBlock = [
+    formatHandoffContextBlock(metadata),
+    '',
+    '<handoff_synthesis_rules>',
+    'Treat handoff_context as producer process material, not current truth by itself.',
+    'Use the sanitized transcript and current_memory to decide what should become current memory candidates.',
+    'Do not copy old current_memory unchanged unless this session confirms it should carry forward.',
+    'Represent resolved, superseded, revoked, or uncertain items explicitly in structuredSummary payload fields when applicable.',
+    'Do not include raw transcript, tool output, debug ids, DB ids, hashes, secrets, or injected context in memory candidates.',
+    '</handoff_synthesis_rules>',
+  ].join('\n');
+  return basePrompt.replace('<sanitized_transcript>', `${handoffBlock}\n\n<sanitized_transcript>`);
+}
+
+async function prepareHandoffSynthesis(aquifer, payload = {}, opts = {}) {
+  const view = opts.view || payload.view;
+  if (!view || view.status !== 'ok') {
+    throw new Error(`Codex handoff synthesis requires an ok normalized transcript view; got ${view && view.status ? view.status : 'missing'}`);
+  }
+  const currentMemory = await resolveCurrentMemoryForFinalization(aquifer, opts);
+  return {
+    status: 'needs_agent_summary',
+    view,
+    currentMemory,
+    prompt: buildHandoffSynthesisPrompt(payload, view, { ...opts, currentMemory }),
+  };
+}
+
 async function finalizeHandoff(aquifer, payload = {}, opts = {}) {
   const view = opts.view || payload.view;
   if (!view || view.status !== 'ok') {
@@ -154,5 +214,7 @@ async function finalizeHandoff(aquifer, payload = {}, opts = {}) {
 
 module.exports = {
   buildHandoffMetadata,
+  buildHandoffSynthesisPrompt,
+  prepareHandoffSynthesis,
   finalizeHandoff,
 };

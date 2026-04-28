@@ -412,6 +412,61 @@ function buildTimerSynthesisInput(normalized, statusUpdates, candidates, opts) {
   };
 }
 
+function buildTimerSynthesisPrompt(plan = {}, opts = {}) {
+  const synthesisInput = plan.synthesisInput || plan.meta?.synthesisInput || null;
+  if (!synthesisInput) {
+    throw new Error('memory.consolidation.timer_synthesis_prompt requires a timer synthesisInput');
+  }
+  const maxFacts = opts.maxFacts || 12;
+  return [
+    'You are producing an Aquifer timer current-memory synthesis proposal.',
+    'Use only the <timer_synthesis_input> block. Do not read raw transcripts, session summaries, tool output, or debug material.',
+    'This is a producer proposal, not an active memory commit. Promotion still requires the normal operator promotion gate.',
+    'Return compact JSON with this shape:',
+    '{"summaryText":"...","structuredSummary":{"facts":[],"decisions":[],"open_loops":[],"preferences":[],"constraints":[],"conclusions":[],"entity_notes":[],"states":[]}}',
+    `Keep facts/states/open_loops concrete and scoped. Use at most ${maxFacts} facts.`,
+    'Mark uncertain, resolved, superseded, revoked, or stale items explicitly in payload fields when applicable.',
+    'Do not copy sourceCurrentMemory unchanged unless the timer window confirms it still carries forward.',
+    '',
+    '<timer_synthesis_input>',
+    stableJson(synthesisInput),
+    '</timer_synthesis_input>',
+  ].join('\n');
+}
+
+function buildPromotionReview(input = {}, opts = {}) {
+  const plan = input.plan || input;
+  const promotionResult = input.promotionResult || {};
+  const applyResult = input.applyResult || {};
+  const candidates = Array.isArray(plan.candidates) ? plan.candidates : [];
+  const statusUpdates = Array.isArray(plan.statusUpdates) ? plan.statusUpdates : [];
+  const candidateLines = candidates.slice(0, Math.max(0, Math.min(20, opts.limit || 8))).map(candidate => {
+    const type = candidate.memoryType || candidate.memory_type || 'memory';
+    const scope = candidate.scopeKey || candidate.scope_key || 'unspecified';
+    const payload = candidate.payload && typeof candidate.payload === 'object' ? candidate.payload : {};
+    const sourceKeys = Array.isArray(payload.sourceCanonicalKeys) && payload.sourceCanonicalKeys.length > 0
+      ? ` | sources=${payload.sourceCanonicalKeys.join(',')}`
+      : '';
+    return `- candidate ${type} ${scope}: ${compactSummary(candidate)}${sourceKeys}`;
+  });
+  const staleLines = statusUpdates.slice(0, Math.max(0, Math.min(20, opts.limit || 8))).map(update => (
+    `- ${update.status}: ${update.canonicalKey || update.memoryId || 'memory'}${update.reason ? ` (${update.reason})` : ''}`
+  ));
+  const linesOrNone = lines => (lines.length > 0 ? lines.join('\n') : '- none');
+  return [
+    'Promotion review:',
+    `window: ${plan.cadence || 'manual'} ${canonicalInstant(plan.periodStart)} -> ${canonicalInstant(plan.periodEnd)}`,
+    `source: ${plan.synthesisInput?.sourceOfTruth || plan.meta?.synthesisInput?.sourceOfTruth || 'memory_records'}`,
+    `gate: ${input.promoteCandidates === true ? 'operator promotion requested' : 'candidate-only unless promoteCandidates=true'}`,
+    `status updates: planned=${statusUpdates.length} applied=${applyResult.applied || 0} skipped=${applyResult.skipped || 0}`,
+    `candidates: planned=${candidates.length} promoted=${promotionResult.promoted || 0} quarantined=${promotionResult.quarantined || 0} errored=${promotionResult.errored || 0}`,
+    'candidate proposals:',
+    linesOrNone(candidateLines),
+    'status update proposals:',
+    linesOrNone(staleLines),
+  ].join('\n');
+}
+
 function buildCoverage(normalized, statusUpdates, candidates) {
   const active = normalized.filter(record => record.status === 'active');
   const activeOpenLoops = active.filter(record => record.memoryType === 'open_loop');
@@ -1255,6 +1310,10 @@ function createMemoryConsolidation({ pool, schema, defaultTenantId, records = nu
         status: 'planned',
         dryRun: true,
         plan,
+        synthesisPrompt: input.includeSynthesisPrompt === true && plan.synthesisInput
+          ? buildTimerSynthesisPrompt(plan, input)
+          : undefined,
+        promotionReview: buildPromotionReview({ plan }),
         cadence: plan.cadence,
         periodStart: plan.periodStart,
         periodEnd: plan.periodEnd,
@@ -1291,6 +1350,12 @@ function createMemoryConsolidation({ pool, schema, defaultTenantId, records = nu
       ...result,
       job,
       dryRun: false,
+      promotionReview: buildPromotionReview({
+        plan,
+        promotionResult: result.promotionResult,
+        applyResult: result.applyResult,
+        promoteCandidates: input.promoteCandidates === true,
+      }),
       cadence: plan.cadence,
       periodStart: plan.periodStart,
       periodEnd: plan.periodEnd,
@@ -1324,6 +1389,8 @@ module.exports = {
   resolveOperatorWindow,
   planCompaction,
   buildTimerSynthesisInput,
+  buildTimerSynthesisPrompt,
+  buildPromotionReview,
   distillArchiveSnapshot,
   createMemoryConsolidation,
 };
