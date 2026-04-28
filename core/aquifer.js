@@ -2150,6 +2150,14 @@ function createAquifer(config = {}) {
       await ensureMigrated();
       return memoryBootstrap.bootstrap(opts);
     },
+    current: async (opts = {}) => {
+      await ensureMigrated();
+      return memoryRecords.currentProjection(withDefaultMemoryScope(opts));
+    },
+    listCurrentMemory: async (opts = {}) => {
+      await ensureMigrated();
+      return memoryRecords.currentProjection(withDefaultMemoryScope(opts));
+    },
     recall: async (query, opts = {}) => {
       await ensureMigrated();
       return memoryRecall.recall(query, opts);

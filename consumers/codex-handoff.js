@@ -1,6 +1,10 @@
 'use strict';
 
-const { finalizeTranscriptView } = require('./codex');
+const {
+  finalizeTranscriptView,
+  resolveCurrentMemoryForFinalization,
+  compactCurrentMemorySnapshot,
+} = require('./codex');
 const { buildFinalizationReview } = require('../core/finalization-review');
 
 function normalizeText(value) {
@@ -108,6 +112,8 @@ async function finalizeHandoff(aquifer, payload = {}, opts = {}) {
     ...buildHandoffMetadata(payload),
     ...(opts.metadata || {}),
   };
+  const currentMemory = await resolveCurrentMemoryForFinalization(aquifer, opts);
+  if (currentMemory) metadata.currentMemory = compactCurrentMemorySnapshot(currentMemory, opts);
   const result = await finalizeTranscriptView(aquifer, view, summary, {
     ...opts,
     mode: 'handoff',

@@ -142,6 +142,23 @@ describe('Codex handoff finalization helper', () => {
           };
         },
       },
+      memory: {
+        async current() {
+          return {
+            memories: [{
+              memoryType: 'state',
+              canonicalKey: 'state:handoff:current',
+              scopeKey: 'project:aquifer',
+              summary: 'Existing handoff current memory.',
+            }],
+            meta: {
+              source: 'memory_records',
+              servingContract: 'current_memory_v1',
+              count: 1,
+            },
+          };
+        },
+      },
     };
     const view = sampleView();
     const summary = sampleSummary();
@@ -170,6 +187,10 @@ describe('Codex handoff finalization helper', () => {
     assert.equal(calls[0].assistantCount, view.counts.assistantCount);
     assert.equal(calls[0].metadata.source, 'codex_handoff');
     assert.equal(calls[0].metadata.handoff.title, 'Aquifer handoff finalization');
+    assert.equal(calls[0].metadata.currentMemory.meta.servingContract, 'current_memory_v1');
+    assert.equal(calls[0].metadata.currentMemory.memories[0].summary, 'Existing handoff current memory.');
+    assert.equal(calls[0].metadata.currentMemory.memories[0].memoryId, undefined);
+    assert.equal(calls[0].metadata.currentMemory.memories[0].evidenceRefs, undefined);
   });
 
   it('surfaces committed core review and SessionStart text for handoff parity', async () => {

@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const { resolveApplicableRecords } = require('./memory-bootstrap');
 
 function requireField(obj, field) {
   if (!obj || obj[field] === undefined || obj[field] === null || obj[field] === '') {
@@ -24,10 +25,10 @@ function advisoryLockKeys(namespace, value) {
 const BOOTSTRAP_ORDER_SQL = `
          CASE m.memory_type
            WHEN 'constraint' THEN 0
-           WHEN 'preference' THEN 1
-           WHEN 'state' THEN 2
-           WHEN 'open_loop' THEN 3
-           WHEN 'decision' THEN 4
+           WHEN 'state' THEN 1
+           WHEN 'open_loop' THEN 2
+           WHEN 'decision' THEN 3
+           WHEN 'preference' THEN 4
            WHEN 'fact' THEN 5
            WHEN 'conclusion' THEN 6
            WHEN 'entity_note' THEN 7
@@ -45,6 +46,123 @@ const BOOTSTRAP_ORDER_SQL = `
          END ASC,
          m.accepted_at DESC NULLS LAST,
          m.id ASC`;
+
+const CURRENT_TYPE_PRIORITY = {
+  constraint: 0,
+  state: 1,
+  open_loop: 2,
+  decision: 3,
+  preference: 4,
+  fact: 5,
+  conclusion: 6,
+  entity_note: 7,
+};
+
+const CURRENT_AUTHORITY_PRIORITY = {
+  user_explicit: 0,
+  executable_evidence: 1,
+  manual: 2,
+  system: 3,
+  verified_summary: 4,
+  llm_inference: 5,
+  raw_transcript: 6,
+};
+
+function parseTime(value) {
+  const parsed = Date.parse(value || '');
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function normalizeScopePath(activeScopePath, activeScopeKey) {
+  const source = Array.isArray(activeScopePath)
+    ? activeScopePath
+    : (typeof activeScopePath === 'string' ? activeScopePath.split(',') : null);
+  if (source && source.length > 0) {
+    const seen = new Set();
+    const path = [];
+    for (const value of source) {
+      const key = String(value || '').trim();
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      path.push(key);
+    }
+    if (path.length > 0) return path;
+  }
+  if (activeScopeKey) return [String(activeScopeKey).trim()].filter(Boolean);
+  return ['global'];
+}
+
+function compareRecordIdAsc(a, b) {
+  const left = a.memoryId ?? a.memory_id ?? a.id ?? null;
+  const right = b.memoryId ?? b.memory_id ?? b.id ?? null;
+  const leftNum = Number(left);
+  const rightNum = Number(right);
+  if (Number.isFinite(leftNum) && Number.isFinite(rightNum) && leftNum !== rightNum) {
+    return leftNum - rightNum;
+  }
+  return String(left ?? '').localeCompare(String(right ?? ''));
+}
+
+function normalizeCurrentMemoryRow(row = {}) {
+  const memoryId = row.memoryId ?? row.memory_id ?? row.id ?? null;
+  const evidenceRefsValue = row.evidenceRefs ?? row.evidence_refs ?? [];
+  const evidenceRefs = Array.isArray(evidenceRefsValue) ? evidenceRefsValue : [];
+  return {
+    ...row,
+    memoryId: memoryId === null ? null : String(memoryId),
+    canonicalKey: row.canonicalKey ?? row.canonical_key ?? null,
+    memoryType: row.memoryType ?? row.memory_type ?? null,
+    scopeKey: row.scopeKey ?? row.scope_key ?? null,
+    scopeKind: row.scopeKind ?? row.scope_kind ?? null,
+    inheritanceMode: row.inheritanceMode ?? row.inheritance_mode ?? row.scope_inheritance_mode ?? null,
+    visibleInBootstrap: row.visibleInBootstrap ?? row.visible_in_bootstrap ?? false,
+    visibleInRecall: row.visibleInRecall ?? row.visible_in_recall ?? false,
+    acceptedAt: row.acceptedAt ?? row.accepted_at ?? null,
+    validFrom: row.validFrom ?? row.valid_from ?? null,
+    validTo: row.validTo ?? row.valid_to ?? null,
+    staleAfter: row.staleAfter ?? row.stale_after ?? null,
+    evidenceRefs,
+    evidence_refs: evidenceRefs,
+  };
+}
+
+function currentScopePriority(record, positions) {
+  return positions.get(record.scopeKey ?? record.scope_key) ?? -1;
+}
+
+function sortCurrentMemoryRecords(a, b, positions) {
+  const leftScope = currentScopePriority(a, positions);
+  const rightScope = currentScopePriority(b, positions);
+  if (rightScope !== leftScope) return rightScope - leftScope;
+
+  const leftType = CURRENT_TYPE_PRIORITY[a.memoryType ?? a.memory_type] ?? 99;
+  const rightType = CURRENT_TYPE_PRIORITY[b.memoryType ?? b.memory_type] ?? 99;
+  if (leftType !== rightType) return leftType - rightType;
+
+  const leftAuthority = CURRENT_AUTHORITY_PRIORITY[a.authority] ?? 99;
+  const rightAuthority = CURRENT_AUTHORITY_PRIORITY[b.authority] ?? 99;
+  if (leftAuthority !== rightAuthority) return leftAuthority - rightAuthority;
+
+  const leftAccepted = parseTime(a.acceptedAt ?? a.accepted_at);
+  const rightAccepted = parseTime(b.acceptedAt ?? b.accepted_at);
+  if (leftAccepted !== rightAccepted) return (rightAccepted ?? 0) - (leftAccepted ?? 0);
+
+  return compareRecordIdAsc(a, b);
+}
+
+function isCurrentProjectionRow(row, asOf) {
+  if ((row.status || 'candidate') !== 'active') return false;
+  if (row.visibleInBootstrap !== true && row.visibleInRecall !== true) return false;
+  const at = parseTime(asOf);
+  if (at === null) return true;
+  const validFrom = parseTime(row.validFrom ?? row.valid_from);
+  const validTo = parseTime(row.validTo ?? row.valid_to);
+  const staleAfter = parseTime(row.staleAfter ?? row.stale_after);
+  if (validFrom !== null && validFrom > at) return false;
+  if (validTo !== null && validTo <= at) return false;
+  if (staleAfter !== null && staleAfter <= at) return false;
+  return true;
+}
 
 function createMemoryRecords({ pool, schema, defaultTenantId, inTransaction = false }) {
   const scopes = `${schema}.scopes`;
@@ -534,6 +652,103 @@ function createMemoryRecords({ pool, schema, defaultTenantId, inTransaction = fa
     return result.rows;
   }
 
+  async function currentProjection(input = {}) {
+    const tenantId = input.tenantId || defaultTenantId;
+    let activeScopePath = normalizeScopePath(input.activeScopePath, input.activeScopeKey);
+    let activeScopeKey = input.activeScopeKey || activeScopePath[activeScopePath.length - 1] || null;
+    if (input.scopeId && !input.activeScopeKey && !input.activeScopePath) {
+      const scopeResult = await pool.query(
+        `SELECT scope_key FROM ${scopes} WHERE tenant_id = $1 AND id = $2 LIMIT 1`,
+        [tenantId, input.scopeId],
+      );
+      const scopedKey = scopeResult.rows[0]?.scope_key || null;
+      if (scopedKey) {
+        activeScopePath = [scopedKey];
+        activeScopeKey = scopedKey;
+      }
+    }
+    const limit = Math.max(1, Math.min(100, input.limit || 50));
+    const fetchLimit = Math.max(limit + 1, Math.min(200, Math.max(limit * 4, 40)));
+    const asOf = input.asOf || new Date().toISOString();
+    const params = [tenantId, activeScopePath, asOf];
+    const where = [
+      `m.tenant_id = $1`,
+      `m.status = 'active'`,
+      `s.scope_key = ANY($2::text[])`,
+      `(m.visible_in_bootstrap = true OR m.visible_in_recall = true)`,
+      `(m.valid_from IS NULL OR m.valid_from <= $3::timestamptz)`,
+      `(m.valid_to IS NULL OR m.valid_to > $3::timestamptz)`,
+      `(m.stale_after IS NULL OR m.stale_after > $3::timestamptz)`,
+    ];
+
+    if (input.scopeId) {
+      params.push(input.scopeId);
+      where.push(`m.scope_id = $${params.length}`);
+    }
+
+    params.push(fetchLimit);
+    const limitParam = `$${params.length}`;
+    const evidenceRefsSelect = input.includeEvidenceRefs === true
+      ? `COALESCE((
+           SELECT jsonb_agg(
+             jsonb_build_object(
+               'id', e.id,
+               'sourceKind', e.source_kind,
+               'sourceRef', e.source_ref,
+               'relationKind', e.relation_kind,
+               'weight', e.weight,
+               'metadata', e.metadata
+             )
+             ORDER BY e.id ASC
+           )
+           FROM ${evidenceRefs} e
+           WHERE e.tenant_id = m.tenant_id
+             AND e.owner_kind = 'memory_record'
+             AND e.owner_id = m.id
+         ), '[]'::jsonb)`
+      : `'[]'::jsonb`;
+
+    const result = await pool.query(
+      `SELECT
+         m.*,
+         s.scope_kind,
+         s.scope_key,
+         s.inheritance_mode AS scope_inheritance_mode,
+         ${evidenceRefsSelect} AS evidence_refs
+       FROM ${memories} m
+       JOIN ${scopes} s ON s.id = m.scope_id
+       WHERE ${where.join(' AND ')}
+       ORDER BY array_position($2::text[], s.scope_key) DESC NULLS LAST,
+                ${BOOTSTRAP_ORDER_SQL}
+       LIMIT ${limitParam}`,
+      params,
+    );
+
+    const positions = new Map(activeScopePath.map((key, index) => [key, index]));
+    const applicable = resolveApplicableRecords(
+      result.rows
+        .map(normalizeCurrentMemoryRow)
+        .filter(row => isCurrentProjectionRow(row, asOf)),
+      { activeScopeKey, activeScopePath },
+    ).sort((left, right) => sortCurrentMemoryRecords(left, right, positions));
+
+    const selected = applicable.slice(0, limit);
+    const truncated = applicable.length > limit;
+    return {
+      memories: selected,
+      meta: {
+        source: 'memory_records',
+        servingContract: 'current_memory_v1',
+        count: selected.length,
+        activeScopeKey,
+        activeScopePath,
+        asOf,
+        truncated,
+        degraded: truncated,
+      },
+    };
+  }
+
   async function withTransaction(fn) {
     if (inTransaction) {
       return fn(api, { transactional: true });
@@ -572,6 +787,7 @@ function createMemoryRecords({ pool, schema, defaultTenantId, inTransaction = fa
     updateMemoryStatusIfCurrent,
     updateFactAssertionStatus,
     listActive,
+    currentProjection,
     withTransaction,
   };
 

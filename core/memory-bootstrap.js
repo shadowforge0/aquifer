@@ -2,10 +2,10 @@
 
 const TYPE_PRIORITY = {
   constraint: 0,
-  preference: 1,
-  state: 2,
-  open_loop: 3,
-  decision: 4,
+  state: 1,
+  open_loop: 2,
+  decision: 3,
+  preference: 4,
   fact: 5,
   conclusion: 6,
   entity_note: 7,
@@ -96,7 +96,13 @@ function resolveApplicableRecords(records = [], opts = {}) {
   return [...winners.values(), ...additive];
 }
 
-function sortForBootstrap(a, b) {
+function sortForBootstrap(a, b, opts = {}) {
+  const activeScopePath = opts.activeScopePath || (opts.activeScopeKey ? [opts.activeScopeKey] : ['global']);
+  const position = new Map(activeScopePath.map((key, idx) => [key, idx]));
+  const aScope = position.get(scopeKey(a)) ?? -1;
+  const bScope = position.get(scopeKey(b)) ?? -1;
+  if (bScope !== aScope) return bScope - aScope;
+
   const aType = TYPE_PRIORITY[a.memoryType || a.memory_type] ?? 99;
   const bType = TYPE_PRIORITY[b.memoryType || b.memory_type] ?? 99;
   if (aType !== bType) return aType - bType;
@@ -129,10 +135,11 @@ function buildText(records, meta) {
 
 function buildMemoryBootstrap(records = [], opts = {}) {
   const maxChars = Math.max(120, opts.maxChars || 4000);
+  const limit = Number.isFinite(opts.limit) ? Math.max(1, Math.min(100, Math.floor(opts.limit))) : null;
   const active = resolveApplicableRecords(
     records.filter(record => isActiveBootstrap(record, opts)),
     opts,
-  ).sort(sortForBootstrap);
+  ).sort((a, b) => sortForBootstrap(a, b, opts));
 
   const meta = {
     overflow: false,
@@ -141,7 +148,11 @@ function buildMemoryBootstrap(records = [], opts = {}) {
     count: active.length,
   };
 
-  let selected = active.slice();
+  let selected = limit ? active.slice(0, limit) : active.slice();
+  if (limit && active.length > limit) {
+    meta.overflow = true;
+    meta.degraded = true;
+  }
   let text = buildText(selected, meta);
   while (text.length > maxChars && selected.length > 1) {
     selected = selected.slice(0, -1);
@@ -167,13 +178,14 @@ function buildMemoryBootstrap(records = [], opts = {}) {
 
 function createMemoryBootstrap({ records }) {
   async function bootstrap(opts = {}) {
+    const requestedLimit = Number.isFinite(opts.limit) ? Math.max(1, Math.floor(opts.limit)) : 50;
     const rows = await records.listActive({
       tenantId: opts.tenantId,
       scopeId: opts.scopeId,
       scopeKeys: opts.activeScopePath || (opts.activeScopeKey ? [opts.activeScopeKey] : undefined),
       visibleInBootstrap: true,
       asOf: opts.asOf,
-      limit: opts.limit || 50,
+      limit: Math.max(50, Math.min(200, requestedLimit * 4)),
     });
     return buildMemoryBootstrap(rows, opts);
   }

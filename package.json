@@ -67,7 +67,7 @@
   "scripts": {
     "test": "node --test test/*.test.js",
     "test:integration": "node --test test/integration.test.js",
-    "test:release:package": "node --test test/package-surface.test.js test/mcp-manifest.test.js",
+    "test:release:package": "node --test test/package-surface.test.js test/mcp-manifest.test.js test/v1-serving-cutover.test.js test/v1-current-memory-contract.test.js test/consumer-codex.test.js test/codex-handoff.test.js",
     "test:release:db": "node -e \"if (!process.env.AQUIFER_TEST_DB_URL) { console.error('AQUIFER_TEST_DB_URL is required for test:release:db'); process.exit(1); }\" && node --test test/consumer-mcp.integration.test.js test/consumer-cli.integration.test.js test/codex-finalization-serving.integration.test.js",
     "lint": "eslint index.js core/*.js consumers/cli.js consumers/mcp.js consumers/claude-code.js consumers/codex.js consumers/codex-handoff.js consumers/openclaw-plugin.js consumers/opencode.js consumers/shared/*.js consumers/default/*.js consumers/default/prompts/*.js consumers/openclaw-ext/*.js pipeline/*.js pipeline/consolidation/*.js scripts/*.js test/*.js",
     "hooks:install": "git config core.hooksPath .githooks"

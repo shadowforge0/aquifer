@@ -228,6 +228,25 @@ describe('Codex consumer normalize/parse', () => {
 });
 
 describe('Codex consumer recovery helpers', () => {
+    it('omits current memory instructions when finalization prompt opts out', () => {
+        const prompt = codex.buildFinalizationPrompt({
+            status: 'ok',
+            sessionId: 'prompt-opt-out',
+            transcriptHash: 'a'.repeat(64),
+            approxPromptTokens: 12,
+            text: 'User asked Codex to finalize a session.',
+        }, {
+            includeCurrentMemory: false,
+            currentMemory: {
+                memories: [{ summary: 'This current memory must not be injected.' }],
+            },
+        });
+
+        assert.doesNotMatch(prompt, /current_memory/);
+        assert.doesNotMatch(prompt, /This current memory must not be injected/);
+        assert.match(prompt, /sanitized_transcript/);
+    });
+
     it('returns metadata-only recovery candidates without reading missing JSONL files', async () => {
         const root = tmpDir();
         const sessionsDir = path.join(root, 'sessions');
@@ -755,6 +774,28 @@ describe('Codex consumer recovery helpers', () => {
             assistant('a3'),
         ]);
         const aq = makeFakeAquifer();
+        const currentCalls = [];
+        aq.memory = {
+            async current(opts) {
+                currentCalls.push(opts);
+                return {
+                    memories: [{
+                        memoryType: 'state',
+                        canonicalKey: 'state:project:aquifer:current',
+                        scopeKey: 'project:aquifer',
+                        summary: 'Existing current memory must be reconciled.',
+                        authority: 'verified_summary',
+                    }],
+                    meta: {
+                        source: 'memory_records',
+                        servingContract: 'current_memory_v1',
+                        count: 1,
+                        truncated: false,
+                        degraded: false,
+                    },
+                };
+            },
+        };
         const prepared = await codex.prepareSessionStartRecovery(aq, {
             stateDir: path.join(root, 'state'),
             sessionsDir: root,
@@ -763,11 +804,15 @@ describe('Codex consumer recovery helpers', () => {
             idleMs: 1,
             excludeNewest: false,
             consent: true,
+            activeScopeKey: 'project:aquifer',
         });
 
         assert.equal(prepared.status, 'needs_agent_summary');
         assert.match(prepared.prompt, /sanitized_transcript/);
+        assert.match(prepared.prompt, /current_memory/);
+        assert.match(prepared.prompt, /Existing current memory must be reconciled/);
         assert.doesNotMatch(prepared.prompt, /AQUIFER CONTEXT/);
+        assert.deepEqual(currentCalls[0].activeScopeKey, 'project:aquifer');
 
         const result = await codex.finalizeCodexSession(aq, {
             view: prepared.view,
@@ -776,6 +821,7 @@ describe('Codex consumer recovery helpers', () => {
             structuredSummary: {
                 facts: [{ subject: 'Aquifer', statement: 'Finalization writes through core ledger.' }],
             },
+            currentMemory: prepared.currentMemory,
         });
 
         assert.equal(result.status, 'finalized');
@@ -786,6 +832,8 @@ describe('Codex consumer recovery helpers', () => {
         assert.equal(finalizeCall.input.sessionId, 'meta-finalize');
         assert.match(finalizeCall.input.transcriptHash, /^[a-f0-9]{64}$/);
         assert.equal(finalizeCall.input.metadata.trigger, 'session_start_recovery');
+        assert.equal(finalizeCall.input.metadata.currentMemory.meta.servingContract, 'current_memory_v1');
+        assert.equal(finalizeCall.input.metadata.currentMemory.memories[0].summary, 'Existing current memory must be reconciled.');
     });
 
     it('re-commits a stale session snapshot before finalization', async () => {

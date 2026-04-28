@@ -75,6 +75,21 @@ if (DB_URL) {
       });
       assert.equal(view.status, 'ok');
 
+      const scope = await aq.memory.upsertScope({
+        scopeKind: 'project',
+        scopeKey: 'project:aquifer',
+      });
+      await aq.memory.upsertMemory({
+        memoryType: 'state',
+        canonicalKey: 'state:codex-serving-smoke:current-memory-input',
+        scopeId: scope.id,
+        summary: 'Existing DB current memory is available before recovery finalization.',
+        status: 'active',
+        authority: 'verified_summary',
+        visibleInBootstrap: true,
+        visibleInRecall: true,
+      });
+
       const finalized = await codex.finalizeCodexSession(aq, {
         view,
         mode: 'session_start_recovery',
@@ -93,6 +108,8 @@ if (DB_URL) {
         sessionKey: 'codex:recovery:smoke',
         scopeKind: 'project',
         scopeKey: 'project:aquifer',
+        activeScopePath: ['global', 'project:aquifer'],
+        activeScopeKey: 'project:aquifer',
       });
 
       assert.equal(finalized.status, 'finalized');
@@ -105,6 +122,13 @@ if (DB_URL) {
         transcriptHash: view.transcriptHash,
       });
       assert.equal(finalizationRow.status, 'finalized');
+      assert.equal(finalizationRow.metadata.currentMemory.meta.servingContract, 'current_memory_v1');
+      assert.equal(
+        finalizationRow.metadata.currentMemory.memories.some(
+          row => row.summary === 'Existing DB current memory is available before recovery finalization.',
+        ),
+        true,
+      );
       assert.match(finalizationRow.session_start_text, /下一段只需要帶/);
       assert.match(finalizationRow.session_start_text, /Codex recovery finalization must be visible through curated bootstrap/);
       assert.doesNotMatch(finalizationRow.session_start_text, /transcriptHash|sessionId|DB Write Plan|raw JSON|message count/);
@@ -117,6 +141,55 @@ if (DB_URL) {
 
       assert.match(bootstrap.text, /memory-bootstrap/);
       assert.match(bootstrap.text, /Codex recovery finalization must be visible through curated bootstrap/);
+    });
+
+    it('injects DB current memory into consented recovery prompt before agent summary', async () => {
+      const sessionsDir = path.join(root, 'recovery-prompt-sessions');
+      const stateDir = path.join(root, 'recovery-prompt-state');
+      const file = path.join(sessionsDir, 'rollout-codex-recovery-prompt.jsonl');
+      writeJsonl(file, [
+        { type: 'session_meta', payload: { id: 'codex-recovery-prompt-smoke' } },
+        { type: 'event_msg', payload: { type: 'user_message', message: 'Aquifer recovery prompt smoke start.' } },
+        { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Tracking prompt current memory.' }] } },
+        { type: 'event_msg', payload: { type: 'user_message', message: 'Decision: recovery prompt must include current memory.' } },
+        { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'The prompt should reconcile against committed memory.' }] } },
+        { type: 'event_msg', payload: { type: 'user_message', message: 'Verify current memory enters the finalization prompt.' } },
+      ]);
+
+      const scope = await aq.memory.upsertScope({
+        scopeKind: 'project',
+        scopeKey: 'project:aquifer-recovery-prompt',
+      });
+      await aq.memory.upsertMemory({
+        memoryType: 'state',
+        canonicalKey: 'state:codex-recovery-prompt:current',
+        scopeId: scope.id,
+        summary: 'Existing recovery prompt current memory comes from memory_records.',
+        status: 'active',
+        authority: 'verified_summary',
+        visibleInBootstrap: true,
+        visibleInRecall: true,
+      });
+
+      const prepared = await codex.prepareSessionStartRecovery(aq, {
+        sessionsDir,
+        stateDir,
+        includeJsonlPreviews: true,
+        minSessionBytes: 1,
+        idleMs: 0,
+        excludeNewest: false,
+        consent: true,
+        activeScopePath: ['global', 'project:aquifer-recovery-prompt'],
+        activeScopeKey: 'project:aquifer-recovery-prompt',
+        scopeKind: 'project',
+        scopeKey: 'project:aquifer-recovery-prompt',
+      });
+
+      assert.equal(prepared.status, 'needs_agent_summary');
+      assert.equal(prepared.currentMemory.meta.servingContract, 'current_memory_v1');
+      assert.match(prepared.prompt, /<current_memory/);
+      assert.match(prepared.prompt, /Existing recovery prompt current memory comes from memory_records/);
+      assert.doesNotMatch(prepared.prompt, /AQUIFER CONTEXT|session_summaries/);
     });
 
     it('serves memory promoted by Codex handoff finalization from the same core surface', async () => {
@@ -135,6 +208,21 @@ if (DB_URL) {
         maxRecoveryBytes: 1024 * 1024,
       });
       assert.equal(view.status, 'ok');
+
+      const scope = await aq.memory.upsertScope({
+        scopeKind: 'project',
+        scopeKey: 'project:aquifer-handoff',
+      });
+      await aq.memory.upsertMemory({
+        memoryType: 'state',
+        canonicalKey: 'state:codex-handoff-smoke:current-memory-input',
+        scopeId: scope.id,
+        summary: 'Existing handoff current memory is captured in finalization metadata.',
+        status: 'active',
+        authority: 'verified_summary',
+        visibleInBootstrap: true,
+        visibleInRecall: true,
+      });
 
       const result = await handoff.finalizeHandoff(aq, {
         title: 'Codex handoff DB smoke',
@@ -158,6 +246,8 @@ if (DB_URL) {
         sessionKey: 'codex:wrapper:handoff',
         scopeKind: 'project',
         scopeKey: 'project:aquifer-handoff',
+        activeScopePath: ['global', 'project:aquifer-handoff'],
+        activeScopeKey: 'project:aquifer-handoff',
       });
 
       assert.equal(result.status, 'finalized');
@@ -178,6 +268,17 @@ if (DB_URL) {
       assert.equal(finalizationRow.mode, 'handoff');
       assert.equal(finalizationRow.human_review_text, result.reviewText);
       assert.equal(finalizationRow.session_start_text, result.sessionStartText);
+      assert.equal(finalizationRow.metadata.currentMemory.meta.servingContract, 'current_memory_v1');
+      assert.equal(
+        finalizationRow.metadata.currentMemory.memories.some(
+          row => row.summary === 'Existing handoff current memory is captured in finalization metadata.',
+        ),
+        true,
+      );
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(finalizationRow.metadata.currentMemory.memories[0], 'evidenceRefs'),
+        false,
+      );
 
       const bootstrap = await aq.bootstrap({
         activeScopePath: ['global', 'project:aquifer-handoff'],
