@@ -4,6 +4,14 @@ All notable changes to `@shadowforge0/aquifer-memory` are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project uses semantic versioning.
 
+## [1.8.1] - 2026-05-01
+
+### Fixed
+
+- `aquifer migrate --json` now emits parseable JSON on stdout and captures
+  migration post-flight notices inside the JSON payload instead of mixing
+  human-readable text into JSON output.
+
 ## [1.8.0] - 2026-05-01
 
 ### Added

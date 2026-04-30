@@ -204,7 +204,29 @@ function parseArgs(argv) {
 // Commands
 // ---------------------------------------------------------------------------
 
-async function cmdMigrate(aquifer) {
+async function cmdMigrate(aquifer, args = { flags: {} }) {
+  if (args.flags && args.flags.json) {
+    const notices = [];
+    const originalStderrWrite = process.stderr.write;
+    process.stderr.write = function writeCapturedStderr(chunk, encoding, callback) {
+      notices.push(Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk));
+      if (typeof encoding === 'function') encoding();
+      if (typeof callback === 'function') callback();
+      return true;
+    };
+    try {
+      await aquifer.migrate();
+    } finally {
+      process.stderr.write = originalStderrWrite;
+    }
+    console.log(JSON.stringify({
+      ok: true,
+      migrated: true,
+      notices: notices.join('').split(/\r?\n/).map(line => line.trim()).filter(Boolean),
+    }, null, 2));
+    return;
+  }
+
   await aquifer.migrate();
   console.log('Migrations applied successfully.');
 }
@@ -962,7 +984,7 @@ Operator examples:
         await cmdQuickstart(aquifer);
         break;
       case 'migrate':
-        await cmdMigrate(aquifer);
+        await cmdMigrate(aquifer, args);
         break;
       case 'recall':
         await cmdRecall(aquifer, args);
@@ -1016,6 +1038,7 @@ module.exports = {
   parseArgs,
   selectedBackendInfo,
   cmdBackendInfo,
+  cmdMigrate,
   cmdLocalQuickstart,
   cmdOperator,
   readSynthesisSummaryFromFlags,

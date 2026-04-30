@@ -9,6 +9,7 @@ const path = require('node:path');
 const {
   parseArgs,
   selectedBackendInfo,
+  cmdMigrate,
   cmdLocalQuickstart,
   cmdOperator,
   readSynthesisSummaryFromFlags,
@@ -92,6 +93,37 @@ describe('parseArgs', () => {
     assert.equal(info.backendKind, 'local');
     assert.equal(info.backendProfile, 'starter');
     assert.equal(info.storage.postgresUrlConfigured, false);
+  });
+
+  it('cmdMigrate --json emits parseable stdout and captures migration notices', async () => {
+    const logs = [];
+    const leakedStderr = [];
+    const originalLog = console.log;
+    const originalStderrWrite = process.stderr.write;
+    console.log = (...items) => logs.push(items.join(' '));
+    process.stderr.write = function captureLeak(chunk, encoding, callback) {
+      leakedStderr.push(Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk));
+      if (typeof encoding === 'function') encoding();
+      if (typeof callback === 'function') callback();
+      return true;
+    };
+    try {
+      await cmdMigrate({
+        async migrate() {
+          process.stderr.write('[aquifer] FTS post-flight: backend=simple\n');
+        },
+      }, { flags: { json: true } });
+    } finally {
+      console.log = originalLog;
+      process.stderr.write = originalStderrWrite;
+    }
+
+    assert.equal(leakedStderr.length, 0);
+    assert.equal(logs.length, 1);
+    const payload = JSON.parse(logs[0]);
+    assert.equal(payload.ok, true);
+    assert.equal(payload.migrated, true);
+    assert.deepEqual(payload.notices, ['[aquifer] FTS post-flight: backend=simple']);
   });
 
   it('runs local quickstart without PostgreSQL and cleans up the test session', async () => {

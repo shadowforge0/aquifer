@@ -105,6 +105,15 @@ describe('CLI consumer — aquifer <command> end-to-end', () => {
     assert.match(res.stdout, /Migrations applied successfully/);
   });
 
+  it('migrate --json emits parseable JSON without text prelude', () => {
+    const res = runCli(['migrate', '--json'], { AQUIFER_SCHEMA: schema });
+    assert.equal(res.code, 0, `migrate --json failed: ${res.stderr}`);
+    const payload = JSON.parse(res.stdout);
+    assert.equal(payload.ok, true);
+    assert.equal(payload.migrated, true);
+    assert.ok(Array.isArray(payload.notices));
+  });
+
   it('stats --json reports seeded session counts', () => {
     const res = runCli(['stats', '--json'], { AQUIFER_SCHEMA: schema });
     assert.equal(res.code, 0, `stats failed: ${res.stderr}`);
