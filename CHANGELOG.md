@@ -4,6 +4,21 @@ All notable changes to `@shadowforge0/aquifer-memory` are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project uses semantic versioning.
 
+## [1.8.0] - 2026-05-01
+
+### Added
+
+- Current-memory serving repair for hybrid recall routing, including verified
+  MCP behavior and current corpus recall coverage.
+- Handoff/current-memory candidate envelope schema and contract for finalization
+  producers, including `schema/018-v1-finalization-candidate-envelope.sql`.
+
+### Changed
+
+- Project ledger now records the 2026-05-01 release boundary: Codex private
+  wrapper recovery notices stay outside the public package surface, while the
+  product `scripts/codex-recovery.js` keeps its existing hook-context behavior.
+
 ## [1.7.0] - 2026-04-29
 
 ### Added

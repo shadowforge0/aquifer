@@ -1,8 +1,34 @@
 # Aquifer Memory v1 Roadmap
 
-狀態：agent team 收斂後的實作切分；2026-04-26 已推進到 Slice 5 初版。Public serving 已有 opt-in curated mode，預設仍保留 legacy mode 以維持既有 consumer 相容。
+狀態：agent team 收斂後的實作切分；2026-05-01 已完成 current-memory serving repair 與 handoff/current-memory candidate envelope。Public serving 已有 opt-in curated mode，預設仍保留 legacy mode 以維持既有 consumer 相容。
 
 這份文件接在 [memory-scope-v1.md](memory-scope-v1.md) 後面，用來把 v1 scope 轉成可落地的 PR slices。這不是目前 1.5.x public API contract，也不是一次性大改計畫。
+
+## 2026-05-01 Ledger Update
+
+產品 repo implementation 狀態：envelope 功能已完成；ledger 已同步到 2026-05-01，剩餘主要是治理與發佈，不是 implementation blocker。
+
+已完成：
+
+- `3c403a9 Repair curated memory recall serving` 修復 current-memory hybrid recall / serving，實際 MCP、focused tests、乾淨 env pre-commit/full tests 已驗證。
+- `8f4b5c0 Add handoff candidate envelope` 補齊 handoff producer 的 current-memory DB write candidate envelope，新增 `schema/018-v1-finalization-candidate-envelope.sql` 與 `test/v1-finalization-envelope-schema.test.js`。
+- 最新實作驗證通過：`npm run lint`、focused tests 68 pass、`npm run test:release:package` 180 pass / 1 skip、`AQUIFER_TEST_DB_URL="$DATABASE_URL" npm run test:release:db` 36 pass、`git diff --check` 乾淨。
+- Live Codex wrapper smoke 通過：輸出 JSON 合法，`hasSystemMessage=true`、`hasAdditionalContext=false`、`recoveryInAdditionalContext=false`。
+- Fake recovery smoke 通過：`systemMessage` 包含 recovery warning，`additionalContext` 保留 memory context 且不含 `[AQUIFER RECOVERY]`。
+- `node --check /home/mingko/.codex/scripts/codex-bridge-hook.js` 通過。
+
+邊界：
+
+- Aquifer 產品 repo 不混入 private wrapper 行為，避免把 host UX 決策塞進 package surface。
+- `scripts/codex-recovery.js` 仍保持產品腳本原本 hook-context 行為；本輪未修改。
+- `/home/mingko/.codex/scripts/codex-bridge-hook.js` 是 private Codex wrapper，現在負責把 recovery candidates 轉為 top-level `systemMessage`。
+- `facts.db` 仍屬下一階段，不在本輪 handoff/current-memory envelope 或 recovery notice 修正範圍。
+- `codex-handoff-render.md` 是未追蹤 render 產物，保持隔離，不納入產品 commit。
+
+下一步：
+
+- 發佈前先做 release surface governance：確認 package surface、docs、version/tag/publish 決策都沒有把 private wrapper 行為納入 public contract。
+- 若決定 publish，再跑 release package gate 與 DB release gate，然後處理 push/tag/publish。
 
 ## 總判斷
 
