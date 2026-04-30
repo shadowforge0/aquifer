@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('crypto');
 const storage = require('./storage');
 const { createMemoryRecords } = require('./memory-records');
 const { createMemoryPromotion } = require('./memory-promotion');
@@ -37,6 +38,70 @@ function summarizeMemoryResults(results = [], extra = {}) {
     skipped: results.filter(result => result.action && !['promote', 'quarantine'].includes(result.action)).length,
     reasons: countByReason(results),
     ...extra,
+  };
+}
+
+function stableJson(value) {
+  if (value === null || value === undefined) return JSON.stringify(null);
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (typeof value === 'object') {
+    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function hashStable(value) {
+  return crypto.createHash('sha256').update(stableJson(value)).digest('hex');
+}
+
+function publicCandidateEnvelopeRow(candidate = {}, index = 0) {
+  const rest = { ...(candidate || {}) };
+  delete rest.embedding;
+  delete rest._preparedEvidenceTexts;
+  return {
+    index,
+    memoryType: rest.memoryType || rest.memory_type || null,
+    canonicalKey: rest.canonicalKey || rest.canonical_key || null,
+    scopeKind: rest.scopeKind || rest.scope_kind || null,
+    scopeKey: rest.scopeKey || rest.scope_key || null,
+    contextKey: rest.contextKey || rest.context_key || null,
+    topicKey: rest.topicKey || rest.topic_key || null,
+    inheritanceMode: rest.inheritanceMode || rest.inheritance_mode || null,
+    authority: rest.authority || null,
+    title: rest.title || null,
+    summary: rest.summary || null,
+    payload: rest.payload || {},
+    visibleInBootstrap: rest.visibleInBootstrap === true || rest.visible_in_bootstrap === true,
+    visibleInRecall: rest.visibleInRecall === true || rest.visible_in_recall === true,
+    evidenceRefs: Array.isArray(rest.evidenceRefs || rest.evidence_refs)
+      ? (rest.evidenceRefs || rest.evidence_refs)
+      : [],
+    validFrom: rest.validFrom || rest.valid_from || null,
+    validTo: rest.validTo || rest.valid_to || null,
+    staleAfter: rest.staleAfter || rest.stale_after || null,
+    candidateHash: hashStable({
+      memoryType: rest.memoryType || rest.memory_type || null,
+      canonicalKey: rest.canonicalKey || rest.canonical_key || null,
+      summary: rest.summary || null,
+      payload: rest.payload || {},
+      evidenceRefs: rest.evidenceRefs || rest.evidence_refs || [],
+    }),
+  };
+}
+
+function buildCandidateEnvelope(input = {}, candidates = [], opts = {}) {
+  const provided = input.candidateEnvelope || input.candidate_envelope || {};
+  const version = provided.version
+    || input.candidateEnvelopeVersion
+    || input.candidate_envelope_version
+    || 'current_memory_candidate_envelope_v1';
+  return {
+    ...provided,
+    version,
+    source: provided.source || input.mode || 'finalization',
+    transcriptHash: opts.transcriptHash || input.transcriptHash || null,
+    inputContext: provided.inputContext || provided.input_context || {},
+    candidates: candidates.map(publicCandidateEnvelopeRow),
   };
 }
 
@@ -259,6 +324,9 @@ function createSessionFinalization({
             evidenceRefs,
           });
       const candidates = decorateCandidates(rawCandidates, input);
+      const candidateEnvelope = buildCandidateEnvelope(input, candidates, {
+        transcriptHash: base.transcriptHash,
+      });
 
       const memoryResults = candidates.length > 0
         ? await promotion.promote(candidates, {
@@ -310,6 +378,10 @@ function createSessionFinalization({
         structuredSummary: safeStructuredSummary,
         humanReviewText,
         sessionStartText,
+        candidateEnvelope,
+        candidateEnvelopeHash: hashStable(candidateEnvelope),
+        candidateEnvelopeVersion: candidateEnvelope.version,
+        coverage: input.coverage || candidateEnvelope.coverage || {},
         metadata: {
           ...(input.metadata || {}),
           safetyGate: sanitized.meta || {},

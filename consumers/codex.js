@@ -1492,6 +1492,8 @@ async function finalizeTranscriptView(aquifer, view = {}, summary = {}, opts = {
         authority: opts.authority || 'verified_summary',
         candidates: Array.isArray(opts.candidates) ? opts.candidates : undefined,
         candidatePayload: opts.candidatePayload || null,
+        candidateEnvelope: opts.candidateEnvelope || null,
+        coverage: opts.coverage || null,
         metadata,
     });
     const humanReviewText = result.humanReviewText || '';
@@ -1644,6 +1646,8 @@ async function finalizeCodexSession(aquifer, input = {}, opts = {}) {
         currentMemory: input.currentMemory !== undefined ? input.currentMemory : opts.currentMemory,
         currentMemoryLimit: input.currentMemoryLimit || opts.currentMemoryLimit || null,
         includeCurrentMemory: input.includeCurrentMemory !== undefined ? input.includeCurrentMemory : opts.includeCurrentMemory,
+        candidateEnvelope: input.candidateEnvelope || opts.candidateEnvelope || null,
+        coverage: input.coverage || opts.coverage || null,
     });
 }
 

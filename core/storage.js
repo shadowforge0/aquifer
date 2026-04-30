@@ -67,6 +67,19 @@ function toJson(value, fallback) {
   return JSON.stringify(value === undefined ? fallback : value);
 }
 
+function stableJson(value) {
+  if (value === null || value === undefined) return JSON.stringify(null);
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (typeof value === 'object') {
+    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function hashStable(value) {
+  return crypto.createHash('sha256').update(stableJson(value)).digest('hex');
+}
+
 // ---------------------------------------------------------------------------
 // upsertSession
 // ---------------------------------------------------------------------------
@@ -380,6 +393,15 @@ async function upsertSessionFinalization(pool, input = {}, { schema, tenantId: d
   const status = normalizeFinalizationStatus(input.status || 'pending');
   const mode = normalizeFinalizationMode(input.mode || 'handoff');
   const phase = input.phase || 'curated_memory_v1';
+  const candidateEnvelope = input.candidateEnvelope || input.candidate_envelope || {};
+  const candidateEnvelopeHash = input.candidateEnvelopeHash
+    || input.candidate_envelope_hash
+    || (candidateEnvelope && Object.keys(candidateEnvelope).length > 0 ? hashStable(candidateEnvelope) : null);
+  const candidateEnvelopeVersion = input.candidateEnvelopeVersion
+    || input.candidate_envelope_version
+    || candidateEnvelope.version
+    || null;
+  const coverage = input.coverage || {};
   const preserveTerminal = `${finalizationTerminalSql(qi(schema) + '.session_finalizations')}
           AND ${qi(schema)}.session_finalizations.status <> EXCLUDED.status`;
   const result = await pool.query(
@@ -389,14 +411,16 @@ async function upsertSessionFinalization(pool, input = {}, { schema, tenantId: d
        scope_key, context_key, topic_key, scope_id, scope_snapshot,
        summary_row_id, memory_result,
        summary_text, structured_summary, human_review_text, session_start_text,
-       error, metadata, claimed_at, finalized_at
+       candidate_envelope, candidate_envelope_hash, candidate_envelope_version,
+       coverage, error, metadata, claimed_at, finalized_at
      )
      VALUES (
        $1,$2,$3,COALESCE($4,'codex'),$5,$6,$7,COALESCE($8,'curated_memory_v1'),
        $9,$10,$11,$12,$13,$14,$15,$16,COALESCE($17::jsonb,'{}'::jsonb),
        $18,COALESCE($19::jsonb,'{}'::jsonb),
        $20,COALESCE($21::jsonb,'{}'::jsonb),$22,$23,
-       $24,COALESCE($25::jsonb,'{}'::jsonb),$26,$27
+       COALESCE($24::jsonb,'{}'::jsonb),$25,$26,COALESCE($27::jsonb,'{}'::jsonb),
+       $28,COALESCE($29::jsonb,'{}'::jsonb),$30,$31
      )
      ON CONFLICT (tenant_id, source, agent_id, session_id, transcript_hash, phase)
      DO UPDATE SET
@@ -485,6 +509,26 @@ async function upsertSessionFinalization(pool, input = {}, { schema, tenantId: d
          THEN ${qi(schema)}.session_finalizations.session_start_text
          ELSE COALESCE(EXCLUDED.session_start_text, ${qi(schema)}.session_finalizations.session_start_text)
        END,
+       candidate_envelope = CASE
+         WHEN ${preserveTerminal}
+         THEN ${qi(schema)}.session_finalizations.candidate_envelope
+         ELSE COALESCE(NULLIF(EXCLUDED.candidate_envelope, '{}'::jsonb), ${qi(schema)}.session_finalizations.candidate_envelope)
+       END,
+       candidate_envelope_hash = CASE
+         WHEN ${preserveTerminal}
+         THEN ${qi(schema)}.session_finalizations.candidate_envelope_hash
+         ELSE COALESCE(EXCLUDED.candidate_envelope_hash, ${qi(schema)}.session_finalizations.candidate_envelope_hash)
+       END,
+       candidate_envelope_version = CASE
+         WHEN ${preserveTerminal}
+         THEN ${qi(schema)}.session_finalizations.candidate_envelope_version
+         ELSE COALESCE(EXCLUDED.candidate_envelope_version, ${qi(schema)}.session_finalizations.candidate_envelope_version)
+       END,
+       coverage = CASE
+         WHEN ${preserveTerminal}
+         THEN ${qi(schema)}.session_finalizations.coverage
+         ELSE COALESCE(NULLIF(EXCLUDED.coverage, '{}'::jsonb), ${qi(schema)}.session_finalizations.coverage)
+       END,
        error = CASE
          WHEN ${preserveTerminal}
          THEN ${qi(schema)}.session_finalizations.error
@@ -535,6 +579,10 @@ async function upsertSessionFinalization(pool, input = {}, { schema, tenantId: d
       toJson(input.structuredSummary, {}),
       input.humanReviewText || null,
       input.sessionStartText || null,
+      toJson(candidateEnvelope, {}),
+      candidateEnvelopeHash,
+      candidateEnvelopeVersion,
+      toJson(coverage, {}),
       input.error || null,
       toJson(input.metadata, {}),
       input.claimedAt || (status === 'processing' ? new Date().toISOString() : null),
@@ -698,14 +746,21 @@ async function upsertFinalizationCandidates(pool, rows = [], input = {}, { schem
     const memory = row.memory || {};
     const backingFact = row.backingFact || {};
     const evidenceRefs = candidate.evidenceRefs || candidate.evidence_refs || [];
+    const candidateHash = row.candidateHash || row.candidate_hash || hashStable({
+      action: row.action || 'skipped',
+      reason: row.reason || null,
+      memoryType: candidate.memoryType || candidate.memory_type || memory.memory_type || memory.memoryType || null,
+      canonicalKey: candidate.canonicalKey || candidate.canonical_key || memory.canonical_key || memory.canonicalKey || null,
+      payload: candidatePayload(candidate),
+    });
     const result = await pool.query(
       `INSERT INTO ${qi(schema)}.finalization_candidates (
          tenant_id, finalization_id, session_id, candidate_index, action, reason,
          memory_type, canonical_key, summary, payload, provenance,
-         memory_record_id, fact_assertion_id
+         memory_record_id, fact_assertion_id, candidate_hash
        )
        VALUES (
-         $1,$2,$3,$4,$5,$6,$7,$8,$9,COALESCE($10::jsonb,'{}'::jsonb),COALESCE($11::jsonb,'{}'::jsonb),$12,$13
+         $1,$2,$3,$4,$5,$6,$7,$8,$9,COALESCE($10::jsonb,'{}'::jsonb),COALESCE($11::jsonb,'{}'::jsonb),$12,$13,$14
        )
        ON CONFLICT (tenant_id, finalization_id, candidate_index)
        DO UPDATE SET
@@ -718,6 +773,7 @@ async function upsertFinalizationCandidates(pool, rows = [], input = {}, { schem
          provenance = COALESCE(NULLIF(EXCLUDED.provenance, '{}'::jsonb), ${qi(schema)}.finalization_candidates.provenance),
          memory_record_id = COALESCE(EXCLUDED.memory_record_id, ${qi(schema)}.finalization_candidates.memory_record_id),
          fact_assertion_id = COALESCE(EXCLUDED.fact_assertion_id, ${qi(schema)}.finalization_candidates.fact_assertion_id),
+         candidate_hash = COALESCE(EXCLUDED.candidate_hash, ${qi(schema)}.finalization_candidates.candidate_hash),
          updated_at = now()
        RETURNING *`,
       [
@@ -734,6 +790,7 @@ async function upsertFinalizationCandidates(pool, rows = [], input = {}, { schem
         toJson({ evidenceRefs }, {}),
         memory.id || memory.memory_id || null,
         backingFact.id || memory.backing_fact_id || null,
+        candidateHash,
       ]
     );
     out.push(result.rows[0] || null);

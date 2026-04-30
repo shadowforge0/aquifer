@@ -72,6 +72,15 @@ const MIGRATION_PLAN = [
       { table: 'memory_records', column: 'embedding' },
     ],
   },
+  {
+    id: '018-v1-finalization-candidate-envelope',
+    file: '018-v1-finalization-candidate-envelope.sql',
+    always: true,
+    signature: [
+      { table: 'session_finalizations', column: 'candidate_envelope' },
+      { table: 'finalization_candidates', column: 'candidate_hash' },
+    ],
+  },
 ];
 
 function createPostgresMigrationRuntime(opts = {}) {
@@ -286,6 +295,7 @@ function createPostgresMigrationRuntime(opts = {}) {
           ['015-v1-evidence-items.sql', '015-v1-evidence-items'],
           ['016-v1-evidence-ref-multi-item.sql', '016-v1-evidence-ref-multi-item'],
           ['017-v1-memory-record-embeddings.sql', '017-v1-memory-record-embeddings'],
+          ['018-v1-finalization-candidate-envelope.sql', '018-v1-finalization-candidate-envelope'],
         ]) {
           await client.query(loadSql(migration[0], schema));
           ddlExecuted.push(migration[1]);

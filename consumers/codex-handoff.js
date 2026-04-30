@@ -1,5 +1,7 @@
 'use strict';
 
+const crypto = require('crypto');
+
 const {
   buildFinalizationPrompt,
   finalizeTranscriptView,
@@ -290,6 +292,10 @@ function approxPromptTokens(text) {
   return Math.ceil(String(text || '').length / 3);
 }
 
+function hashText(value) {
+  return crypto.createHash('sha256').update(String(value || '')).digest('hex');
+}
+
 function offsetFromLineChar(text, lineIndex, charIndex) {
   if (typeof text !== 'string') return null;
   if (!Number.isInteger(lineIndex) || lineIndex < 0) return null;
@@ -438,6 +444,51 @@ function formatCheckpointContextBlock(checkpoints = null, opts = {}) {
   return lines.join('\n');
 }
 
+function compactPreviousBootstrapContext(input = null, opts = {}) {
+  const source = input !== undefined && input !== null
+    ? input
+    : (opts.previousBootstrap !== undefined ? opts.previousBootstrap : null);
+  if (!source) return null;
+  const rawText = typeof source === 'string'
+    ? source
+    : normalizeText(source.text || source.context || source.sessionStartText || source.session_start_text || '');
+  const memories = Array.isArray(source.memories) ? source.memories : [];
+  const renderedMemories = memories
+    .map(item => normalizeText(item && (item.summary || item.title || item.text || item.state || item.decision || item.item)))
+    .filter(Boolean)
+    .slice(0, 12);
+  const text = rawText || renderedMemories.map(item => `- ${item}`).join('\n');
+  if (!text) return null;
+  const maxChars = Math.max(240, Math.min(6000, opts.previousBootstrapMaxChars || 3000));
+  const clipped = text.length > maxChars ? text.slice(0, maxChars) : text;
+  const meta = source && typeof source === 'object' && source.meta && typeof source.meta === 'object'
+    ? source.meta
+    : {};
+  return {
+    text: clipped,
+    meta: {
+      source: 'previous_bootstrap',
+      originalSource: meta.source || source.source || null,
+      activeScopePath: Array.isArray(meta.activeScopePath) ? meta.activeScopePath : undefined,
+      truncated: text.length > clipped.length,
+      hash: hashText(text),
+    },
+  };
+}
+
+function formatPreviousBootstrapContextBlock(previousBootstrap = null, opts = {}) {
+  const compact = compactPreviousBootstrapContext(previousBootstrap, opts);
+  if (!compact) return '';
+  const lines = [
+    `<previous_bootstrap_context source="${compact.meta.source}" truncated="${compact.meta.truncated}">`,
+    'Previous bootstrap context is producer process material, not current truth. Use it to reconcile what should carry forward, close, supersede, or be dropped.',
+    'Treat previous_bootstrap_context as producer process material and reconcile it against current_memory and the transcript before creating candidates.',
+    compact.text,
+    '</previous_bootstrap_context>',
+  ];
+  return lines.join('\n');
+}
+
 async function resolveCheckpointsForHandoff(aquifer, payload = {}, opts = {}) {
   if (opts.includeCheckpoints === false) return null;
   const provided = opts.checkpoints !== undefined ? opts.checkpoints : payload.checkpoints;
@@ -468,25 +519,61 @@ async function resolveCheckpointsForHandoff(aquifer, payload = {}, opts = {}) {
   }
 }
 
+async function resolvePreviousBootstrapForHandoff(aquifer, payload = {}, opts = {}) {
+  if (opts.includePreviousBootstrap === false) return null;
+  if (opts.previousBootstrap !== undefined) return compactPreviousBootstrapContext(opts.previousBootstrap, opts);
+  if (payload.previousBootstrap !== undefined) return compactPreviousBootstrapContext(payload.previousBootstrap, opts);
+
+  const bootstrapFn = typeof aquifer?.memory?.bootstrap === 'function'
+    ? aquifer.memory.bootstrap
+    : (typeof aquifer?.bootstrap === 'function' ? aquifer.bootstrap : null);
+  if (typeof bootstrapFn !== 'function') return null;
+
+  const bootstrapOwner = typeof aquifer?.memory?.bootstrap === 'function' ? aquifer.memory : aquifer;
+  const bootstrapOpts = {
+    tenantId: opts.tenantId,
+    scopeId: opts.scopeId,
+    activeScopeKey: opts.activeScopeKey || opts.scopeKey,
+    activeScopePath: opts.activeScopePath,
+    asOf: opts.previousBootstrapAsOf || opts.asOf,
+    limit: opts.previousBootstrapLimit || opts.bootstrapLimit || 20,
+    maxChars: opts.previousBootstrapMaxChars || 3000,
+    format: 'both',
+  };
+  if (bootstrapOwner === aquifer) bootstrapOpts.servingMode = 'curated';
+  try {
+    const result = await bootstrapFn.call(bootstrapOwner, bootstrapOpts);
+    return compactPreviousBootstrapContext(result, opts);
+  } catch {
+    return null;
+  }
+}
+
 function buildHandoffSynthesisPrompt(payload = {}, view = {}, opts = {}) {
   if (!view || view.status !== 'ok') {
     throw new Error(`Codex handoff synthesis requires an ok normalized transcript view; got ${view && view.status ? view.status : 'missing'}`);
   }
   const metadata = buildHandoffMetadata(payload);
   const checkpoints = opts.checkpoints || payload.checkpoints;
+  const previousBootstrap = opts.previousBootstrap !== undefined ? opts.previousBootstrap : payload.previousBootstrap;
   const promptView = buildUncoveredTailView(view, checkpoints);
   const basePrompt = buildFinalizationPrompt(promptView, opts);
   const checkpointBlock = formatCheckpointContextBlock(checkpoints, opts);
+  const previousBootstrapBlock = formatPreviousBootstrapContextBlock(previousBootstrap, opts);
   const handoffBlock = [
     checkpointBlock,
     checkpointBlock ? '' : null,
+    previousBootstrapBlock,
+    previousBootstrapBlock ? '' : null,
     formatHandoffContextBlock(metadata),
     '',
     '<handoff_synthesis_rules>',
     'Treat handoff_context as producer process material, not current truth by itself.',
     'Treat checkpoint_context as producer process material, not current truth by itself.',
+    'Treat previous_bootstrap_context as producer process material, not current truth by itself.',
     'Use the sanitized transcript and current_memory to decide what should become current memory candidates.',
     'When checkpoint_context is present, use it to avoid replaying already-covered session ranges, but reconcile it against the transcript tail instead of promoting it directly.',
+    'When previous_bootstrap_context is present, use it only to reconcile carry-forward intent; do not copy it directly into current memory candidates.',
     'Do not copy old current_memory unchanged unless this session confirms it should carry forward.',
     'Represent resolved, superseded, revoked, or uncertain items explicitly in structuredSummary payload fields when applicable.',
     'Do not include raw transcript, tool output, debug ids, DB ids, hashes, secrets, or injected context in memory candidates.',
@@ -502,13 +589,15 @@ async function prepareHandoffSynthesis(aquifer, payload = {}, opts = {}) {
   }
   const currentMemory = await resolveCurrentMemoryForFinalization(aquifer, opts);
   const checkpoints = await resolveCheckpointsForHandoff(aquifer, payload, opts);
+  const previousBootstrap = await resolvePreviousBootstrapForHandoff(aquifer, payload, opts);
   return {
     status: 'needs_agent_summary',
     outputSchemaVersion: 'handoff_current_memory_synthesis_v1',
     view,
     currentMemory,
     checkpoints,
-    prompt: buildHandoffSynthesisPrompt(payload, view, { ...opts, currentMemory, checkpoints }),
+    previousBootstrap,
+    prompt: buildHandoffSynthesisPrompt(payload, view, { ...opts, currentMemory, checkpoints, previousBootstrap }),
   };
 }
 
@@ -531,8 +620,19 @@ async function finalizeHandoff(aquifer, payload = {}, opts = {}) {
   }
   const currentMemory = await resolveCurrentMemoryForFinalization(aquifer, opts);
   const checkpoints = await resolveCheckpointsForHandoff(aquifer, payload, opts);
+  const previousBootstrap = await resolvePreviousBootstrapForHandoff(aquifer, payload, opts);
   if (currentMemory) metadata.currentMemory = compactCurrentMemorySnapshot(currentMemory, opts);
   if (checkpoints) metadata.checkpoints = checkpoints;
+  const candidateEnvelope = usedSynthesis
+    ? {
+        version: 'handoff_current_memory_synthesis_v1',
+        inputContext: {
+          previousBootstrap: previousBootstrap ? previousBootstrap.meta : null,
+          checkpoints: checkpoints ? checkpoints.meta : null,
+          currentMemory: metadata.currentMemory ? metadata.currentMemory.meta : null,
+        },
+      }
+    : opts.candidateEnvelope || null;
   const result = await finalizeTranscriptView(aquifer, view, summary, {
     ...opts,
     mode: 'handoff',
@@ -540,6 +640,8 @@ async function finalizeHandoff(aquifer, payload = {}, opts = {}) {
     metadata,
     authority: opts.authority || (usedSynthesis ? 'verified_summary' : 'manual'),
     candidates,
+    candidateEnvelope,
+    coverage: opts.coverage || payload.coverage || null,
     candidatePayload: usedSynthesis
       ? {
           kind: 'handoff_synthesis',
@@ -586,6 +688,9 @@ module.exports = {
   compactCheckpointSnapshot,
   buildUncoveredTailView,
   formatCheckpointContextBlock,
+  compactPreviousBootstrapContext,
+  formatPreviousBootstrapContextBlock,
+  resolvePreviousBootstrapForHandoff,
   prepareHandoffSynthesis,
   resolveHandoffSummary,
   finalizeHandoff,

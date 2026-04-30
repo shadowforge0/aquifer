@@ -950,6 +950,13 @@ describe('Codex consumer recovery helpers', () => {
                 facts: [{ subject: 'Aquifer', statement: 'Finalization writes through core ledger.' }],
             },
             currentMemory: prepared.currentMemory,
+            candidateEnvelope: {
+                version: 'recovery_candidate_envelope_v1',
+                inputContext: { previousBootstrap: { hash: 'bootstrap-hash' } },
+            },
+            coverage: {
+                transcript: { coveredUntilMessageIndex: 3 },
+            },
         });
 
         assert.equal(result.status, 'finalized');
@@ -964,6 +971,11 @@ describe('Codex consumer recovery helpers', () => {
         assert.equal(finalizeCall.input.metadata.trigger, 'session_start_recovery');
         assert.equal(finalizeCall.input.metadata.currentMemory.meta.servingContract, 'current_memory_v1');
         assert.equal(finalizeCall.input.metadata.currentMemory.memories[0].summary, 'Existing current memory must be reconciled.');
+        assert.equal(finalizeCall.input.candidateEnvelope.version, 'recovery_candidate_envelope_v1');
+        assert.equal(finalizeCall.input.candidateEnvelope.inputContext.previousBootstrap.hash, 'bootstrap-hash');
+        assert.deepEqual(finalizeCall.input.coverage, {
+            transcript: { coveredUntilMessageIndex: 3 },
+        });
     });
 
     it('uses resolved current memory scope during finalization when caller omits active scope', async () => {

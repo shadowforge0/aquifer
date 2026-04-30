@@ -63,6 +63,10 @@ function makeFinalizationPool(opts = {}) {
             mode: params[8],
             status: params[9],
             memory_result: params[18] ? JSON.parse(params[18]) : {},
+            candidate_envelope: params[23] ? JSON.parse(params[23]) : {},
+            candidate_envelope_hash: params[24],
+            candidate_envelope_version: params[25],
+            coverage: params[26] ? JSON.parse(params[26]) : {},
           }],
         };
       }
@@ -165,6 +169,57 @@ describe('session finalization', () => {
     assert.equal(payload.synthesisKind, 'handoff_current_memory_synthesis_v1');
     assert.equal(payload.promotionGate, 'core_finalization');
     assert.equal(payload.state, 'Handoff synthesis candidates must keep producer lineage.');
+  });
+
+  it('persists candidate envelope as non-serving finalization material', async () => {
+    const pool = makeFinalizationPool();
+    const finalization = createSessionFinalization({
+      pool,
+      schema: 'aq',
+      recordsSchema: '"aq"',
+      defaultTenantId: 'default',
+    });
+
+    const result = await finalization.finalizeSession({
+      sessionId: 's1',
+      agentId: 'main',
+      source: 'codex',
+      transcriptHash: 'b'.repeat(64),
+      mode: 'handoff',
+      summaryText: 'Handoff synthesis produced dual outputs.',
+      structuredSummary: {
+        states: [{ state: 'Committed bootstrap continuation must follow core promotion.' }],
+      },
+      candidateEnvelope: {
+        version: 'handoff_current_memory_synthesis_v1',
+        inputContext: {
+          previousBootstrap: {
+            source: 'session_bootstrap',
+            hash: 'prev-bootstrap-hash',
+          },
+        },
+      },
+      coverage: {
+        transcript: { coveredUntilMessageIndex: 1 },
+      },
+    });
+
+    const finalizationInsert = pool.queries
+      .filter(query => String(query.sql).includes('INSERT INTO "aq".session_finalizations'))
+      .at(-1);
+    const envelope = JSON.parse(finalizationInsert.params[23]);
+    const metadata = JSON.parse(finalizationInsert.params[28]);
+    assert.equal(result.finalization.candidate_envelope_version, 'handoff_current_memory_synthesis_v1');
+    assert.equal(result.finalization.candidate_envelope_hash.length, 64);
+    assert.equal(envelope.version, 'handoff_current_memory_synthesis_v1');
+    assert.equal(envelope.inputContext.previousBootstrap.hash, 'prev-bootstrap-hash');
+    assert.equal(envelope.candidates.length, 1);
+    assert.equal(envelope.candidates[0].memoryType, 'state');
+    assert.deepEqual(JSON.parse(finalizationInsert.params[26]), {
+      transcript: { coveredUntilMessageIndex: 1 },
+    });
+    assert.equal(metadata.candidateEnvelope, undefined);
+    assert.doesNotMatch(finalizationInsert.params[22] || '', /prev-bootstrap-hash/);
   });
 
   it('passes embedFn through finalization so promoted memory rows persist embeddings', async () => {

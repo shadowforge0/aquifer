@@ -137,6 +137,30 @@ describe('Codex handoff finalization helper', () => {
     assert.doesNotMatch(prompt, /id: 42/);
   });
 
+  it('adds previous bootstrap context as process material without promoting it directly', () => {
+    const prompt = handoff.buildHandoffSynthesisPrompt(samplePayload(), sampleView(), {
+      previousBootstrap: {
+        text: [
+          '<memory-bootstrap memories="2">',
+          '- open_loop: Prior run said to verify candidate envelope.',
+          '- decision: Prior bootstrap context is continuity material.',
+          '</memory-bootstrap>',
+        ].join('\n'),
+        meta: {
+          source: 'session_bootstrap',
+          activeScopePath: ['global', 'project:aquifer'],
+          generatedAt: '2026-05-01T00:00:00.000Z',
+        },
+      },
+    });
+
+    assert.match(prompt, /previous_bootstrap_context/);
+    assert.match(prompt, /Prior run said to verify candidate envelope/);
+    assert.match(prompt, /Treat previous_bootstrap_context as producer process material/);
+    assert.match(prompt, /reconcile it against current_memory and the transcript/);
+    assert.doesNotMatch(prompt, /generatedAt/);
+  });
+
   it('uses only uncovered transcript tail when checkpoint coverage is explicit', () => {
     const view = sampleView({
       messages: [
@@ -315,6 +339,62 @@ describe('Codex handoff finalization helper', () => {
     assert.equal(prepared.outputSchemaVersion, 'handoff_current_memory_synthesis_v1');
   });
 
+  it('passes previous bootstrap context into handoff synthesis preparation', async () => {
+    const prepared = await handoff.prepareHandoffSynthesis({
+      memory: { async current() { return { memories: [], meta: { count: 0 } }; } },
+    }, samplePayload(), {
+      view: sampleView(),
+      previousBootstrap: {
+        text: 'Prior bootstrap carried a scope-specific open loop.',
+        meta: { source: 'session_bootstrap' },
+      },
+    });
+
+    assert.equal(prepared.previousBootstrap.meta.source, 'previous_bootstrap');
+    assert.match(prepared.prompt, /previous_bootstrap_context/);
+    assert.match(prepared.prompt, /Prior bootstrap carried a scope-specific open loop/);
+  });
+
+  it('auto-loads previous bootstrap from current-memory bootstrap when not provided', async () => {
+    const bootstrapCalls = [];
+    const prepared = await handoff.prepareHandoffSynthesis({
+      memory: {
+        async current() {
+          return { memories: [], meta: { servingContract: 'current_memory_v1' } };
+        },
+        async bootstrap(input) {
+          bootstrapCalls.push(input);
+          return {
+            text: '<memory-bootstrap memories="1">\n- open_loop: Auto-loaded bootstrap should be reconciled.\n</memory-bootstrap>',
+            memories: [{
+              memoryType: 'open_loop',
+              summary: 'Auto-loaded bootstrap should be reconciled.',
+            }],
+            meta: {
+              source: 'current_memory_bootstrap',
+              activeScopePath: input.activeScopePath,
+            },
+          };
+        },
+      },
+    }, samplePayload(), {
+      view: sampleView(),
+      activeScopeKey: 'project:aquifer',
+      activeScopePath: ['global', 'project:aquifer'],
+      previousBootstrapLimit: 7,
+      previousBootstrapMaxChars: 900,
+    });
+
+    assert.equal(bootstrapCalls.length, 1);
+    assert.deepEqual(bootstrapCalls[0].activeScopePath, ['global', 'project:aquifer']);
+    assert.equal(bootstrapCalls[0].activeScopeKey, 'project:aquifer');
+    assert.equal(bootstrapCalls[0].limit, 7);
+    assert.equal(bootstrapCalls[0].maxChars, 900);
+    assert.equal(prepared.previousBootstrap.meta.originalSource, 'current_memory_bootstrap');
+    assert.match(prepared.prompt, /Auto-loaded bootstrap should be reconciled/);
+    assert.match(prepared.prompt, /previous_bootstrap_context/);
+  });
+
   it('rejects manual handoff finalization without a real transcript view', async () => {
     const calls = [];
     const aquifer = {
@@ -429,6 +509,7 @@ describe('Codex handoff finalization helper', () => {
 
   it('promotes explicit handoff synthesis output instead of raw handoff payload', async () => {
     const calls = [];
+    const bootstrapCalls = [];
     const view = sampleView();
     const synthesisSummary = {
       summaryText: 'Reviewed handoff synthesis summary.',
@@ -478,6 +559,15 @@ describe('Codex handoff finalization helper', () => {
           };
         },
       },
+      memory: {
+        async bootstrap(input) {
+          bootstrapCalls.push(input);
+          return {
+            text: '<memory-bootstrap memories="1">\n- decision: Previous bootstrap enters only as envelope input context.\n</memory-bootstrap>',
+            meta: { source: 'current_memory_bootstrap' },
+          };
+        },
+      },
     };
 
     const result = await handoff.finalizeHandoff(aquifer, samplePayload({
@@ -499,6 +589,10 @@ describe('Codex handoff finalization helper', () => {
     assert.equal(calls[0].candidatePayload.kind, 'handoff_synthesis');
     assert.equal(calls[0].candidatePayload.synthesisKind, 'handoff_current_memory_synthesis_v1');
     assert.equal(calls[0].candidates[0].canonicalKey, 'state:project:aquifer:handoff-reviewed');
+    assert.equal(bootstrapCalls.length, 1);
+    assert.equal(calls[0].candidateEnvelope.version, 'handoff_current_memory_synthesis_v1');
+    assert.equal(calls[0].candidateEnvelope.inputContext.previousBootstrap.originalSource, 'current_memory_bootstrap');
+    assert.equal(calls[0].candidateEnvelope.inputContext.previousBootstrap.hash.length, 64);
     assert.doesNotMatch(calls[0].summaryText, /Raw handoff/);
   });
 
