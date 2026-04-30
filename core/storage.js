@@ -1,6 +1,14 @@
 'use strict';
 
 const crypto = require('crypto');
+const {
+  upsertCheckpointRun,
+  updateCheckpointRunStatus,
+  listCheckpointRuns,
+  upsertCheckpointRunSources,
+  listCheckpointRunSources,
+} = require('./storage-checkpoints');
+const { publicPlaceholderSummarySql } = require('./public-session-filter');
 
 // C1: quote identifier for SQL safety
 function qi(identifier) { return `"${identifier}"`; }
@@ -49,7 +57,6 @@ const FINALIZATION_MODES = new Set([
   'afterburn',
   'manual',
 ]);
-
 function requireField(obj, field) {
   if (!obj || obj[field] === undefined || obj[field] === null || obj[field] === '') {
     throw new Error(`${field} is required`);
@@ -270,6 +277,7 @@ async function searchSessions(pool, query, {
   const where = [
     `(ss.search_text ILIKE '%' || $1 || '%' OR ss.search_tsv @@ plainto_tsquery('${cfg}', $2))`,
     `s.tenant_id = $3`,
+    `NOT ${publicPlaceholderSummarySql('ss')}`,
   ];
   const params = [likeQuery, query, tenantId];
 
@@ -378,15 +386,17 @@ async function upsertSessionFinalization(pool, input = {}, { schema, tenantId: d
     `INSERT INTO ${qi(schema)}.session_finalizations (
        tenant_id, session_row_id, source, host, agent_id, session_id,
        transcript_hash, phase, mode, status, finalizer_model, scope_kind,
-       scope_key, context_key, topic_key, summary_row_id, memory_result,
+       scope_key, context_key, topic_key, scope_id, scope_snapshot,
+       summary_row_id, memory_result,
        summary_text, structured_summary, human_review_text, session_start_text,
        error, metadata, claimed_at, finalized_at
      )
      VALUES (
        $1,$2,$3,COALESCE($4,'codex'),$5,$6,$7,COALESCE($8,'curated_memory_v1'),
        $9,$10,$11,$12,$13,$14,$15,$16,COALESCE($17::jsonb,'{}'::jsonb),
-       $18,COALESCE($19::jsonb,'{}'::jsonb),$20,$21,
-       $22,COALESCE($23::jsonb,'{}'::jsonb),$24,$25
+       $18,COALESCE($19::jsonb,'{}'::jsonb),
+       $20,COALESCE($21::jsonb,'{}'::jsonb),$22,$23,
+       $24,COALESCE($25::jsonb,'{}'::jsonb),$26,$27
      )
      ON CONFLICT (tenant_id, source, agent_id, session_id, transcript_hash, phase)
      DO UPDATE SET
@@ -434,6 +444,16 @@ async function upsertSessionFinalization(pool, input = {}, { schema, tenantId: d
          WHEN ${preserveTerminal}
          THEN ${qi(schema)}.session_finalizations.topic_key
          ELSE COALESCE(EXCLUDED.topic_key, ${qi(schema)}.session_finalizations.topic_key)
+       END,
+       scope_id = CASE
+         WHEN ${preserveTerminal}
+         THEN ${qi(schema)}.session_finalizations.scope_id
+         ELSE COALESCE(EXCLUDED.scope_id, ${qi(schema)}.session_finalizations.scope_id)
+       END,
+       scope_snapshot = CASE
+         WHEN ${preserveTerminal}
+         THEN ${qi(schema)}.session_finalizations.scope_snapshot
+         ELSE COALESCE(NULLIF(EXCLUDED.scope_snapshot, '{}'::jsonb), ${qi(schema)}.session_finalizations.scope_snapshot)
        END,
        summary_row_id = CASE
          WHEN ${preserveTerminal}
@@ -507,6 +527,8 @@ async function upsertSessionFinalization(pool, input = {}, { schema, tenantId: d
       input.scopeKey || null,
       input.contextKey || null,
       input.topicKey || null,
+      input.scopeId || input.scope_id || null,
+      toJson(input.scopeSnapshot || input.scope_snapshot, {}),
       input.summaryRowId || null,
       toJson(input.memoryResult, {}),
       input.summaryText || null,
@@ -638,6 +660,33 @@ function candidateText(candidate = {}) {
   return '';
 }
 
+const EXPLICIT_EVIDENCE_PAYLOAD_KEYS = [
+  'evidenceText',
+  'evidence_text',
+  'evidenceExcerpt',
+  'evidence_excerpt',
+  'sourceText',
+  'source_text',
+  'quote',
+  'evidenceItems',
+  'evidence_items',
+  'evidenceTexts',
+  'evidence_texts',
+];
+
+function candidatePayload(candidate = {}) {
+  if (!candidate || typeof candidate !== 'object') return {};
+  const base = candidate.payload && typeof candidate.payload === 'object'
+    ? { ...candidate.payload }
+    : { ...candidate };
+  for (const key of EXPLICIT_EVIDENCE_PAYLOAD_KEYS) {
+    if (candidate[key] !== undefined && base[key] === undefined) {
+      base[key] = candidate[key];
+    }
+  }
+  return base;
+}
+
 async function upsertFinalizationCandidates(pool, rows = [], input = {}, { schema, tenantId: defaultTenantId } = {}) {
   if (!Array.isArray(rows) || rows.length === 0) return [];
   requireField(input, 'finalizationId');
@@ -681,7 +730,7 @@ async function upsertFinalizationCandidates(pool, rows = [], input = {}, { schem
         candidate.memoryType || candidate.memory_type || memory.memory_type || memory.memoryType || null,
         candidate.canonicalKey || candidate.canonical_key || memory.canonical_key || memory.canonicalKey || null,
         candidateText(candidate) || candidateText(memory) || null,
-        toJson(candidate.payload || candidate, {}),
+        toJson(candidatePayload(candidate), {}),
         toJson({ evidenceRefs }, {}),
         memory.id || memory.memory_id || null,
         backingFact.id || memory.backing_fact_id || null,
@@ -839,6 +888,7 @@ async function searchTurnEmbeddings(pool, {
     params.push(source);
     where.push(`s.source = $${params.length}`);
   }
+  where.push(`NOT ${publicPlaceholderSummarySql('ss')}`);
 
   params.push(`[${queryVec.join(',')}]`);
   const vecPos = params.length;
@@ -945,6 +995,7 @@ async function searchSummaryEmbeddings(pool, {
     params.push(candidateSessionIds);
     where.push(`s.session_id = ANY($${params.length})`);
   }
+  where.push(`NOT ${publicPlaceholderSummarySql('ss')}`);
 
   params.push(limit);
 
@@ -1130,6 +1181,11 @@ module.exports = {
   getSessionFinalization,
   updateSessionFinalizationStatus,
   listSessionFinalizations,
+  upsertCheckpointRun,
+  updateCheckpointRunStatus,
+  listCheckpointRuns,
+  upsertCheckpointRunSources,
+  listCheckpointRunSources,
   upsertFinalizationCandidates,
   extractUserTurns,
   upsertTurnEmbeddings,

@@ -10,6 +10,7 @@
  *   aquifer recall <query> [options]    Search sessions
  *   aquifer backfill [options]          Enrich pending sessions
  *   aquifer stats [options]             Show database statistics
+ *   aquifer backend-info [--json]       Show selected backend capabilities
  *   aquifer export [options]            Export sessions
  *   aquifer operator ...                Run operator-safe consolidation jobs
  *   aquifer mcp                         Start MCP server
@@ -17,7 +18,9 @@
 
 const fs = require('fs');
 const { createAquiferFromConfig } = require('./shared/factory');
+const { loadConfig } = require('./shared/config');
 const { formatRecallResults } = require('./shared/recall-format');
+const { backendCapabilities } = require('../core/backends/capabilities');
 
 function formatDate(value, fallback) {
   if (!value) return fallback;
@@ -109,6 +112,7 @@ function buildQuickstartSetupHints(env, detected, err) {
     if (!hasDb) {
       hints.push('If you expect local defaults, make sure PostgreSQL is running on localhost:5432.');
       hints.push('Otherwise set DATABASE_URL or AQUIFER_DB_URL explicitly and run quickstart again.');
+      hints.push('To inspect the degraded local starter profile without PostgreSQL, run `AQUIFER_BACKEND=local aquifer backend-info --json`.');
     }
     return hints;
   }
@@ -124,6 +128,7 @@ function buildQuickstartSetupHints(env, detected, err) {
     if (!hasDb) hints.push('PostgreSQL was not autodetected and no DATABASE_URL is set.');
     if (!hasEmbed) hints.push('No embedding provider was autodetected and no embed env is set.');
     hints.push('Try `docker compose up -d`, then run `npx aquifer quickstart` again.');
+    hints.push('To inspect the degraded local starter profile without PostgreSQL, run `AQUIFER_BACKEND=local aquifer backend-info --json`.');
   }
 
   hints.push(`Raw error: ${message}`);
@@ -176,8 +181,8 @@ function parseArgs(argv) {
     'verdict', 'feedback-type', 'note', 'db', 'since', 'min-messages', 'lookback-days', 'max-chars',
     'out', 'active-scope-key', 'active-scope-path', 'cadence', 'period-start', 'period-end',
     'policy-version', 'worker-id', 'apply-token', 'claim-lease-seconds', 'snapshot-as-of',
-    'scope-key', 'scope-keys', 'scope-kind', 'context-key', 'topic-key', 'authority', 'input',
-    'synthesis-summary', 'synthesis-summary-file',
+    'scope-id', 'scope-key', 'scope-keys', 'scope-kind', 'context-key', 'topic-key', 'authority', 'input',
+    'synthesis-summary', 'synthesis-summary-file', 'min-finalizations', 'checkpoint-key',
   ]);
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--') { args._.push(...argv.slice(i + 1)); break; }
@@ -381,15 +386,122 @@ async function cmdStats(aquifer, args) {
   if (args.flags.json) {
     console.log(JSON.stringify(stats, null, 2));
   } else {
+    console.log(`Backend: ${stats.backendKind || 'unknown'} (${stats.backendProfile || 'unknown'})`);
+    console.log(`Serving mode: ${stats.serving?.mode || 'legacy'}`);
+    console.log(`Active scope: ${stats.serving?.activeScopePath?.join(' > ') || stats.serving?.activeScopeKey || 'none'}`);
     console.log(`Sessions: ${stats.sessionTotal} (${Object.entries(stats.sessions).map(([k, v]) => `${k}: ${v}`).join(', ')})`);
     console.log(`Summaries: ${stats.summaries}`);
     console.log(`Turn embeddings: ${stats.turnEmbeddings}`);
     console.log(`Entities: ${stats.entities}`);
+    if (stats.memoryRecords) {
+      console.log(`Memory records: ${stats.memoryRecords.total} (${stats.memoryRecords.active} active, ${stats.memoryRecords.visibleInRecall} recall-visible, ${stats.memoryRecords.visibleInBootstrap} bootstrap-visible)`);
+      if (stats.memoryRecords.latest) console.log(`Memory record range: ${formatDate(stats.memoryRecords.earliest, '?')} — ${formatDate(stats.memoryRecords.latest, '?')}`);
+    }
+    if (stats.sessionFinalizations?.available) {
+      const statusText = Object.entries(stats.sessionFinalizations.statuses || {})
+        .map(([status, count]) => `${status}: ${count}`)
+        .join(', ') || 'none';
+      console.log(`Session finalizations: ${stats.sessionFinalizations.total} (${statusText})`);
+      if (stats.sessionFinalizations.latestFinalizedAt) console.log(`Latest finalization: ${formatDate(stats.sessionFinalizations.latestFinalizedAt, '?')}`);
+    }
     if (stats.earliest) console.log(`Range: ${formatDate(stats.earliest, '?')} — ${formatDate(stats.latest, '?')}`);
+    if ((stats.serving?.mode || 'legacy') !== 'curated') {
+      console.log('Warning: legacy serving returns session/evidence material; configure curated serving with an active scope for current-memory answers.');
+    }
   }
 }
 
+function selectedBackendInfo(opts = {}) {
+  const config = loadConfig(opts);
+  const backendKind = config.storage.backend;
+  const capabilities = backendCapabilities(backendKind);
+  return {
+    backendKind,
+    backendProfile: capabilities.profile,
+    label: capabilities.label,
+    summary: capabilities.summary,
+    capabilities: capabilities.capabilities,
+    storage: {
+      localPath: config.storage.local.path,
+      postgresUrlConfigured: Boolean(config.storage.postgres.url || config.db.url),
+    },
+    upgradeHint: capabilities.upgradeHint,
+  };
+}
+
+async function cmdBackendInfo(args) {
+  const info = selectedBackendInfo();
+  if (args.flags.json) {
+    console.log(JSON.stringify(info, null, 2));
+    return;
+  }
+
+  console.log(`Backend: ${info.label} (${info.backendKind}/${info.backendProfile})`);
+  console.log(info.summary);
+  console.log(`PostgreSQL URL configured: ${info.storage.postgresUrlConfigured ? 'yes' : 'no'}`);
+  if (info.backendKind === 'local') {
+    console.log(`Local path: ${info.storage.localPath}`);
+  }
+  if (info.upgradeHint) {
+    console.log(`Upgrade: ${info.upgradeHint}`);
+  }
+  console.log('Capabilities:');
+  for (const [name, status] of Object.entries(info.capabilities)) {
+    console.log(`  ${name}: ${status}`);
+  }
+}
+
+async function cmdLocalQuickstart(aquifer) {
+  const cfg = aquifer.getConfig();
+  console.log('Aquifer quickstart — verifying local starter backend.\n');
+
+  console.log('1/5  Preparing local store...');
+  await aquifer.init();
+  console.log(`     OK — ${cfg.backendPath}\n`);
+
+  const sessionId = `quickstart-local-${Date.now()}`;
+  console.log('2/5  Committing test session...');
+  await aquifer.commit(sessionId, [
+    { role: 'user', content: 'Aquifer local starter can store a session without PostgreSQL.' },
+    { role: 'assistant', content: 'Local starter uses JSON persistence and degraded lexical recall.' },
+  ], { agentId: 'quickstart', source: 'quickstart' });
+  console.log('     OK\n');
+
+  console.log('3/5  Checking degraded enrich path...');
+  const enrichResult = await aquifer.enrich(sessionId, {
+    agentId: 'quickstart',
+    skipSummary: true,
+    skipEntities: true,
+  });
+  console.log(`     OK — ${enrichResult.turnsEmbedded} turns embedded (local starter is lexical only)\n`);
+
+  console.log('4/5  Recalling "JSON persistence"...');
+  const results = await aquifer.recall('JSON persistence', { agentId: 'quickstart', limit: 3 });
+  if (results.length === 0) {
+    printQuickstartFailure('local starter could not recall its own test session.', [
+      'The write step succeeded, but lexical recall returned no matches.',
+    ]);
+    process.exitCode = 1;
+    return;
+  }
+  console.log(`     OK — ${results.length} result(s), top score: ${results[0].score?.toFixed(3)}\n`);
+
+  console.log('5/5  Cleaning up test data...');
+  if (typeof aquifer.deleteSession === 'function') {
+    await aquifer.deleteSession(sessionId, { agentId: 'quickstart' });
+  }
+  console.log('     OK\n');
+
+  console.log('✓ Aquifer local starter is working.');
+  console.log('  This backend is degraded: use PostgreSQL quickstart for semantic recall, migrations, curated memory, and operator workflows.');
+}
+
 async function cmdQuickstart(aquifer) {
+  if (aquifer.getConfig().backendKind === 'local') {
+    await cmdLocalQuickstart(aquifer);
+    return;
+  }
+
   console.log('Aquifer quickstart — verifying end-to-end setup.\n');
 
   // 1. Migrate
@@ -514,6 +626,51 @@ async function cmdOperator(aquifer, args) {
   const operatorVerb = args._[1] || 'compaction';
   const cadenceVerbs = new Set(['manual', 'daily', 'weekly', 'monthly']);
 
+  if (operatorVerb === 'checkpoint') {
+    const synthesisSummary = readSynthesisSummaryFromFlags(args.flags);
+    const result = await aquifer.checkpoints.runProducer({
+      scopeId: args.flags['scope-id'] || undefined,
+      scopeKind: args.flags['scope-kind'] || undefined,
+      scopeKey: args.flags['scope-key'] || undefined,
+      source: args.flags.source || undefined,
+      agentId: args.flags['agent-id'] || undefined,
+      minFinalizations: args.flags['min-finalizations']
+        ? parsePositiveInt(args.flags['min-finalizations'], 10)
+        : undefined,
+      limit: parsePositiveInt(args.flags.limit, 50),
+      checkpointKey: args.flags['checkpoint-key'] || undefined,
+      policyVersion: args.flags['policy-version'] || undefined,
+      force: args.flags.force === true,
+      apply: args.flags.apply === true,
+      finalize: args.flags.finalize === true,
+      includeSynthesisPrompt: args.flags['include-synthesis-prompt'] === true,
+      synthesisSummary,
+    });
+
+    if (args.flags.json) {
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+
+    console.log(result.due
+      ? `Checkpoint due for ${result.scope.scopeKey}: ${result.sourceFinalizationCount} finalized source(s).`
+      : `Checkpoint not ready for ${result.scope.scopeKey}: ${result.sourceFinalizationCount}/${result.minFinalizations} finalized source(s).`);
+    if (result.range) {
+      console.log(`Range: finalization ${result.range.fromFinalizationIdExclusive} -> ${result.range.toFinalizationIdInclusive}`);
+    }
+    if (result.synthesisPrompt) {
+      console.log('\nCheckpoint synthesis prompt:\n');
+      console.log(result.synthesisPrompt);
+    }
+    if (result.run) {
+      console.log(`Run: #${result.run.id} status=${result.run.status}`);
+    } else if (result.runInput) {
+      console.log(`Run input prepared: status=${result.runInput.status}`);
+      console.log('Mode: dry-run only. Re-run with --apply and an explicit synthesis summary to write checkpoint_runs.');
+    }
+    return;
+  }
+
   if (operatorVerb === 'archive-distill') {
     const inputPath = args.flags.input || args._[2];
     if (!inputPath) {
@@ -544,7 +701,7 @@ async function cmdOperator(aquifer, args) {
   }
 
   if (operatorVerb !== 'compaction' && operatorVerb !== 'compact' && !cadenceVerbs.has(operatorVerb)) {
-    console.error('Usage: aquifer operator <compaction|archive-distill> [...]');
+    console.error('Usage: aquifer operator <compaction|checkpoint|archive-distill> [...]');
     process.exit(1);
   }
 
@@ -650,6 +807,7 @@ async function main() {
 Commands:
    quickstart                  Verify end-to-end setup (migrate → commit → enrich → recall)
    migrate                     Run database migrations
+  backend-info                Show selected backend capabilities without connecting to a database
   recall <query>              Search sessions (requires embed config)
   evidence-recall <query>     Search legacy session/evidence plane explicitly
   feedback                    Record trust feedback on a session
@@ -661,7 +819,7 @@ Commands:
   stats                       Show database statistics
   export                      Export sessions as JSONL
   bootstrap                   Show recent session context (for new session start)
-  codex-recovery ...          Inspect or run Codex SessionStart recovery flow
+  codex-recovery ...          Inspect or run Codex recovery/checkpoint flows
    ingest-opencode             Import sessions from OpenCode's local SQLite DB
    mcp                         Start MCP server
 
@@ -697,7 +855,10 @@ Options:
   --include-synthesis-prompt  Include timer synthesis prompt in operator output
   --synthesis-summary JSON    Timer synthesis summary JSON to attach to a compaction plan
   --synthesis-summary-file P  Read timer synthesis summary JSON from file
+  --min-finalizations N       Min finalized session summaries before checkpoint proposal
+  --checkpoint-key KEY        Explicit checkpoint key when applying checkpoint producer output
   --scope-key A,B             Limit compaction snapshot to specific scope keys
+  --scope-id ID               Target scope row id for checkpoint producer
   --scope-kind KIND           Explicit synthesis target scope kind
   --snapshot-as-of ISO        Read active snapshot as of a specific instant
   --claim-lease-seconds N     Override compaction apply lease
@@ -711,6 +872,11 @@ Operator examples:
   aquifer operator compaction daily --include-synthesis-prompt --json
   aquifer operator compaction manual --period-start 2026-04-27T00:00:00Z --period-end 2026-04-28T00:00:00Z --apply
   aquifer operator compaction daily --synthesis-summary-file /tmp/timer-summary.json --apply --promote-candidates --json
+  aquifer operator checkpoint --scope-key project:aquifer --min-finalizations 10 --include-synthesis-prompt --json
+  aquifer operator checkpoint --scope-id 7 --synthesis-summary-file /tmp/checkpoint-summary.json --apply --finalize --json
+  AQUIFER_BACKEND=local aquifer backend-info --json
+  aquifer codex-recovery checkpoint-heartbeat --hook-stdin --scope-key project:aquifer
+  aquifer codex-recovery checkpoint-heartbeat-hook --scope-key project:aquifer --hooks-path "$CODEX_HOME/hooks.json" --json
   aquifer operator archive-distill --input /tmp/archive-snapshot.json --json`);
     process.exit(0);
   }
@@ -743,6 +909,14 @@ Operator examples:
     return;
   }
 
+  if (command === 'backend-info') {
+    if (args.flags.config) {
+      process.env.AQUIFER_CONFIG = args.flags.config;
+    }
+    await cmdBackendInfo(args);
+    return;
+  }
+
   // All other commands need an Aquifer instance
   const configOverrides = {};
   if (args.flags.config) {
@@ -755,15 +929,18 @@ Operator examples:
   // Production commands (migrate, mcp, recall, ...) stay strict — they expect
   // the operator to have set env explicitly.
   if (command === 'quickstart') {
-    const { autodetectForQuickstart } = require('./shared/autodetect');
-    quickstartDetected = await autodetectForQuickstart(process.env);
-    if (Object.keys(quickstartDetected).length > 0) {
-      console.log('Autodetected localhost services (env not set):');
-      for (const [k, v] of Object.entries(quickstartDetected)) {
-        console.log(`  ${k}=${v}`);
-        process.env[k] = v;
+    const selected = loadConfig({ overrides: configOverrides });
+    if (selected.storage.backend !== 'local') {
+      const { autodetectForQuickstart } = require('./shared/autodetect');
+      quickstartDetected = await autodetectForQuickstart(process.env);
+      if (Object.keys(quickstartDetected).length > 0) {
+        console.log('Autodetected localhost services (env not set):');
+        for (const [k, v] of Object.entries(quickstartDetected)) {
+          console.log(`  ${k}=${v}`);
+          process.env[k] = v;
+        }
+        console.log('  Export these in your shell (or MCP client env) to make them permanent.\n');
       }
-      console.log('  Export these in your shell (or MCP client env) to make them permanent.\n');
     }
   }
 
@@ -837,6 +1014,9 @@ Operator examples:
 // Export for testing; execute only when run directly
 module.exports = {
   parseArgs,
+  selectedBackendInfo,
+  cmdBackendInfo,
+  cmdLocalQuickstart,
   cmdOperator,
   readSynthesisSummaryFromFlags,
 };

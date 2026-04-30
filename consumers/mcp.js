@@ -7,8 +7,9 @@
  * This is the primary integration surface for Aquifer. Agent hosts (Claude Code,
  * Codex, OpenCode, etc.) should integrate through this MCP server.
  *
- * Tools: session_recall, evidence_recall, session_feedback, memory_feedback,
- * feedback_stats, session_bootstrap, memory_stats, memory_pending
+ * Tools: memory_recall, historical_recall, session_recall, evidence_recall,
+ * session_feedback, memory_feedback, feedback_stats, session_bootstrap,
+ * memory_stats, memory_pending
  *
  * Usage:
  *   npx aquifer mcp
@@ -38,6 +39,32 @@ function formatResults(results, query, explain) {
   return formatRecallResults(results, { query, showScore: true, showExplain: !!explain });
 }
 
+function scopeLabel(config = {}) {
+  if (Array.isArray(config.memoryActiveScopePath) && config.memoryActiveScopePath.length > 0) {
+    return config.memoryActiveScopePath.join(' > ');
+  }
+  return config.memoryActiveScopeKey || 'none';
+}
+
+function sessionRecallLaneHeader(config = {}) {
+  const mode = config.memoryServingMode || 'legacy';
+  if (mode === 'curated') {
+    return `Serving lane: curated current memory (active scope: ${scopeLabel(config)})`;
+  }
+  return 'Serving lane: legacy evidence/session recall (not current memory)';
+}
+
+function memoryRecallLaneHeader(config = {}, params = {}) {
+  const scope = Array.isArray(params.activeScopePath) && params.activeScopePath.length > 0
+    ? params.activeScopePath.join(' > ')
+    : (params.activeScopeKey || scopeLabel(config));
+  return `Serving lane: explicit current memory recall (active scope: ${scope || 'none'})`;
+}
+
+function historicalRecallLaneHeader() {
+  return 'Serving lane: explicit historical/session recall';
+}
+
 // ---------------------------------------------------------------------------
 // Start MCP server
 // ---------------------------------------------------------------------------
@@ -64,8 +91,92 @@ async function main() {
   });
 
   server.tool(
+    'memory_recall',
+    'Explicit current-memory recall on the active curated memory corpus. Use this for current state / next-step lookup; use historical_recall for older session detail.',
+    {
+      query: z.string().min(1).describe('Search query (keyword or natural language)'),
+      limit: z.number().int().min(1).max(20).optional().describe('Max results (default 5)'),
+      mode: z.enum(['fts', 'hybrid', 'vector']).optional().describe('Recall mode: "fts" (keyword only), "hybrid" (default, FTS + vector), "vector" (vector only)'),
+      explain: z.boolean().optional().describe('Include per-result score breakdown (diagnostic)'),
+      activeScopeKey: z.string().optional().describe('Active curated memory scope key'),
+      activeScopePath: z.array(z.string()).optional().describe('Ordered curated scope path'),
+    },
+    async (params) => {
+      try {
+        const aquifer = getAquifer();
+        const recallOpts = {
+          limit: params.limit || 5,
+          activeScopeKey: params.activeScopeKey || undefined,
+          activeScopePath: params.activeScopePath || undefined,
+        };
+        if (params.mode) recallOpts.mode = params.mode;
+
+        const results = await aquifer.memoryRecall(params.query, recallOpts);
+        const text = [
+          memoryRecallLaneHeader(aquifer.getConfig ? aquifer.getConfig() : {}, params),
+          '',
+          formatResults(results, params.query, params.explain),
+        ].join('\n');
+        return { content: [{ type: 'text', text }] };
+      } catch (err) {
+        return {
+          content: [{ type: 'text', text: `memory_recall error: ${err.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    'historical_recall',
+    'Explicit historical/session recall over stored sessions and summaries. Use this for timeline, detail, and session context lookup; use evidence_recall only for audit/debug/provenance.',
+    {
+      query: z.string().min(1).describe('Search query (keyword or natural language)'),
+      limit: z.number().int().min(1).max(20).optional().describe('Max results (default 5)'),
+      agentId: z.string().optional().describe('Filter by agent ID'),
+      source: z.string().optional().describe('Filter by source (e.g., gateway, cc)'),
+      dateFrom: z.string().optional().describe('Start date YYYY-MM-DD'),
+      dateTo: z.string().optional().describe('End date YYYY-MM-DD'),
+      entities: z.array(z.string()).optional().describe('Entity names to match'),
+      entityMode: z.enum(['any', 'all']).optional().describe('"any" (default, boost) or "all" (only sessions with every entity)'),
+      mode: z.enum(['fts', 'hybrid', 'vector']).optional().describe('Recall mode: "fts" (keyword only, no embed needed), "hybrid" (default, FTS + vector), "vector" (vector only)'),
+      explain: z.boolean().optional().describe('Include per-result score breakdown (diagnostic)'),
+    },
+    async (params) => {
+      try {
+        const aquifer = getAquifer();
+        const recallOpts = {
+          limit: params.limit || 5,
+          agentId: params.agentId || undefined,
+          source: params.source || undefined,
+          dateFrom: params.dateFrom || undefined,
+          dateTo: params.dateTo || undefined,
+        };
+        if (params.entities && params.entities.length > 0) {
+          recallOpts.entities = params.entities;
+          recallOpts.entityMode = params.entityMode || 'any';
+        }
+        if (params.mode) recallOpts.mode = params.mode;
+
+        const results = await aquifer.historicalRecall(params.query, recallOpts);
+        const text = [
+          historicalRecallLaneHeader(),
+          '',
+          formatResults(results, params.query, params.explain),
+        ].join('\n');
+        return { content: [{ type: 'text', text }] };
+      } catch (err) {
+        return {
+          content: [{ type: 'text', text: `historical_recall error: ${err.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
     'session_recall',
-    'Search Aquifer memory. In curated serving mode this searches active curated memory only; use evidence_recall for legacy session/evidence lookup.',
+    'Compatibility recall surface. In curated serving mode this routes to current memory; in legacy serving mode it routes to historical/session recall. Prefer memory_recall for current state and historical_recall for timeline/detail lookup.',
     {
       query: z.string().min(1).describe('Search query (keyword or natural language)'),
       limit: z.number().int().min(1).max(20).optional().describe('Max results (default 5)'),
@@ -100,7 +211,11 @@ async function main() {
         if (params.mode) recallOpts.mode = params.mode;
 
         const results = await aquifer.recall(params.query, recallOpts);
-        const text = formatResults(results, params.query, params.explain);
+        const text = [
+          sessionRecallLaneHeader(aquifer.getConfig ? aquifer.getConfig() : {}),
+          '',
+          formatResults(results, params.query, params.explain),
+        ].join('\n');
         return { content: [{ type: 'text', text }] };
       } catch (err) {
         return {
@@ -146,7 +261,11 @@ async function main() {
         if (params.allowUnsafeDebug) recallOpts.allowUnsafeDebug = true;
 
         const results = await aquifer.evidenceRecall(params.query, recallOpts);
-        const text = formatResults(results, params.query, params.explain);
+        const text = [
+          'Serving lane: explicit legacy/evidence recall',
+          '',
+          formatResults(results, params.query, params.explain),
+        ].join('\n');
         return { content: [{ type: 'text', text }] };
       } catch (err) {
         return {
@@ -255,13 +374,16 @@ async function main() {
 
   server.tool(
     'memory_stats',
-    'Return storage statistics for the Aquifer memory store (session counts by status, summaries, turn embeddings, entities, date range).',
+    'Return storage statistics for the Aquifer memory store, serving mode, current-memory record coverage, and session date range.',
     {},
     async () => {
       try {
         const aquifer = getAquifer();
         const stats = await aquifer.getStats();
         const lines = [
+          `Backend: ${stats.backendKind || 'unknown'} (${stats.backendProfile || 'unknown'})`,
+          `Serving mode: ${stats.serving?.mode || 'legacy'}`,
+          `Active scope: ${stats.serving?.activeScopePath?.join(' > ') || stats.serving?.activeScopeKey || 'none'}`,
           `Sessions: ${stats.sessionTotal} total`,
         ];
         for (const [status, count] of Object.entries(stats.sessions)) {
@@ -270,7 +392,23 @@ async function main() {
         lines.push(`Summaries: ${stats.summaries}`);
         lines.push(`Turn embeddings: ${stats.turnEmbeddings}`);
         lines.push(`Entities: ${stats.entities}`);
+        if (stats.memoryRecords) {
+          lines.push(`Memory records: ${stats.memoryRecords.total} total (${stats.memoryRecords.active} active, ${stats.memoryRecords.visibleInRecall} recall-visible, ${stats.memoryRecords.visibleInBootstrap} bootstrap-visible)`);
+          if (stats.memoryRecords.latest) lines.push(`Memory record range: ${new Date(stats.memoryRecords.earliest).toISOString().slice(0, 10)} → ${new Date(stats.memoryRecords.latest).toISOString().slice(0, 10)}`);
+        }
+        if (stats.sessionFinalizations?.available) {
+          const statusText = Object.entries(stats.sessionFinalizations.statuses || {})
+            .map(([status, count]) => `${status}: ${count}`)
+            .join(', ') || 'none';
+          lines.push(`Session finalizations: ${stats.sessionFinalizations.total} total (${statusText})`);
+          if (stats.sessionFinalizations.latestFinalizedAt) {
+            lines.push(`Latest finalization: ${new Date(stats.sessionFinalizations.latestFinalizedAt).toISOString().slice(0, 10)}`);
+          }
+        }
         if (stats.earliest) lines.push(`Date range: ${new Date(stats.earliest).toISOString().slice(0, 10)} → ${new Date(stats.latest).toISOString().slice(0, 10)}`);
+        if ((stats.serving?.mode || 'legacy') !== 'curated') {
+          lines.push('Warning: legacy serving returns session/evidence material; configure curated serving with an active scope for current-memory answers.');
+        }
         return { content: [{ type: 'text', text: lines.join('\n') }] };
       } catch (err) {
         return {

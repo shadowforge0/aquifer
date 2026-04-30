@@ -247,6 +247,7 @@ describe('consumers/cli.js', () => {
 
   it('cmdQuickstart fails when enrich returns warnings', async () => {
     const aquifer = {
+      getConfig() { return { backendKind: 'postgres' }; },
       async migrate() {},
       async commit() {},
       async enrich() {
@@ -275,6 +276,7 @@ describe('consumers/cli.js', () => {
 
   it('cmdQuickstart fails when no turns are embedded', async () => {
     const aquifer = {
+      getConfig() { return { backendKind: 'postgres' }; },
       async migrate() {},
       async commit() {},
       async enrich() {
@@ -303,6 +305,7 @@ describe('consumers/cli.js', () => {
 
   it('cmdQuickstart explains empty recall results more clearly', async () => {
     const aquifer = {
+      getConfig() { return { backendKind: 'postgres' }; },
       async migrate() {},
       async commit() {},
       async enrich() {
@@ -418,6 +421,7 @@ describe('consumers/cli.js', () => {
     let ended = false;
 
     const aquifer = {
+      getConfig() { return { backendKind: 'postgres' }; },
       async migrate() {},
       async commit() {},
       async enrich() { return { turnsEmbedded: 1 }; },
@@ -456,6 +460,7 @@ describe('consumers/cli.js', () => {
     let ended = false;
 
     const aquifer = {
+      getConfig() { return { backendKind: 'postgres' }; },
       async migrate() {},
       async commit() {},
       async enrich() { return { turnsEmbedded: 1 }; },
@@ -749,9 +754,18 @@ describe('consumers/shared/config.js', () => {
 });
 
 describe('consumers/shared/factory.js', () => {
-  it('strips trailing /v1 from Ollama embed URLs before creating the embedder', () => {
+  it('strips trailing /v1 from Ollama embed URLs before creating the embedder', async () => {
     let embedderConfig = null;
     let poolOptions = null;
+    const indexMock = {
+      createAquifer(config) {
+        return { receivedConfig: config };
+      },
+      createEmbedder(config) {
+        embedderConfig = config;
+        return { embedBatch: async () => [] };
+      },
+    };
 
     class FakePool {
       constructor(opts) {
@@ -762,15 +776,7 @@ describe('consumers/shared/factory.js', () => {
     const { createAquiferFromConfig } = loadModuleFromSource('consumers/shared/factory.js', {
       mocks: {
         pg: { Pool: FakePool },
-        '../../index': {
-          createAquifer(config) {
-            return { receivedConfig: config };
-          },
-          createEmbedder(config) {
-            embedderConfig = config;
-            return { embedBatch: async () => [] };
-          },
-        },
+        '../../index': indexMock,
         './config': {
           loadConfig() {
             return {
@@ -799,7 +805,10 @@ describe('consumers/shared/factory.js', () => {
       },
     });
 
-    const aquifer = createAquiferFromConfig();
+    const aquifer = await withPatchedModuleLoad({
+      pg: { Pool: FakePool },
+      '../../index': indexMock,
+    }, async () => createAquiferFromConfig());
 
     assert.equal(poolOptions.connectionString, 'postgres://example/db');
     assert.equal(embedderConfig.provider, 'ollama');
@@ -807,9 +816,18 @@ describe('consumers/shared/factory.js', () => {
     assert.equal(aquifer.receivedConfig.tenantId, 'tenant-x');
   });
 
-  it('does not create an llm function when llm.model is missing', () => {
+  it('does not create an llm function when llm.model is missing', async () => {
     let llmCalls = 0;
     let createAquiferArg = null;
+    const indexMock = {
+      createAquifer(config) {
+        createAquiferArg = config;
+        return {};
+      },
+      createEmbedder() {
+        return { embedBatch: async () => [] };
+      },
+    };
 
     class FakePool {
       constructor() {}
@@ -818,15 +836,7 @@ describe('consumers/shared/factory.js', () => {
     const { createAquiferFromConfig } = loadModuleFromSource('consumers/shared/factory.js', {
       mocks: {
         pg: { Pool: FakePool },
-        '../../index': {
-          createAquifer(config) {
-            createAquiferArg = config;
-            return {};
-          },
-          createEmbedder() {
-            return { embedBatch: async () => [] };
-          },
-        },
+        '../../index': indexMock,
         './config': {
           loadConfig() {
             return {
@@ -852,7 +862,10 @@ describe('consumers/shared/factory.js', () => {
       },
     });
 
-    createAquiferFromConfig();
+    await withPatchedModuleLoad({
+      pg: { Pool: FakePool },
+      '../../index': indexMock,
+    }, async () => createAquiferFromConfig());
 
     assert.equal(llmCalls, 0);
     assert.equal(createAquiferArg.llm, null);

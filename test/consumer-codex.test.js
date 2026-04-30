@@ -438,6 +438,81 @@ describe('Codex consumer recovery helpers', () => {
         assert.match(view.text, /\[REDACTED_SECRET\]/);
     });
 
+    it('prepares active-session checkpoint prompts without writing DB state', async () => {
+        const root = tmpDir();
+        const file = path.join(root, 'rollout-active-checkpoint.jsonl');
+        writeJsonl(file, [
+            sessionMeta('meta-active-checkpoint'),
+            user('[AQUIFER CONTEXT] injected context should not enter checkpoint'),
+            user('Active checkpoint should summarize the first part.'),
+            assistant('Checkpoint output must stay process material.'),
+            user('Second useful user turn.'),
+            assistant('Second useful assistant turn.'),
+        ]);
+        const aq = makeFakeAquifer();
+        aq.memory = {
+            async current() {
+                return {
+                    memories: [{
+                        memoryType: 'state',
+                        canonicalKey: 'state:project:aquifer:active-checkpoint',
+                        scopeKey: 'project:aquifer',
+                        summary: 'Existing current memory is prompt context only.',
+                    }],
+                    meta: {
+                        source: 'memory_records',
+                        servingContract: 'current_memory_v1',
+                    },
+                };
+            },
+        };
+
+        const prepared = await codex.prepareActiveSessionCheckpoint(aq, {
+            filePath: file,
+            scopeKind: 'project',
+            scopeKey: 'project:aquifer',
+            checkpointEveryMessages: 4,
+        });
+
+        assert.equal(prepared.status, 'needs_agent_checkpoint');
+        assert.equal(prepared.due, true);
+        assert.equal(prepared.checkpointInput.threshold.messageCount, 4);
+        assert.equal(prepared.checkpointInput.coverage.coordinateSystem, 'codex_sanitized_view_v1');
+        assert.equal(prepared.checkpointInput.coverage.coveredUntilMessageIndex, 3);
+        assert.match(prepared.prompt, /active-session checkpoint proposal/);
+        assert.match(prepared.prompt, /Existing current memory is prompt context only/);
+        assert.match(prepared.prompt, /Checkpoint output must stay process material/);
+        assert.doesNotMatch(prepared.prompt, /AQUIFER CONTEXT/);
+        assert.doesNotMatch(prepared.prompt, /transcriptHash/);
+        assert.equal(aq.calls.commit.length, 0);
+        assert.equal(aq.calls.finalization.length, 0);
+    });
+
+    it('keeps active-session checkpoint not_ready below threshold', async () => {
+        const view = {
+            status: 'ok',
+            sessionId: 'meta-not-ready',
+            messages: [
+                { role: 'user', content: 'one' },
+                { role: 'assistant', content: 'two' },
+            ],
+            text: '[user]\none\n\n[assistant]\ntwo',
+            counts: { userCount: 1, safeMessageCount: 2 },
+        };
+
+        const prepared = await codex.prepareActiveSessionCheckpoint(makeFakeAquifer(), {
+            view,
+            scopeKind: 'project',
+            scopeKey: 'project:aquifer',
+            checkpointEveryMessages: 4,
+        });
+
+        assert.equal(prepared.status, 'not_ready');
+        assert.equal(prepared.due, false);
+        assert.equal(prepared.prompt, undefined);
+        assert.equal(prepared.checkpointInput.threshold.messageCount, 2);
+    });
+
     it('defers recovery transcript materialization when byte budget is exceeded', () => {
         const root = tmpDir();
         const file = path.join(root, 'rollout-budget.jsonl');
@@ -453,6 +528,57 @@ describe('Codex consumer recovery helpers', () => {
 
         assert.equal(view.status, 'deferred');
         assert.equal(view.reason, 'max_bytes');
+    });
+
+    it('materializes an oversize active checkpoint as a tail view with absolute counts and coverage', async () => {
+        const root = tmpDir();
+        const file = path.join(root, 'rollout-checkpoint-tail.jsonl');
+        writeJsonl(file, [
+            sessionMeta('meta-checkpoint-tail'),
+            { type: 'turn_context', payload: { model: 'gpt-test', padding: 'x'.repeat(4000) } },
+            user('u1 early content'),
+            assistant('a1 early content'),
+            user('u2 early content'),
+            assistant('a2 early content'),
+            user('u3 middle content'),
+            assistant('a3 middle content'),
+            user('u4 tail content'),
+            assistant('a4 tail content'),
+            user('u5 tail content'),
+            assistant('a5 tail content'),
+        ]);
+
+        const view = codex.materializeRecoveryTranscriptView({ filePath: file }, {
+            maxRecoveryBytes: 10,
+            maxRecoveryMessages: 4,
+            tailOnMaxBudget: true,
+        });
+
+        assert.equal(view.status, 'ok');
+        assert.equal(view.truncated, true);
+        assert.equal(view.counts.safeMessageCount, 10);
+        assert.equal(view.counts.userCount, 5);
+        assert.equal(view.messages.length, 4);
+        assert.match(view.text, /u4 tail content/);
+        assert.doesNotMatch(view.text, /u1 early content/);
+        assert.equal(view.coverage.coveredUntilMessageIndex, 9);
+        assert.equal(view.coverage.coveredUntilChar, view.fullCharCount);
+
+        const prepared = await codex.prepareActiveSessionCheckpoint(makeFakeAquifer(), {
+            view,
+            scopeKind: 'project',
+            scopeKey: 'project:aquifer',
+            checkpointEveryMessages: 10,
+        });
+
+        assert.equal(prepared.status, 'needs_agent_checkpoint');
+        assert.equal(prepared.checkpointInput.threshold.messageCount, 10);
+        assert.equal(prepared.checkpointInput.threshold.userCount, 5);
+        assert.equal(prepared.checkpointInput.transcript.truncated, true);
+        assert.equal(prepared.checkpointInput.coverage.coveredUntilMessageIndex, 9);
+        assert.equal(prepared.checkpointInput.coverage.coveredUntilChar, view.fullCharCount);
+        assert.match(prepared.prompt, /u5 tail content/);
+        assert.doesNotMatch(prepared.prompt, /u1 early content/);
     });
 
     it('prepares SessionStart recovery metadata without reading JSONL before consent', async () => {
@@ -792,6 +918,8 @@ describe('Codex consumer recovery helpers', () => {
                         count: 1,
                         truncated: false,
                         degraded: false,
+                        activeScopeKey: 'project:aquifer',
+                        activeScopePath: ['global', 'project:aquifer'],
                     },
                 };
             },
@@ -830,10 +958,77 @@ describe('Codex consumer recovery helpers', () => {
         const finalizeCall = aq.calls.finalization.find(c => c.method === 'finalizeSession');
         assert.equal(finalizeCall.input.mode, 'session_start_recovery');
         assert.equal(finalizeCall.input.sessionId, 'meta-finalize');
+        assert.equal(finalizeCall.input.scopeKind, 'project');
+        assert.equal(finalizeCall.input.scopeKey, 'project:aquifer');
         assert.match(finalizeCall.input.transcriptHash, /^[a-f0-9]{64}$/);
         assert.equal(finalizeCall.input.metadata.trigger, 'session_start_recovery');
         assert.equal(finalizeCall.input.metadata.currentMemory.meta.servingContract, 'current_memory_v1');
         assert.equal(finalizeCall.input.metadata.currentMemory.memories[0].summary, 'Existing current memory must be reconciled.');
+    });
+
+    it('uses resolved current memory scope during finalization when caller omits active scope', async () => {
+        const root = tmpDir();
+        const file = path.join(root, 'rollout-finalize-current-memory-scope.jsonl');
+        writeJsonl(file, [
+            sessionMeta('meta-finalize-scope'),
+            user('Aquifer current-memory scope should drive promotion scope.'),
+            assistant('Use resolved current memory metadata for finalization scope.'),
+            user('u2'),
+            assistant('a2'),
+            user('u3'),
+            assistant('a3'),
+        ]);
+        const view = codex.materializeRecoveryTranscriptView({ filePath: file }, {
+            maxRecoveryBytes: 1024 * 1024,
+        });
+        assert.equal(view.status, 'ok');
+
+        const aq = makeFakeAquifer({}, {
+            finalizeResult: input => ({
+                status: 'finalized',
+                finalization: { id: 101, mode: input.mode },
+                memoryResult: {
+                    promoted: 1,
+                    records: [{
+                        scopeKey: input.scopeKey || `session:${input.sessionId}`,
+                    }],
+                },
+            }),
+        });
+        aq.memory = {
+            async current() {
+                return {
+                    memories: [{
+                        memoryType: 'state',
+                        canonicalKey: 'state:project:aquifer:resolved-scope',
+                        scopeKey: 'project:aquifer',
+                        summary: 'Resolved project current memory should anchor promotion scope.',
+                    }],
+                    meta: {
+                        source: 'memory_records',
+                        servingContract: 'current_memory_v1',
+                        activeScopeKey: 'project:aquifer',
+                        activeScopePath: ['global', 'project:aquifer'],
+                    },
+                };
+            },
+        };
+
+        const result = await codex.finalizeCodexSession(aq, {
+            view,
+            summaryText: 'Finalization should keep project scope from resolved current memory.',
+            structuredSummary: {
+                facts: [{ subject: 'Aquifer', statement: 'Resolved current memory scope is used for promoted memory.' }],
+            },
+        });
+
+        assert.equal(result.status, 'finalized');
+        assert.equal(result.memoryResult.records[0].scopeKey, 'project:aquifer');
+        assert.notEqual(result.memoryResult.records[0].scopeKey, `session:${view.sessionId}`);
+        const finalizeCall = aq.calls.finalization.find(c => c.method === 'finalizeSession');
+        assert.equal(finalizeCall.input.scopeKind, 'project');
+        assert.equal(finalizeCall.input.scopeKey, 'project:aquifer');
+        assert.equal(finalizeCall.input.metadata.currentMemory.memories[0].scopeKey, 'project:aquifer');
     });
 
     it('re-commits a stale session snapshot before finalization', async () => {

@@ -3,6 +3,7 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 const { formatBootstrapText } = require('../core/aquifer');
+const { collectOpenLoops, createLegacyBootstrap, normalizeSessionRow } = require('../core/legacy-bootstrap');
 
 // ---------------------------------------------------------------------------
 // formatBootstrapText tests
@@ -92,40 +93,24 @@ describe('formatBootstrapText', () => {
 });
 
 // ---------------------------------------------------------------------------
-// open loop sentinel and dedup tests (test via formatBootstrapText input)
+// open loop sentinel and dedup tests
 // ---------------------------------------------------------------------------
 
 describe('bootstrap open loop handling', () => {
   it('sentinel filter: removes 無, none, n/a, empty', () => {
-    // These sentinels would be filtered in bootstrap() method, not formatBootstrapText.
-    // Testing the format function just passes through what it gets.
-    // This test documents expected behavior of the bootstrap() method's filtering.
-    const SENTINELS = new Set(['無', 'none', 'n/a', 'na', 'done', '']);
-    for (const s of SENTINELS) {
-      const normalized = s.trim().replace(/\s+/g, ' ').toLowerCase();
-      assert.ok(SENTINELS.has(normalized), `${s} should be filtered`);
-    }
+    const sessions = [
+      { openLoops: [{ item: '無' }, { item: 'none' }, { item: 'n/a' }, { item: 'na' }, { item: 'done' }, { item: '' }], sessionId: 'a', startedAt: '2026-04-16' },
+    ];
+    assert.deepEqual(collectOpenLoops(sessions), []);
   });
 
   it('dedup: same item across sessions normalized to one', () => {
-    // Simulating what bootstrap() does
     const sessions = [
       { openLoops: [{ item: 'Fix the bug' }], sessionId: 'a', startedAt: '2026-04-16' },
       { openLoops: [{ item: 'fix the bug' }], sessionId: 'b', startedAt: '2026-04-15' },
       { openLoops: [{ item: '  Fix  The  Bug  ' }], sessionId: 'c', startedAt: '2026-04-14' },
     ];
-    const SENTINELS = new Set(['無', 'none', 'n/a', 'na', 'done', '']);
-    const seenLoops = new Set();
-    const openLoops = [];
-    for (const s of sessions) {
-      for (const loop of s.openLoops) {
-        const raw = typeof loop === 'string' ? loop : (loop.item || '');
-        const normalized = raw.trim().replace(/\s+/g, ' ').toLowerCase();
-        if (SENTINELS.has(normalized) || !normalized || seenLoops.has(normalized)) continue;
-        seenLoops.add(normalized);
-        openLoops.push({ item: raw.trim(), fromSession: s.sessionId });
-      }
-    }
+    const openLoops = collectOpenLoops(sessions);
     assert.equal(openLoops.length, 1);
     assert.equal(openLoops[0].item, 'Fix the bug');
     assert.equal(openLoops[0].fromSession, 'a');
@@ -138,7 +123,6 @@ describe('bootstrap open loop handling', () => {
 
 describe('bootstrap summaryText fallback', () => {
   it('uses summaryText when structuredSummary is empty', () => {
-    // Simulating what bootstrap() does with a row
     const row = {
       session_id: 'x',
       agent_id: 'main',
@@ -147,12 +131,9 @@ describe('bootstrap summaryText fallback', () => {
       summary_text: 'This is a long summary text that should be used as fallback for title and overview',
       structured_summary: {},
     };
-    const ss = row.structured_summary || {};
-    const hasSS = ss.title || ss.overview;
-    const title = ss.title || (hasSS ? null : (row.summary_text || '').slice(0, 60).trim() || null);
-    const overview = ss.overview || (hasSS ? null : (row.summary_text || '').slice(0, 200).trim() || null);
-    assert.equal(title, 'This is a long summary text that should be used as fallback');
-    assert.ok(overview.startsWith('This is a long summary text'));
+    const session = normalizeSessionRow(row);
+    assert.equal(session.title, 'This is a long summary text that should be used as fallback');
+    assert.ok(session.overview.startsWith('This is a long summary text'));
   });
 
   it('does not fallback when structuredSummary has title', () => {
@@ -160,9 +141,30 @@ describe('bootstrap summaryText fallback', () => {
       summary_text: 'Fallback text',
       structured_summary: { title: 'Real title', overview: null },
     };
-    const ss = row.structured_summary || {};
-    const hasSS = ss.title || ss.overview;
-    const title = ss.title || (hasSS ? null : (row.summary_text || '').slice(0, 60) || null);
-    assert.equal(title, 'Real title');
+    const session = normalizeSessionRow(row);
+    assert.equal(session.title, 'Real title');
+  });
+});
+
+describe('legacy bootstrap quality filter', () => {
+  it('excludes obvious placeholder summaries from the public legacy bootstrap query', async () => {
+    let capturedSql = '';
+    const legacyBootstrap = createLegacyBootstrap({
+      schema: 'aq',
+      tenantId: 'default',
+      formatBootstrapText,
+      pool: {
+        async query(sql) {
+          capturedSql = String(sql);
+          return { rows: [] };
+        },
+      },
+    });
+
+    await legacyBootstrap({ format: 'structured' });
+
+    assert.match(capturedSql, /summary_text/);
+    assert.match(capturedSql, /空測試會話/);
+    assert.match(capturedSql, /placeholder/);
   });
 });

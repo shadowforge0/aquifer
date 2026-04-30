@@ -17,6 +17,14 @@ function toJsonOrNull(value) {
   return value === undefined || value === null ? null : JSON.stringify(value);
 }
 
+function vecToStr(vec) {
+  if (!vec || !Array.isArray(vec) || vec.length === 0) return null;
+  for (let i = 0; i < vec.length; i++) {
+    if (!Number.isFinite(vec[i])) throw new Error(`Vector contains non-finite value at index ${i}`);
+  }
+  return `[${vec.join(',')}]`;
+}
+
 function advisoryLockKeys(namespace, value) {
   const digest = crypto.createHash('sha256').update(`${namespace}:${value}`).digest();
   return [digest.readInt32BE(0), digest.readInt32BE(4)];
@@ -104,11 +112,13 @@ function compareRecordIdAsc(a, b) {
 }
 
 function normalizeCurrentMemoryRow(row = {}) {
+  const { embedding: _embedding, ...publicRow } = row;
+  void _embedding;
   const memoryId = row.memoryId ?? row.memory_id ?? row.id ?? null;
   const evidenceRefsValue = row.evidenceRefs ?? row.evidence_refs ?? [];
   const evidenceRefs = Array.isArray(evidenceRefsValue) ? evidenceRefsValue : [];
   return {
-    ...row,
+    ...publicRow,
     memoryId: memoryId === null ? null : String(memoryId),
     canonicalKey: row.canonicalKey ?? row.canonical_key ?? null,
     memoryType: row.memoryType ?? row.memory_type ?? null,
@@ -170,6 +180,7 @@ function createMemoryRecords({ pool, schema, defaultTenantId, inTransaction = fa
   const memories = `${schema}.memory_records`;
   const factAssertions = `${schema}.fact_assertions_v1`;
   const evidenceRefs = `${schema}.evidence_refs`;
+  const evidenceItems = `${schema}.evidence_items`;
   const feedback = `${schema}.feedback`;
   const canTransact = typeof pool.connect === 'function';
 
@@ -251,12 +262,12 @@ function createMemoryRecords({ pool, schema, defaultTenantId, inTransaction = fa
          valid_to, stale_after, superseded_by, backing_fact_id, observed_at,
          revoked_at, superseded_at, version_id, visible_in_bootstrap,
          visible_in_recall, rank_features, created_by_finalization_id,
-         created_by_compaction_run_id
+         created_by_compaction_run_id, embedding
        )
        VALUES (
          $1,$2,$3,$4,$5,$6,$7,COALESCE($8,''),COALESCE($9::jsonb,'{}'::jsonb),
          COALESCE($10,'candidate'),COALESCE($11,'llm_inference'),$12,$13,$14,$15,
-         $16,$17,$18,$19,$20,$21,COALESCE($22,false),COALESCE($23,false),COALESCE($24::jsonb,'{}'::jsonb),$25,$26
+         $16,$17,$18,$19,$20,$21,COALESCE($22,false),COALESCE($23,false),COALESCE($24::jsonb,'{}'::jsonb),$25,$26,$27::vector
        )
        ON CONFLICT (tenant_id, canonical_key) WHERE status = 'active' DO UPDATE SET
          scope_id = EXCLUDED.scope_id,
@@ -279,7 +290,8 @@ function createMemoryRecords({ pool, schema, defaultTenantId, inTransaction = fa
          visible_in_recall = EXCLUDED.visible_in_recall,
          rank_features = COALESCE(NULLIF(EXCLUDED.rank_features, '{}'::jsonb), ${memories}.rank_features),
          created_by_finalization_id = COALESCE(${memories}.created_by_finalization_id, EXCLUDED.created_by_finalization_id),
-         created_by_compaction_run_id = COALESCE(${memories}.created_by_compaction_run_id, EXCLUDED.created_by_compaction_run_id)
+         created_by_compaction_run_id = COALESCE(${memories}.created_by_compaction_run_id, EXCLUDED.created_by_compaction_run_id),
+         embedding = COALESCE(EXCLUDED.embedding, ${memories}.embedding)
        RETURNING *`,
       [
         tenantId,
@@ -308,6 +320,7 @@ function createMemoryRecords({ pool, schema, defaultTenantId, inTransaction = fa
         toJson(input.rankFeatures, {}),
         input.createdByFinalizationId || input.created_by_finalization_id || null,
         input.createdByCompactionRunId || input.created_by_compaction_run_id || null,
+        vecToStr(input.embedding),
       ]
     );
     return result.rows[0] || null;
@@ -394,18 +407,27 @@ function createMemoryRecords({ pool, schema, defaultTenantId, inTransaction = fa
     requireField(input, 'sourceKind');
     requireField(input, 'sourceRef');
     const tenantId = input.tenantId || defaultTenantId;
+    const evidenceItemId = input.evidenceItemId || input.evidence_item_id || null;
+    const conflictTarget = evidenceItemId
+      ? `(tenant_id, owner_kind, owner_id, evidence_item_id, relation_kind)
+         WHERE evidence_item_id IS NOT NULL`
+      : `(tenant_id, owner_kind, owner_id, source_kind, source_ref, relation_kind)
+         WHERE evidence_item_id IS NULL`;
     const result = await pool.query(
       `INSERT INTO ${evidenceRefs} (
          tenant_id, owner_kind, owner_id, source_kind, source_ref,
          relation_kind, weight, metadata, created_by_finalization_id,
-         created_by_compaction_run_id
+         created_by_compaction_run_id, evidence_item_id
        )
-       VALUES ($1,$2,$3,$4,$5,COALESCE($6,'supporting'),COALESCE($7,1.0),COALESCE($8::jsonb,'{}'::jsonb),$9,$10)
-       ON CONFLICT (tenant_id, owner_kind, owner_id, source_kind, source_ref, relation_kind)
+       VALUES ($1,$2,$3,$4,$5,COALESCE($6,'supporting'),COALESCE($7,1.0),COALESCE($8::jsonb,'{}'::jsonb),$9,$10,$11)
+       ON CONFLICT ${conflictTarget}
        DO UPDATE SET weight = EXCLUDED.weight,
+                     source_kind = EXCLUDED.source_kind,
+                     source_ref = EXCLUDED.source_ref,
                      metadata = COALESCE(NULLIF(EXCLUDED.metadata, '{}'::jsonb), ${evidenceRefs}.metadata),
                      created_by_finalization_id = COALESCE(${evidenceRefs}.created_by_finalization_id, EXCLUDED.created_by_finalization_id),
-                     created_by_compaction_run_id = COALESCE(${evidenceRefs}.created_by_compaction_run_id, EXCLUDED.created_by_compaction_run_id)
+                     created_by_compaction_run_id = COALESCE(${evidenceRefs}.created_by_compaction_run_id, EXCLUDED.created_by_compaction_run_id),
+                     evidence_item_id = COALESCE(${evidenceRefs}.evidence_item_id, EXCLUDED.evidence_item_id)
        RETURNING *`,
       [
         tenantId,
@@ -418,7 +440,51 @@ function createMemoryRecords({ pool, schema, defaultTenantId, inTransaction = fa
         toJson(input.metadata, {}),
         input.createdByFinalizationId || input.created_by_finalization_id || null,
         input.createdByCompactionRunId || input.created_by_compaction_run_id || null,
+        evidenceItemId,
       ]
+    );
+    return result.rows[0] || null;
+  }
+
+  async function upsertEvidenceItem(input = {}) {
+    requireField(input, 'sourceKind');
+    requireField(input, 'sourceRef');
+    requireField(input, 'excerptText');
+    const tenantId = input.tenantId || defaultTenantId;
+    const excerptText = String(input.excerptText || input.excerpt_text || '').trim();
+    const excerptHash = input.excerptHash || input.excerpt_hash || crypto
+      .createHash('sha256')
+      .update(excerptText)
+      .digest('hex');
+    const result = await pool.query(
+      `INSERT INTO ${evidenceItems} (
+         tenant_id, source_kind, source_ref, session_row_id, turn_embedding_id,
+         summary_row_id, created_by_finalization_id, excerpt_text, excerpt_hash,
+         embedding, metadata
+       )
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::vector,COALESCE($11::jsonb,'{}'::jsonb))
+       ON CONFLICT (tenant_id, source_kind, source_ref, excerpt_hash)
+       DO UPDATE SET
+         session_row_id = COALESCE(${evidenceItems}.session_row_id, EXCLUDED.session_row_id),
+         turn_embedding_id = COALESCE(${evidenceItems}.turn_embedding_id, EXCLUDED.turn_embedding_id),
+         summary_row_id = COALESCE(${evidenceItems}.summary_row_id, EXCLUDED.summary_row_id),
+         created_by_finalization_id = COALESCE(${evidenceItems}.created_by_finalization_id, EXCLUDED.created_by_finalization_id),
+         embedding = COALESCE(${evidenceItems}.embedding, EXCLUDED.embedding),
+         metadata = COALESCE(NULLIF(EXCLUDED.metadata, '{}'::jsonb), ${evidenceItems}.metadata)
+       RETURNING *`,
+      [
+        tenantId,
+        input.sourceKind || input.source_kind,
+        input.sourceRef || input.source_ref,
+        input.sessionRowId || input.session_row_id || null,
+        input.turnEmbeddingId || input.turn_embedding_id || null,
+        input.summaryRowId || input.summary_row_id || null,
+        input.createdByFinalizationId || input.created_by_finalization_id || null,
+        excerptText,
+        excerptHash,
+        vecToStr(input.embedding),
+        toJson(input.metadata, {}),
+      ],
     );
     return result.rows[0] || null;
   }
@@ -636,6 +702,9 @@ function createMemoryRecords({ pool, schema, defaultTenantId, inTransaction = fa
       params.push(input.visibleInRecall === true);
       where.push(`m.visible_in_recall = $${params.length}`);
     }
+    if (input.withoutEmbedding === true) {
+      where.push(`m.embedding IS NULL`);
+    }
     params.push(Math.max(1, Math.min(200, input.limit || 50)));
     const orderBy = input.visibleInBootstrap === true
       ? BOOTSTRAP_ORDER_SQL
@@ -650,6 +719,54 @@ function createMemoryRecords({ pool, schema, defaultTenantId, inTransaction = fa
       params
     );
     return result.rows;
+  }
+
+  async function updateMemoryEmbedding(input = {}) {
+    requireField(input, 'memoryId');
+    const tenantId = input.tenantId || defaultTenantId;
+    const embedding = vecToStr(input.embedding);
+    if (!embedding) throw new Error('embedding is required');
+    const result = await pool.query(
+      `UPDATE ${memories}
+       SET embedding = $3::vector,
+           updated_at = now()
+       WHERE tenant_id = $1 AND id = $2
+         AND embedding IS NULL
+       RETURNING *`,
+      [
+        tenantId,
+        input.memoryId,
+        embedding,
+      ]
+    );
+    if (result.rows[0]) {
+      return {
+        status: 'updated',
+        updated: true,
+        skipped: false,
+        memory: result.rows[0],
+      };
+    }
+    const existing = await pool.query(
+      `SELECT * FROM ${memories}
+       WHERE tenant_id = $1 AND id = $2
+       LIMIT 1`,
+      [tenantId, input.memoryId]
+    );
+    if (existing.rows[0]) {
+      return {
+        status: 'skipped_existing_embedding',
+        updated: false,
+        skipped: true,
+        memory: existing.rows[0],
+      };
+    }
+    return {
+      status: 'missing',
+      updated: false,
+      skipped: true,
+      memory: null,
+    };
   }
 
   async function currentProjection(input = {}) {
@@ -778,6 +895,7 @@ function createMemoryRecords({ pool, schema, defaultTenantId, inTransaction = fa
     createVersion,
     upsertMemory,
     upsertFactAssertion,
+    upsertEvidenceItem,
     linkEvidence,
     recordFeedback,
     findActiveByCanonicalKey,
@@ -785,9 +903,11 @@ function createMemoryRecords({ pool, schema, defaultTenantId, inTransaction = fa
     lockCanonicalKey,
     updateMemoryStatus,
     updateMemoryStatusIfCurrent,
+    updateMemoryEmbedding,
     updateFactAssertionStatus,
     listActive,
     currentProjection,
+    normalizeCurrentMemoryRow,
     withTransaction,
   };
 

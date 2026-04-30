@@ -62,7 +62,7 @@ function makeFinalizationPool(opts = {}) {
             phase: params[7],
             mode: params[8],
             status: params[9],
-            memory_result: params[16] ? JSON.parse(params[16]) : {},
+            memory_result: params[18] ? JSON.parse(params[18]) : {},
           }],
         };
       }
@@ -75,6 +75,7 @@ function makeFinalizationPool(opts = {}) {
       if (String(sql).includes('INSERT INTO "aq".scopes')) return { rows: [{ id: 11 }], rowCount: 1 };
       if (String(sql).includes('INSERT INTO "aq".fact_assertions_v1')) return { rows: [{ id: 14, assertion_hash: params[18] }], rowCount: 1 };
       if (String(sql).includes('INSERT INTO "aq".memory_records')) return { rows: [{ id: 12 }], rowCount: 1 };
+      if (String(sql).includes('INSERT INTO "aq".evidence_items')) return { rows: [{ id: 16 }], rowCount: 1 };
       if (String(sql).includes('INSERT INTO "aq".evidence_refs')) return { rows: [{ id: 13 }], rowCount: 1 };
       if (String(sql).includes('INSERT INTO "aq".finalization_candidates')) return { rows: [{ id: 15 }], rowCount: 1 };
       if (String(sql).includes('UPDATE "aq".sessions')) return { rows: [{ id: 1, processing_status: 'succeeded' }], rowCount: 1 };
@@ -164,6 +165,70 @@ describe('session finalization', () => {
     assert.equal(payload.synthesisKind, 'handoff_current_memory_synthesis_v1');
     assert.equal(payload.promotionGate, 'core_finalization');
     assert.equal(payload.state, 'Handoff synthesis candidates must keep producer lineage.');
+  });
+
+  it('passes embedFn through finalization so promoted memory rows persist embeddings', async () => {
+    const pool = makeFinalizationPool();
+    const finalization = createSessionFinalization({
+      pool,
+      schema: 'aq',
+      recordsSchema: '"aq"',
+      defaultTenantId: 'default',
+      embedFn: async texts => {
+        assert.equal(texts.length, 1);
+        assert.match(texts[0], /summary: Finalization should write a direct memory embedding/);
+        return [[0.4, 0.5, 0.6]];
+      },
+    });
+
+    await finalization.finalizeSession({
+      sessionId: 's1',
+      agentId: 'main',
+      source: 'codex',
+      transcriptHash: 'b'.repeat(64),
+      mode: 'handoff',
+      summaryText: 'Per-memory embedding write path.',
+      structuredSummary: {
+        decisions: [{ decision: 'Finalization should write a direct memory embedding.' }],
+      },
+    });
+
+    const memoryInsert = pool.queries.find(query => String(query.sql).includes('INSERT INTO "aq".memory_records'));
+    assert.deepEqual(memoryInsert.params[26], '[0.4,0.5,0.6]');
+  });
+
+  it('keeps explicit evidence text in the finalization candidate ledger', async () => {
+    const pool = makeFinalizationPool();
+    const finalization = createSessionFinalization({
+      pool,
+      schema: 'aq',
+      recordsSchema: '"aq"',
+      defaultTenantId: 'default',
+    });
+
+    await finalization.finalizeSession({
+      sessionId: 's1',
+      agentId: 'main',
+      source: 'codex',
+      transcriptHash: 'b'.repeat(64),
+      mode: 'handoff',
+      summaryText: 'Explicit evidence survives finalization.',
+      candidates: [{
+        memoryType: 'decision',
+        canonicalKey: 'decision:project:aquifer:evidence-ledger',
+        scopeKind: 'project',
+        scopeKey: 'project:aquifer',
+        summary: 'Current memory remains distilled.',
+        payload: { decision: 'Current memory remains distilled.' },
+        evidenceText: 'MK asked whether the hybrid query方式 changed.',
+        evidenceRefs: [{ sourceKind: 'session_summary', sourceRef: 's1', relationKind: 'primary' }],
+      }],
+    });
+
+    const candidateInsert = pool.queries.find(query => String(query.sql).includes('INSERT INTO "aq".finalization_candidates'));
+    const payload = JSON.parse(candidateInsert.params[9]);
+    assert.equal(payload.decision, 'Current memory remains distilled.');
+    assert.equal(payload.evidenceText, 'MK asked whether the hybrid query方式 changed.');
   });
 
   it('does not promote or rewrite terminal suppressed finalizations', async () => {

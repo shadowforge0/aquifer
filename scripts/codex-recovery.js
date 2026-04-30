@@ -7,6 +7,36 @@ const path = require('path');
 
 const { createAquiferFromConfig } = require('../consumers/shared/factory');
 const codex = require('../consumers/codex');
+const {
+  cmdCheckpointHeartbeat,
+  cmdCheckpointHeartbeatHook,
+  cmdCheckpointPrompt,
+  cmdCheckpointTick,
+} = require('./codex-checkpoint-commands');
+const {
+  acquireHeartbeatClaim,
+  checkpointCheckIntervalMs,
+  checkpointClaimDir,
+  checkpointClaimTtlMs,
+  checkpointDueFromMarker,
+  checkpointEveryMessages,
+  checkpointEveryUserMessages,
+  checkpointHeartbeatCommand,
+  checkpointMarkerDir,
+  checkpointQuietMs,
+  checkpointSchedulerDir,
+  checkpointSpoolDir,
+  defaultHooksPath,
+  findNewestJsonlFile,
+  inspectCheckpointHeartbeatHook,
+  loadRuntimeConfig,
+  mergeCheckpointHeartbeatHook,
+  readCheckpointMarker,
+  readSchedulerMarker,
+  releaseHeartbeatClaim,
+  writeCheckpointMarker,
+  writeSchedulerMarker,
+} = require('./codex-checkpoint-runtime');
 const DB_ENV_KEYS = new Set(['DATABASE_URL', 'AQUIFER_DB_URL', 'AQUIFER_SCHEMA', 'AQUIFER_TENANT_ID']);
 
 const VALUE_FLAGS = new Set([
@@ -16,7 +46,23 @@ const VALUE_FLAGS = new Set([
   'except-session-id',
   'file-path',
   'finalizer-model',
+  'checkpoint-every-messages',
+  'checkpoint-every-user-messages',
+  'checkpoint-check-interval-ms',
+  'checkpoint-check-interval-minutes',
+  'checkpoint-claim-ttl-ms',
+  'checkpoint-claim-dir',
+  'checkpoint-marker-dir',
+  'checkpoint-scheduler-dir',
+  'checkpoint-spool-dir',
+  'checkpoint-quiet-ms',
+  'hook-event-name',
+  'hooks-path',
   'idle-ms',
+  'max-checkpoint-bytes',
+  'max-checkpoint-chars',
+  'max-checkpoint-messages',
+  'max-checkpoint-prompt-tokens',
   'max-candidates',
   'max-recovery-bytes',
   'max-recovery-chars',
@@ -27,6 +73,8 @@ const VALUE_FLAGS = new Set([
   'reason',
   'scope-kind',
   'scope-key',
+  'active-scope-key',
+  'active-scope-path',
   'session-id',
   'session-key',
   'sessions-dir',
@@ -118,6 +166,7 @@ function buildRecoveryOptions(flags = {}, env = process.env) {
     project: flags.project || flags['project-key'] || envDefault(env, 'CODEX_AQUIFER_PROJECT', 'CODEX_PROJECT') || undefined,
     repoPath: flags['repo-path'] || envDefault(env, 'CODEX_AQUIFER_REPO_PATH', 'CODEX_REPO_PATH') || undefined,
     codexHome: flags['codex-home'] || envDefault(env, 'CODEX_HOME') || undefined,
+    hooksPath: flags['hooks-path'] || undefined,
     stateDir: flags['state-dir'] || undefined,
     sessionsDir: flags['sessions-dir'] || undefined,
     maxRecoveryCandidates: parseIntFlag(flags['max-candidates'], 1),
@@ -288,6 +337,7 @@ function compactDoctorOptions(opts = {}) {
     project: opts.project || null,
     repoPath: opts.repoPath || null,
     codexHome: opts.codexHome || null,
+    hooksPath: opts.hooksPath || null,
     sessionsDir: opts.sessionsDir || null,
     stateDir: opts.stateDir || null,
     excludeNewest: opts.excludeNewest !== false,
@@ -318,6 +368,15 @@ async function buildDoctorReport(aquifer, opts = {}, env = process.env) {
   } else {
     addDoctorCheck(checks, 'current_transcript_guard', 'ok', 'Newest transcript exclusion is enabled.');
   }
+
+  const heartbeatHook = inspectCheckpointHeartbeatHook(opts);
+  addDoctorCheck(
+    checks,
+    'checkpoint_heartbeat_hook',
+    heartbeatHook.status,
+    heartbeatHook.detail,
+    { hooksPath: heartbeatHook.hooksPath, installed: heartbeatHook.installed },
+  );
 
   let candidates = [];
   try {
@@ -602,6 +661,10 @@ async function main(argv = process.argv.slice(2)) {
   node scripts/codex-recovery.js hook-context [options]
   node scripts/codex-recovery.js preview [options]
   node scripts/codex-recovery.js prompt --session-id ID [options]
+  node scripts/codex-recovery.js checkpoint-prompt --file-path FILE --scope-key KEY [options]
+  node scripts/codex-recovery.js checkpoint-tick --scope-key KEY [--file-path FILE|--sessions-dir DIR] [options]
+  node scripts/codex-recovery.js checkpoint-heartbeat --hook-stdin --scope-key KEY [options]
+  node scripts/codex-recovery.js checkpoint-heartbeat-hook --scope-key KEY [--hooks-path FILE] [--apply]
   node scripts/codex-recovery.js finalize --session-id ID --summary-stdin [options]
   node scripts/codex-recovery.js decision --session-id ID --verdict declined|deferred [options]
   node scripts/codex-recovery.js decision --all --verdict declined|deferred [options]
@@ -620,6 +683,16 @@ async function main(argv = process.argv.slice(2)) {
     return;
   }
 
+  if (command === 'checkpoint-heartbeat') {
+    await cmdCheckpointHeartbeat(null, args.flags, opts);
+    return;
+  }
+
+  if (command === 'checkpoint-heartbeat-hook') {
+    await cmdCheckpointHeartbeatHook(args.flags, opts);
+    return;
+  }
+
   await withAquifer(async (aquifer) => {
     switch (command) {
       case 'preview':
@@ -630,6 +703,12 @@ async function main(argv = process.argv.slice(2)) {
         break;
       case 'prompt':
         await cmdPrompt(aquifer, args.flags, opts);
+        break;
+      case 'checkpoint-prompt':
+        await cmdCheckpointPrompt(aquifer, args.flags, opts);
+        break;
+      case 'checkpoint-tick':
+        await cmdCheckpointTick(aquifer, args.flags, opts);
         break;
       case 'finalize':
         await cmdFinalize(aquifer, args.flags, opts);
@@ -651,13 +730,39 @@ module.exports = {
   cmdDoctorInitFailure,
   cmdFinalize,
   cmdHookContext,
+  cmdCheckpointHeartbeat,
+  cmdCheckpointHeartbeatHook,
+  cmdCheckpointPrompt,
+  cmdCheckpointTick,
   cmdPrompt,
+  acquireHeartbeatClaim,
+  checkpointDueFromMarker,
+  checkpointHeartbeatCommand,
+  checkpointCheckIntervalMs,
+  checkpointEveryMessages,
+  checkpointEveryUserMessages,
+  checkpointQuietMs,
+  checkpointClaimDir,
+  checkpointClaimTtlMs,
+  checkpointMarkerDir,
+  checkpointSchedulerDir,
+  checkpointSpoolDir,
+  defaultHooksPath,
+  findNewestJsonlFile,
+  inspectCheckpointHeartbeatHook,
+  loadRuntimeConfig,
   loadCodexEnv,
   main,
+  mergeCheckpointHeartbeatHook,
   parseArgs,
+  readCheckpointMarker,
+  readSchedulerMarker,
+  releaseHeartbeatClaim,
   renderFinalizeCommand,
   renderHookContext,
   selectCandidate,
+  writeCheckpointMarker,
+  writeSchedulerMarker,
 };
 
 if (require.main === module) {

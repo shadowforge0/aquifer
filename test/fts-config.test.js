@@ -204,6 +204,22 @@ describe('storage.searchSessions trigram search', () => {
       'tenant/agent filters must live outside the NN CTE');
   });
 
+  it('searchTurnEmbeddings excludes obvious placeholder summaries from public vector recall SQL', async () => {
+    const captured = [];
+    await storage.searchTurnEmbeddings(makePool(captured), {
+      schema: 'aquifer',
+      tenantId: 'default',
+      queryVec: new Array(8).fill(0.1),
+    });
+    const sql = captured[0].sql;
+
+    assert.match(sql, /summary_text/);
+    assert.match(sql, /空測試會話/);
+    assert.match(sql, /測試會話無實質內容/);
+    assert.match(sql, /placeholder/);
+    assert.match(sql, /x 字元填充/);
+  });
+
   it('orders substring-hit rows ahead of similarity-only matches', async () => {
     const captured = [];
     await storage.searchSessions(makePool(captured), 'hello', {

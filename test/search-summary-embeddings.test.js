@@ -89,4 +89,21 @@ describe('storage.searchSummaryEmbeddings', () => {
     assert.ok(captured[0].sql.includes('ss.embedding IS NOT NULL'),
       'must guard against NULL embeddings');
   });
+
+  it('excludes obvious placeholder summaries from public summary-vector recall SQL', async () => {
+    const captured = [];
+    await storage.searchSummaryEmbeddings(makePool(captured), {
+      schema: 'aq',
+      tenantId: 't',
+      queryVec: [0.1],
+      limit: 3,
+    });
+    const sql = captured[0].sql;
+
+    assert.match(sql, /summary_text/);
+    assert.match(sql, /空測試會話/);
+    assert.match(sql, /測試會話無實質內容/);
+    assert.match(sql, /placeholder/);
+    assert.match(sql, /x 字元填充/);
+  });
 });

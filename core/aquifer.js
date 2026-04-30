@@ -1,171 +1,31 @@
 'use strict';
 
 const { Pool } = require('pg');
-const path = require('path');
-const fs = require('fs');
 
 const storage = require('./storage');
 const entity = require('./entity');
 const { hybridRank } = require('./hybrid-rank');
 const { summarize } = require('../pipeline/summarize');
 const { extractEntities } = require('../pipeline/extract-entities');
-const { createEmbedder } = require('../pipeline/embed');
 const { applyEnrichSafetyGate, sanitizeSummaryResult } = require('./memory-safety-gate');
-
-// ---------------------------------------------------------------------------
-// Schema name validation
-// ---------------------------------------------------------------------------
-
-const SCHEMA_RE = /^[a-zA-Z_]\w{0,62}$/;
-
-function validateSchema(schema) {
-  if (!SCHEMA_RE.test(schema)) {
-    throw new Error(`Invalid schema name: "${schema}". Must match /^[a-zA-Z_]\\w{0,62}$/`);
-  }
-}
-
-// C1 fix: quote identifiers to handle reserved words safely
-function qi(identifier) { return `"${identifier}"`; }
-
-// ---------------------------------------------------------------------------
-// SQL file loader — replaces ${schema} placeholders
-// ---------------------------------------------------------------------------
-
-function loadSql(filename, schema) {
-  const filePath = path.join(__dirname, '..', 'schema', filename);
-  const raw = fs.readFileSync(filePath, 'utf8');
-  // C1: use quoted identifier for safety
-  return raw.replace(/\$\{schema\}/g, qi(schema));
-}
-
-// ---------------------------------------------------------------------------
-// buildRerankDocument — assemble text for cross-encoder reranking
-// ---------------------------------------------------------------------------
-
-function buildRerankDocument(row, maxChars) {
-  // Prefer structured_summary fields when available — title/overview carry
-  // more signal than summary_text for short Chinese recaps, and topics /
-  // decisions / open_loops give the cross-encoder substantive content.
-  // Fall back to summary_text / matched_turn_text when structured is absent.
-  const ss = row.structured_summary || null;
-  const parts = [];
-  if (ss) {
-    if (ss.title) parts.push(String(ss.title).trim());
-    if (ss.overview) parts.push(String(ss.overview).trim());
-    if (Array.isArray(ss.topics)) {
-      const topics = ss.topics
-        .map(t => typeof t === 'string' ? t : (t && t.name ? `${t.name}${t.summary ? ': ' + t.summary : ''}` : ''))
-        .filter(Boolean).join(' / ');
-      if (topics) parts.push(topics);
-    }
-    if (Array.isArray(ss.decisions)) {
-      const decisions = ss.decisions
-        .map(d => typeof d === 'string' ? d : (d && d.decision ? d.decision : ''))
-        .filter(Boolean).join(' / ');
-      if (decisions) parts.push(`Decisions: ${decisions}`);
-    }
-    if (Array.isArray(ss.open_loops)) {
-      const loops = ss.open_loops
-        .map(l => typeof l === 'string' ? l : (l && l.item ? l.item : ''))
-        .filter(Boolean).join(' / ');
-      if (loops) parts.push(`Open loops: ${loops}`);
-    }
-  }
-  if (!parts.length) {
-    const bare = (row.summary_text || row.summary_snippet || '').trim();
-    if (bare) parts.push(bare);
-  }
-  const turn = (row.matched_turn_text || '').replace(/\s+/g, ' ').trim();
-  if (turn) {
-    const joined = parts.join(' \n ');
-    if (!joined.includes(turn)) parts.push(`Matched turn: ${turn}`);
-  }
-
-  let text = parts.join('\n\n').replace(/[ \t]+/g, ' ').trim();
-  if (text.length > maxChars) text = text.slice(0, maxChars);
-  return text;
-}
-
-// ---------------------------------------------------------------------------
-// resolveEmbedFn — v1.2.0 embed autodetect (explicit > object > env > null)
-// ---------------------------------------------------------------------------
-
-function resolveEmbedFn(embedConfig, env) {
-  if (embedConfig && typeof embedConfig.fn === 'function') {
-    return embedConfig.fn;
-  }
-  if (embedConfig && embedConfig.provider) {
-    const embedder = createEmbedder(embedConfig);
-    return (texts) => embedder.embedBatch(texts);
-  }
-  const provider = env.EMBED_PROVIDER;
-  if (!provider) return null;
-
-  const opts = { provider };
-  if (provider === 'ollama') {
-    opts.ollamaUrl = env.OLLAMA_URL || env.AQUIFER_EMBED_BASE_URL || 'http://localhost:11434';
-    opts.model = env.AQUIFER_EMBED_MODEL || 'bge-m3';
-  } else if (provider === 'openai') {
-    opts.openaiApiKey = env.OPENAI_API_KEY;
-    if (!opts.openaiApiKey) {
-      throw new Error('EMBED_PROVIDER=openai requires OPENAI_API_KEY');
-    }
-    opts.openaiModel = env.AQUIFER_EMBED_MODEL || 'text-embedding-3-small';
-    if (env.AQUIFER_EMBED_DIM) opts.openaiDimensions = Number(env.AQUIFER_EMBED_DIM);
-  } else {
-    throw new Error(`EMBED_PROVIDER=${provider} not supported by autodetect (use 'ollama' or 'openai', or pass config.embed.fn explicitly)`);
-  }
-  const embedder = createEmbedder(opts);
-  return (texts) => embedder.embedBatch(texts);
-}
+const { backendCapabilities, normalizeBackendKind } = require('./backends/capabilities');
+const { createPostgresMigrationRuntime, qi, validateSchema } = require('./postgres-migrations');
+const { createMemoryServingRuntime } = require('./memory-serving');
+const { createLegacyBootstrap } = require('./legacy-bootstrap');
+const { buildRerankDocument, resolveEmbedFn, shouldAutoRerank } = require('./recall-runtime');
+const { filterPublicPlaceholderSessionRows } = require('./public-session-filter');
 
 // ---------------------------------------------------------------------------
 // createAquifer
 // ---------------------------------------------------------------------------
 
-// Decide whether to invoke the optional reranker on this recall call.
-// Returns `{ apply: boolean, reason: string }`. Pure function — no side effects.
-function shouldAutoRerank({ query, mode, ranked, hasEntities, autoTrigger }) {
-  if (!autoTrigger.enabled) return { apply: false, reason: 'auto_disabled' };
-
-  if (hasEntities && autoTrigger.alwaysWhenEntities) {
-    return { apply: true, reason: 'entities_present' };
-  }
-
-  const len = ranked.length;
-  if (len < autoTrigger.minResults) return { apply: false, reason: 'too_few_results' };
-  if (len > autoTrigger.maxResults) return { apply: false, reason: 'too_many_results' };
-
-  const q = String(query || '').trim();
-  const tokenCount = q.split(/\s+/).filter(Boolean).length;
-  if (q.length < autoTrigger.minQueryChars && tokenCount < autoTrigger.minQueryTokens) {
-    return { apply: false, reason: 'query_too_short' };
-  }
-
-  // FTS-only path: rerank when results are wide enough that semantic narrowing
-  // is valuable. Cohere-style cross-encoders excel at re-ranking keyword hits.
-  if (mode === 'fts') {
-    if (len > autoTrigger.ftsMinResults) return { apply: true, reason: 'fts_wide_shortlist' };
-    return { apply: false, reason: 'fts_shortlist_too_narrow' };
-  }
-
-  if (!autoTrigger.modes.includes(mode)) {
-    return { apply: false, reason: 'mode_not_in_autotrigger_modes' };
-  }
-
-  // Hybrid: if top-1 and top-2 are close, signals are mixed enough to benefit.
-  if (len >= 2) {
-    const s0 = ranked[0]?._score ?? 0;
-    const s1 = ranked[1]?._score ?? 0;
-    if (s0 - s1 <= autoTrigger.maxTopScoreGap) {
-      return { apply: true, reason: 'top_score_gap_close' };
-    }
-  }
-
-  return { apply: false, reason: 'top_score_gap_wide' };
-}
-
 function createAquifer(config = {}) {
+  const backendKind = normalizeBackendKind(config.backend?.kind || config.storage?.backend || 'postgres');
+  if (backendKind !== 'postgres') {
+    throw new Error(`createAquifer() only constructs the PostgreSQL backend. Use createAquiferFromConfig() for backend "${backendKind}".`);
+  }
+  const backendInfo = backendCapabilities(backendKind);
+
   // v1.2.0: db falls back to DATABASE_URL / AQUIFER_DB_URL env so hosts can
   // call createAquifer() with zero args for install-and-go.
   const dbInput = config.db !== undefined
@@ -270,114 +130,9 @@ function createAquifer(config = {}) {
   // Source registry (in-memory)
   const sources = new Map();
 
-  // Track if migrate was called
-  let migrated = false;
-  let migratePromise = null;
+  const memoryServing = createMemoryServingRuntime(config.memory || {}, process.env);
+  const legacyBootstrap = createLegacyBootstrap({ pool, schema, tenantId, formatBootstrapText });
 
-  // FTS tsconfig — auto-detected during migrate(). 'zhcfg' if zhparser is
-  // installed (better Chinese segmentation), otherwise 'simple' (legacy).
-  // Override via config.ftsConfig if you need to force one or the other.
-  let ftsConfig = config.ftsConfig || null;
-
-  const memoryCfg = config.memory || {};
-  const memoryServingMode = memoryCfg.servingMode || process.env.AQUIFER_MEMORY_SERVING_MODE || 'legacy';
-  function splitScopePath(value) {
-    if (Array.isArray(value)) return value.map(v => String(v).trim()).filter(Boolean);
-    if (typeof value !== 'string') return null;
-    const parts = value.split(',').map(v => v.trim()).filter(Boolean);
-    return parts.length > 0 ? parts : null;
-  }
-  const defaultActiveScopeKey = memoryCfg.activeScopeKey || process.env.AQUIFER_MEMORY_ACTIVE_SCOPE_KEY || null;
-  const defaultActiveScopePath = splitScopePath(
-    memoryCfg.activeScopePath || process.env.AQUIFER_MEMORY_ACTIVE_SCOPE_PATH || null,
-  );
-  function resolveMemoryServingMode(opts = {}) {
-    const mode = opts.memoryMode || opts.servingMode || memoryServingMode;
-    if (mode === 'legacy' || mode === 'evidence') return 'legacy';
-    if (mode === 'curated') return 'curated';
-    throw new Error(`Invalid memory serving mode: "${mode}". Must be one of: legacy, curated`);
-  }
-  function withDefaultMemoryScope(opts = {}) {
-    const next = { ...opts };
-    if (!next.activeScopePath && defaultActiveScopePath) next.activeScopePath = defaultActiveScopePath;
-    if (!next.activeScopeKey && defaultActiveScopeKey) next.activeScopeKey = defaultActiveScopeKey;
-    return next;
-  }
-  function assertCuratedRecallOpts(opts = {}) {
-    const unsupported = [];
-    for (const key of ['agentId', 'agentIds', 'source', 'dateFrom', 'dateTo', 'entities', 'entityMode', 'mode', 'weights', 'rerank', 'allowUnsafeDebug', 'unsafeDebug']) {
-      if (opts[key] !== undefined && opts[key] !== null) unsupported.push(key);
-    }
-    if (unsupported.length > 0) {
-      throw new Error(`curated session_recall does not support legacy filters: ${unsupported.join(', ')}. Use activeScopeKey/activeScopePath or evidence_recall.`);
-    }
-  }
-  function assertCuratedBootstrapOpts(opts = {}) {
-    const unsupported = [];
-    for (const key of ['agentId', 'source', 'lookbackDays', 'dateFrom', 'dateTo']) {
-      if (opts[key] !== undefined && opts[key] !== null) unsupported.push(key);
-    }
-    if (unsupported.length > 0) {
-      throw new Error(`curated session_bootstrap does not support legacy filters: ${unsupported.join(', ')}. Use activeScopeKey/activeScopePath.`);
-    }
-  }
-  function hasEvidenceBoundary(opts = {}) {
-    return Boolean(
-      opts.agentId
-      || (Array.isArray(opts.agentIds) && opts.agentIds.length > 0)
-      || opts.source
-      || opts.dateFrom
-      || opts.dateTo
-      || opts.host
-      || opts.sessionId
-      || opts.allowUnsafeDebug === true
-      || opts.unsafeDebug === true
-    );
-  }
-  function curatedRecallTitle(row = {}) {
-    const title = row.title || row.summary || row.canonical_key || row.canonicalKey || row.memory_type || row.memoryType || 'memory';
-    return String(title).trim();
-  }
-  function curatedRecallSummary(row = {}) {
-    const summary = row.summary || row.title || row.canonical_key || row.canonicalKey || '';
-    return String(summary).trim();
-  }
-  function normalizeCuratedRecallRow(row = {}) {
-    const memoryId = row.memoryId || row.memory_id || row.id || null;
-    const canonicalKey = row.canonicalKey || row.canonical_key || null;
-    const memoryType = row.memoryType || row.memory_type || null;
-    const scopeKey = row.scopeKey || row.scope_key || null;
-    const scopeKind = row.scopeKind || row.scope_kind || null;
-    const summaryText = curatedRecallSummary(row) || null;
-    const title = curatedRecallTitle(row) || null;
-    const scoreValue = row.recall_score ?? row.score ?? row.lexical_rank ?? null;
-    const score = scoreValue === null ? null : Number(scoreValue);
-    return {
-      ...row,
-      memoryId: memoryId === null ? null : String(memoryId),
-      canonicalKey,
-      memoryType,
-      scopeKey,
-      scopeKind,
-      title,
-      summaryText,
-      structuredSummary: {
-        title,
-        overview: summaryText,
-      },
-      startedAt: row.acceptedAt || row.accepted_at || row.observedAt || row.observed_at || null,
-      score: Number.isFinite(score) ? score : null,
-      feedbackTarget: {
-        kind: 'memory_feedback',
-        memoryId: memoryId === null ? null : String(memoryId),
-        canonicalKey,
-      },
-    };
-  }
-
-  // State-change extraction (Q3): off by default. When enabled, enrich() runs
-  // an extra LLM call to capture temporal state transitions on whitelisted
-  // entities. See pipeline/extract-state-changes.js + core/entity-state.js.
   const stateChangesCfg = config.stateChanges || {};
   const stateChangesEnabled = stateChangesCfg.enabled === true;
   const stateChangesWhitelist = new Set(
@@ -392,112 +147,17 @@ function createAquifer(config = {}) {
   const stateChangesMaxOutputTokens = Number.isFinite(stateChangesCfg.maxOutputTokens)
     ? stateChangesCfg.maxOutputTokens : 600;
 
-  const migrationsCfg = config.migrations || {};
-  const migrationsMode = (() => {
-    const raw = migrationsCfg.mode;
-    if (raw === 'apply' || raw === 'check' || raw === 'off') return raw;
-    if (raw === undefined || raw === null) return 'apply';
-    throw new Error(`config.migrations.mode must be 'apply' | 'check' | 'off' (got ${JSON.stringify(raw)})`);
-  })();
-  const migrationLockTimeoutMs = Number.isFinite(migrationsCfg.lockTimeoutMs)
-    ? Math.max(0, migrationsCfg.lockTimeoutMs) : 30000;
-  const migrationStartupTimeoutMs = Number.isFinite(migrationsCfg.startupTimeoutMs)
-    ? Math.max(0, migrationsCfg.startupTimeoutMs) : 60000;
-  const migrationOnEvent = typeof migrationsCfg.onEvent === 'function' ? migrationsCfg.onEvent : null;
+  const migrationRuntime = createPostgresMigrationRuntime({
+    pool,
+    schema,
+    migrations: config.migrations || {},
+    getEntitiesEnabled: () => entitiesEnabled,
+    getFactsEnabled: () => factsEnabled,
+    initialFtsConfig: config.ftsConfig || null,
+  });
 
-  function emitMigrationEvent(name, payload) {
-    if (!migrationOnEvent) return;
-    try { migrationOnEvent({ name, schema, ...payload }); } catch (err) {
-      console.warn(`[aquifer] migrations.onEvent handler threw: ${err.message}`);
-    }
-  }
-
-  // Expected migration set — used for lazy plan introspection. `always: true`
-  // runs every migrate(); others are gated by feature flags. Signature tables
-  // let listPendingMigrations() probe pg_tables without executing DDL.
-  const MIGRATION_PLAN = [
-    { id: '001-base',                file: '001-base.sql',                always: true, signature: 'sessions' },
-    { id: '002-entities',            file: '002-entities.sql',            gate: 'entities', signature: 'entities' },
-    { id: '003-trust-feedback',      file: '003-trust-feedback.sql',      always: true, signature: 'session_feedback' },
-    { id: '004-facts',               file: '004-facts.sql',               gate: 'facts', signature: 'facts' },
-    { id: '004-completion',          file: '004-completion.sql',          always: true, signature: 'narratives' },
-    { id: '005-entity-state-history',file: '005-entity-state-history.sql',gate: 'entities', signature: 'entity_state_history' },
-    { id: '006-insights',            file: '006-insights.sql',            always: true, signature: 'insights' },
-    { id: '007-v1-foundation',       file: '007-v1-foundation.sql',       always: true, signature: 'memory_records' },
-    { id: '008-session-finalizations',file: '008-session-finalizations.sql',always: true, signature: 'session_finalizations' },
-    { id: '009-v1-assertion-plane',  file: '009-v1-assertion-plane.sql',  always: true, signature: 'fact_assertions_v1' },
-    { id: '010-v1-finalization-review',file: '010-v1-finalization-review.sql',always: true, signature: 'finalization_candidates' },
-    { id: '011-v1-compaction-claim', file: '011-v1-compaction-claim.sql', always: true, signature: { table: 'compaction_runs', column: 'apply_token' } },
-    { id: '012-v1-compaction-lease', file: '012-v1-compaction-lease.sql', always: true, signature: { table: 'compaction_runs', column: 'lease_expires_at' } },
-    { id: '013-v1-compaction-lineage', file: '013-v1-compaction-lineage.sql', always: true, signature: 'compaction_candidates' },
-  ];
-
-  function requiredMigrations() {
-    return MIGRATION_PLAN
-      .filter(m => m.always
-        || (m.gate === 'entities' && entitiesEnabled)
-        || (m.gate === 'facts' && factsEnabled))
-      .map(m => m.id);
-  }
-
-  async function readAppliedMigrations(queryRunner) {
-    const required = MIGRATION_PLAN.filter(m => m.always
-      || (m.gate === 'entities' && entitiesEnabled)
-      || (m.gate === 'facts' && factsEnabled));
-    const tableSignatures = required
-      .map(m => m.signature)
-      .filter(signature => typeof signature === 'string');
-    const columnSignatures = required
-      .map(m => m.signature)
-      .filter(signature => signature && typeof signature === 'object');
-    const presentTables = new Set();
-    const presentColumns = new Set();
-    if (tableSignatures.length > 0) {
-      const r = await queryRunner.query(
-        `SELECT tablename FROM pg_tables
-           WHERE schemaname = $1 AND tablename = ANY($2::text[])`,
-        [schema, tableSignatures]
-      );
-      for (const row of r.rows) presentTables.add(row.tablename);
-    }
-    if (columnSignatures.length > 0) {
-      const tables = [...new Set(columnSignatures.map(signature => signature.table))];
-      const r = await queryRunner.query(
-        `SELECT table_name, column_name
-           FROM information_schema.columns
-          WHERE table_schema = $1 AND table_name = ANY($2::text[])`,
-        [schema, tables]
-      );
-      for (const row of r.rows) presentColumns.add(`${row.table_name}.${row.column_name}`);
-    }
-    return required
-      .filter(m => {
-        if (typeof m.signature === 'string') return presentTables.has(m.signature);
-        return presentColumns.has(`${m.signature.table}.${m.signature.column}`);
-      })
-      .map(m => m.id);
-  }
-
-  async function buildMigrationPlan(queryRunner) {
-    const required = requiredMigrations();
-    const applied = await readAppliedMigrations(queryRunner);
-    const appliedSet = new Set(applied);
-    const pending = required.filter(id => !appliedSet.has(id));
-    return { required, applied, pending };
-  }
-
-  async function ensureMigrated() {
-    if (migrated) return;
-    if (migratePromise) return migratePromise;
-    if (migrationsMode === 'off') { migrated = true; return; }
-    if (migrationsMode === 'check') {
-      // Lazy compare only — don't execute DDL implicitly.
-      const plan = await buildMigrationPlan(pool).catch(() => null);
-      if (plan && plan.pending.length === 0) migrated = true;
-      return;
-    }
-    migratePromise = aquifer.migrate().finally(() => { migratePromise = null; });
-    return migratePromise;
+  function ensureMigrated() {
+    return migrationRuntime.ensureMigrated();
   }
 
   // =========================================================================
@@ -512,273 +172,11 @@ function createAquifer(config = {}) {
     },
 
     async migrate() {
-      const t0 = Date.now();
-      // Advisory lock prevents concurrent migrations across processes.
-      // Lock key is derived from schema name to allow parallel migration
-      // of different schemas in the same database.
-      const lockKey = Buffer.from(`aquifer:${schema}`).reduce((h, b) => (h * 31 + b) & 0x7fffffff, 0);
-
-      emitMigrationEvent('init_started', { mode: migrationsMode });
-
-      // Run all migration DDL on a single checked-out client so we can
-      // capture RAISE NOTICE/WARNING emitted by the DO blocks. node-postgres
-      // swallows notices on pool.query(); attaching a 'notice' listener to a
-      // held client surfaces them. Fall back to pool.query() when the caller
-      // passed a bare mock (no connect/release) — tests using minimal pool
-      // stubs still exercise the migration shape, just without notice capture.
-      const supportsCheckout = typeof pool.connect === 'function';
-      const client = supportsCheckout ? await pool.connect() : pool;
-      const releasesClient = supportsCheckout && typeof client.release === 'function';
-      const notices = [];
-      const onNotice = (n) => {
-        notices.push({ severity: n.severity || 'NOTICE', message: n.message || String(n) });
-      };
-      const hasEvents = typeof client.on === 'function' && typeof client.off === 'function';
-      if (hasEvents) client.on('notice', onNotice);
-
-      const ddlExecuted = [];
-      let lockAcquired = false;
-
-      try {
-        // Plan probe before lock: lets consumers see pending list and lets
-        // us emit an accurate check_completed event even when the DDL is a
-        // no-op on an already-migrated schema.
-        const planBefore = await buildMigrationPlan(client).catch(() => null);
-        emitMigrationEvent('check_completed', {
-          required: planBefore ? planBefore.required : requiredMigrations(),
-          applied:  planBefore ? planBefore.applied  : [],
-          pending:  planBefore ? planBefore.pending  : requiredMigrations(),
-        });
-
-        // Try-lock with poll + timeout. Replaces the old blocking
-        // pg_advisory_lock() which could hang indefinitely if another
-        // process crashed holding the lock. Defensive against mock pools:
-        // only poll when PG explicitly returns ok=false; a missing/empty
-        // response (test mocks that don't model pg_try_advisory_lock) is
-        // treated as acquired so suite doesn't hang on the deadline.
-        const lockDeadline = Date.now() + migrationLockTimeoutMs;
-        const pollMs = 250;
-        while (true) {
-          const r = await client.query('SELECT pg_try_advisory_lock($1) AS ok', [lockKey]);
-          const row = r && r.rows ? r.rows[0] : null;
-          if (row && row.ok === false) {
-            if (Date.now() >= lockDeadline) break;
-            await new Promise(res => setTimeout(res, pollMs));
-            continue;
-          }
-          lockAcquired = true;
-          break;
-        }
-        if (!lockAcquired) {
-          const err = new Error(`aquifer: failed to acquire migration advisory lock within ${migrationLockTimeoutMs}ms for schema "${schema}"`);
-          err.code = 'AQ_MIGRATION_LOCK_TIMEOUT';
-          err.failedAt = 'acquire_lock';
-          throw err;
-        }
-
-        emitMigrationEvent('apply_started', {
-          pending: planBefore ? planBefore.pending : requiredMigrations(),
-        });
-
-        try {
-          // 1. Run base DDL
-          const baseSql = loadSql('001-base.sql', schema);
-          await client.query(baseSql); ddlExecuted.push('001-base');
-
-          // 2. If entities enabled, run entity DDL
-          if (entitiesEnabled) {
-            const entitySql = loadSql('002-entities.sql', schema);
-            await client.query(entitySql); ddlExecuted.push('002-entities');
-          }
-
-          // 3. Trust + feedback (always, not gated by entities)
-          const trustSql = loadSql('003-trust-feedback.sql', schema);
-          await client.query(trustSql); ddlExecuted.push('003-trust-feedback');
-
-          // 4. Facts / consolidation (opt-in)
-          if (factsEnabled) {
-            const factsSql = loadSql('004-facts.sql', schema);
-            await client.query(factsSql); ddlExecuted.push('004-facts');
-          }
-
-          // 5. Completion foundation (always, additive): narratives,
-          // consumer_profiles, sessions.consolidation_phases. Pure additive DDL
-          // with IF NOT EXISTS guards — safe on every migrate() call.
-          const completionSql = loadSql('004-completion.sql', schema);
-          await client.query(completionSql); ddlExecuted.push('004-completion');
-
-          // 6. Entity state history (always, gated by entitiesEnabled because
-          // it FK-references entities). Drop-clean — see scripts/drop-entity-state-history.sql.
-          if (entitiesEnabled) {
-            const stateHistorySql = loadSql('005-entity-state-history.sql', schema);
-            await client.query(stateHistorySql); ddlExecuted.push('005-entity-state-history');
-          }
-
-          // 7. Insights (always, additive). No FK from anywhere into this table —
-          // safe to DROP CASCADE. See scripts/drop-insights.sql.
-          const insightsSql = loadSql('006-insights.sql', schema);
-          await client.query(insightsSql); ddlExecuted.push('006-insights');
-
-          // 8. v1 curated-memory foundation (always, additive). This creates
-          // a sidecar curated plane without changing the legacy session recall
-          // or bootstrap serving path.
-          const memoryV1Sql = loadSql('007-v1-foundation.sql', schema);
-          await client.query(memoryV1Sql); ddlExecuted.push('007-v1-foundation');
-
-          // 9. v1 session finalization ledger (always, additive). Finalization
-          // is the source-of-truth lifecycle for handoff/session-end/recovery
-          // triggers; local consumer markers are cache hints only.
-          const finalizationSql = loadSql('008-session-finalizations.sql', schema);
-          await client.query(finalizationSql); ddlExecuted.push('008-session-finalizations');
-
-          // 10. v1 structured assertion plane (always, additive). This keeps
-          // legacy 004-facts untouched and adds the minimal DB contract for
-          // backing structured assertions, tenant-safe scope ancestry guards,
-          // and compaction coverage fields.
-          const assertionPlaneSql = loadSql('009-v1-assertion-plane.sql', schema);
-          await client.query(assertionPlaneSql); ddlExecuted.push('009-v1-assertion-plane');
-
-          // 11. v1 finalization review and lineage (always, additive). This
-          // stores human review text, minimal SessionStart text, finalization
-          // candidate rows, and row-level created_by_finalization_id lineage.
-          const finalizationReviewSql = loadSql('010-v1-finalization-review.sql', schema);
-          await client.query(finalizationReviewSql); ddlExecuted.push('010-v1-finalization-review');
-
-          // 12. v1 compaction claim/apply guard (always, additive). This adds
-          // a minimal claim token and one-live-apply guard for compaction_runs;
-          // it does not create or promote aggregate memory.
-          const compactionClaimSql = loadSql('011-v1-compaction-claim.sql', schema);
-          await client.query(compactionClaimSql); ddlExecuted.push('011-v1-compaction-claim');
-
-          // 13. v1 compaction claim lease (always, additive). This persists
-          // row-level lease expiry so stale applying claims can be reclaimed
-          // without relying on caller clocks or changing runtime defaults.
-          const compactionLeaseSql = loadSql('012-v1-compaction-lease.sql', schema);
-          await client.query(compactionLeaseSql); ddlExecuted.push('012-v1-compaction-lease');
-
-          // 14. v1 compaction lineage and candidate ledger (always,
-          // additive). This records aggregate candidate outcomes and links
-          // promoted rows back to the compaction run that created them.
-          const compactionLineageSql = loadSql('013-v1-compaction-lineage.sql', schema);
-          await client.query(compactionLineageSql); ddlExecuted.push('013-v1-compaction-lineage');
-
-          migrated = true;
-        } finally {
-          await client.query('SELECT pg_advisory_unlock($1)', [lockKey]).catch((err) => {
-            console.warn(`[aquifer] failed to release migration advisory lock for schema "${schema}": ${err.message}`);
-          });
-        }
-      } catch (err) {
-        err.notices = Array.isArray(err.notices) ? err.notices : notices.slice();
-        err.failedAt = err.failedAt || 'apply_ddl';
-        emitMigrationEvent('apply_failed', {
-          error: { code: err.code || null, message: err.message },
-          failedAt: err.failedAt,
-          notices: err.notices,
-          durationMs: Date.now() - t0,
-        });
-        throw err;
-      } finally {
-        if (hasEvents) client.off('notice', onNotice);
-        if (releasesClient) client.release();
-      }
-
-      // Surface captured migration notices that operators need to see:
-      //   - any WARNING/ERROR (zhcfg rebuild warnings, HNSW OOM, etc.)
-      //   - aquifer-authored NOTICE messages ('[aquifer] ...' prefix in the
-      //     migration DO blocks; these announce extension-install fallback,
-      //     HNSW deferral, and other operational decisions)
-      // Filtered out: PG's own "relation already exists, skipping" and
-      // similar idempotent-DDL chatter that floods a re-run.
-      for (const n of notices) {
-        const sev = (n.severity || 'NOTICE').toUpperCase();
-        const msg = n.message || '';
-        const line = `[aquifer] migration ${sev.toLowerCase()}: ${msg}`;
-        if (sev === 'WARNING' || sev === 'ERROR') {
-          console.warn(line);
-        } else if (sev === 'NOTICE' && msg.startsWith('[aquifer]')) {
-          process.stderr.write(line + '\n');
-        }
-      }
-
-      // Auto-detect FTS tsconfig if not forced by config. Restrict to the
-      // public namespace — same restriction the trigger function uses — so a
-      // same-named config in another schema doesn't fool the detection.
-      if (!ftsConfig) {
-        try {
-          const r = await pool.query(
-            `SELECT 1 FROM pg_ts_config
-               WHERE cfgname = 'zhcfg' AND cfgnamespace = 'public'::regnamespace
-               LIMIT 1`);
-          ftsConfig = r.rowCount > 0 ? 'zhcfg' : 'simple';
-        } catch {
-          ftsConfig = 'simple';
-        }
-      }
-
-      // Post-flight: surface which Chinese FTS backend the migration actually
-      // landed on, and warm the backend's tokenizer so the first live query
-      // doesn't pay cold-start cost unpredictably. RAISE NOTICE/WARNING from
-      // the migration DO blocks are swallowed by node-postgres unless a
-      // notice handler is attached, so without this operators can't tell if
-      // pg_jieba silently failed to install and FTS is degraded to 'simple'.
-      //
-      // pg_jieba first-backend load is ~60MB RAM + 0.5-1s to mmap the dict.
-      // Warming once inside migrate() amortizes that on the backend that runs
-      // migration; other pool backends still pay it on first use, but the
-      // timing surfaces the cost so operators who see unexpected latency
-      // know where to look.
-      try {
-        const f = await pool.query(`
-          SELECT
-            EXISTS(SELECT 1 FROM pg_extension WHERE extname='pg_jieba')   AS have_jieba,
-            EXISTS(SELECT 1 FROM pg_extension WHERE extname='zhparser')   AS have_zhparser,
-            (SELECT p.prsname FROM pg_ts_config c
-               JOIN pg_ts_parser p ON c.cfgparser = p.oid
-               WHERE c.cfgname='zhcfg' AND c.cfgnamespace='public'::regnamespace
-               LIMIT 1)                                                    AS zhcfg_parser
-        `);
-        const row = f.rows[0] || {};
-        const backend = row.zhcfg_parser
-          ? `zhcfg(parser=${row.zhcfg_parser})`
-          : `simple (no zhcfg in public namespace)`;
-
-        let warmupMs = null;
-        if (row.zhcfg_parser) {
-          const t0 = Date.now();
-          await pool.query(`SELECT to_tsvector('zhcfg', $1)`, ['warmup 記憶系統 aquifer'])
-            .catch(() => {});
-          warmupMs = Date.now() - t0;
-        }
-
-        const warmupNote = warmupMs !== null ? ` warmup=${warmupMs}ms` : '';
-        process.stderr.write(
-          `[aquifer] FTS post-flight: backend=${backend} ` +
-          `jieba=${row.have_jieba} zhparser=${row.have_zhparser} ` +
-          `selected=${ftsConfig}${warmupNote}\n`
-        );
-        if (warmupMs !== null && warmupMs > 500) {
-          process.stderr.write(
-            `[aquifer] Note: first FTS call paid ~${warmupMs}ms for tokenizer init ` +
-            `(dictionary mmap). Subsequent calls on the same backend are cached.\n`
-          );
-        }
-      } catch (err) {
-        console.warn(`[aquifer] FTS post-flight check failed: ${err.message}`);
-      }
-
-      const durationMs = Date.now() - t0;
-      emitMigrationEvent('apply_succeeded', {
-        ddlExecuted,
-        durationMs,
-        notices: notices.slice(),
-      });
-      return { ok: true, durationMs, notices: notices.slice(), ddlExecuted };
+      return migrationRuntime.migrate();
     },
 
     async listPendingMigrations() {
-      const plan = await buildMigrationPlan(pool);
-      return { ...plan, lastRunAt: null };
+      return migrationRuntime.listPendingMigrations();
     },
 
     async getMigrationStatus() {
@@ -786,94 +184,7 @@ function createAquifer(config = {}) {
     },
 
     async init() {
-      const t0 = Date.now();
-      const mode = migrationsMode;
-
-      let deadlineTimer = null;
-      const startupDeadline = migrationStartupTimeoutMs > 0
-        ? new Promise((_, reject) => {
-            deadlineTimer = setTimeout(() => {
-              const err = new Error(`aquifer: init() exceeded startupTimeoutMs=${migrationStartupTimeoutMs}ms`);
-              err.code = 'AQ_MIGRATION_STARTUP_TIMEOUT';
-              reject(err);
-            }, migrationStartupTimeoutMs);
-            if (typeof deadlineTimer.unref === 'function') deadlineTimer.unref();
-          })
-        : null;
-      const withDeadline = (p) => startupDeadline ? Promise.race([p, startupDeadline]) : p;
-      const clearDeadline = () => { if (deadlineTimer) { clearTimeout(deadlineTimer); deadlineTimer = null; } };
-
-      try {
-        let plan;
-        try {
-          plan = await withDeadline(buildMigrationPlan(pool));
-        } catch (err) {
-          const durationMs = Date.now() - t0;
-          emitMigrationEvent('apply_failed', {
-            error: { code: err.code || null, message: err.message },
-            failedAt: 'plan_probe',
-            notices: [],
-            durationMs,
-          });
-          return {
-            ready: false,
-            memoryMode: 'off',
-            migrationMode: mode,
-            pendingMigrations: [],
-            appliedMigrations: [],
-            error: { code: err.code || 'AQ_MIGRATION_PROBE_FAILED', message: err.message },
-            durationMs,
-          };
-        }
-
-        if (mode === 'off') {
-          return {
-            ready: true, memoryMode: 'rw', migrationMode: mode,
-            pendingMigrations: plan.pending, appliedMigrations: plan.applied,
-            error: null, durationMs: Date.now() - t0,
-          };
-        }
-
-        if (mode === 'check') {
-          const ready = plan.pending.length === 0;
-          if (ready) migrated = true;
-          return {
-            ready, memoryMode: ready ? 'rw' : 'ro', migrationMode: mode,
-            pendingMigrations: plan.pending, appliedMigrations: plan.applied,
-            error: null, durationMs: Date.now() - t0,
-          };
-        }
-
-        // mode === 'apply'
-        if (plan.pending.length === 0) {
-          migrated = true;
-          return {
-            ready: true, memoryMode: 'rw', migrationMode: mode,
-            pendingMigrations: [], appliedMigrations: plan.applied,
-            error: null, durationMs: Date.now() - t0,
-          };
-        }
-
-        try {
-          const result = await withDeadline(this.migrate());
-          const planAfter = await buildMigrationPlan(pool).catch(() => null);
-          return {
-            ready: true, memoryMode: 'rw', migrationMode: mode,
-            pendingMigrations: planAfter ? planAfter.pending : [],
-            appliedMigrations: planAfter ? planAfter.applied : plan.required,
-            error: null, durationMs: result.durationMs || (Date.now() - t0),
-          };
-        } catch (err) {
-          return {
-            ready: false, memoryMode: 'ro', migrationMode: mode,
-            pendingMigrations: plan.pending, appliedMigrations: plan.applied,
-            error: { code: err.code || 'AQ_MIGRATION_FAILED', message: err.message },
-            durationMs: Date.now() - t0,
-          };
-        }
-      } finally {
-        clearDeadline();
-      }
+      return migrationRuntime.init();
     },
 
     async close() {
@@ -895,8 +206,8 @@ function createAquifer(config = {}) {
     async enableEntities() {
       entitiesEnabled = true;
       // M4: if already migrated, run entity DDL now
-      if (migrated) {
-        const entitySql = loadSql('002-entities.sql', schema);
+      if (migrationRuntime.isMigrated()) {
+        const entitySql = migrationRuntime.loadSql('002-entities.sql');
         await pool.query(entitySql);
       }
     },
@@ -907,7 +218,7 @@ function createAquifer(config = {}) {
       // Safe to call repeatedly; also safe to call before migrate() (will no-op
       // until base schema exists, which enrich/commit will materialize).
       await ensureMigrated();
-      const factsSql = loadSql('004-facts.sql', schema);
+      const factsSql = migrationRuntime.loadSql('004-facts.sql');
       await pool.query(factsSql);
     },
 
@@ -1345,14 +656,53 @@ function createAquifer(config = {}) {
 
     // --- read path ---
 
-    async recall(query, opts = {}) {
-      if (resolveMemoryServingMode(opts) === 'curated') {
-        assertCuratedRecallOpts(opts);
-        await ensureMigrated();
-        const rows = await aquifer.memory.recall(query, withDefaultMemoryScope(opts));
-        return rows.map(normalizeCuratedRecallRow);
+    async memoryRecall(query, opts = {}) {
+      memoryServing.assertCuratedRecallOpts(opts);
+      await ensureMigrated();
+      if (typeof query !== 'string' || query.trim().length === 0) {
+        throw new Error('memory.recall(query): query must be a non-empty string');
       }
+      const validModes = new Set(['fts', 'hybrid', 'vector']);
+      const mode = opts.mode || 'hybrid';
+      if (!validModes.has(mode)) {
+        throw new Error(`Invalid curated recall mode: "${mode}". Must be one of: fts, hybrid, vector`);
+      }
+      let queryVec = null;
+      if (mode === 'hybrid' || mode === 'vector') {
+        if (!embedFn) {
+          if (mode === 'vector') {
+            throw new Error('curated memory_recall mode=vector requires config.embed.fn or EMBED_PROVIDER env');
+          }
+        } else {
+          const embedded = await embedFn([query]);
+          queryVec = Array.isArray(embedded) && Array.isArray(embedded[0]) ? embedded[0] : null;
+          if (!queryVec && mode === 'vector') throw new Error('embedFn returned empty vector for curated memory_recall');
+        }
+      }
+      const scopedOpts = memoryServing.withDefaultScope(opts);
+      const limit = Math.max(1, Math.min(50, scopedOpts.limit || 10));
+      const runLexical = mode === 'fts' || mode === 'hybrid';
+      const runVector = (mode === 'vector' || mode === 'hybrid') && queryVec;
+      const [lexicalRows, embeddingRows] = await Promise.all([
+        runLexical ? aquifer.memory.recall(query, {
+          ...scopedOpts,
+          ftsConfig: migrationRuntime.getFtsConfig(),
+        }) : Promise.resolve([]),
+        runVector ? aquifer.memory.recallViaMemoryEmbeddings(queryVec, scopedOpts) : Promise.resolve([]),
+      ]);
+      const rows = aquifer.memory.rankHybridMemoryRows(lexicalRows, embeddingRows, { limit });
+      return rows.map(memoryServing.normalizeCuratedRecallRow);
+    },
+
+    async historicalRecall(query, opts = {}) {
       return aquifer.evidenceRecall(query, { ...opts, allowBroadEvidence: true });
+    },
+
+    async recall(query, opts = {}) {
+      if (memoryServing.resolveMode(opts) === 'curated') {
+        return aquifer.memoryRecall(query, opts);
+      }
+      return aquifer.historicalRecall(query, opts);
     },
 
     async evidenceRecall(query, opts = {}) {
@@ -1363,7 +713,7 @@ function createAquifer(config = {}) {
       if (typeof query !== 'string' || query.trim().length === 0) {
         throw new Error('aquifer.recall(query): query must be a non-empty string');
       }
-      if (opts.allowBroadEvidence !== true && !hasEvidenceBoundary(opts)) {
+      if (opts.allowBroadEvidence !== true && !memoryServing.hasEvidenceBoundary(opts)) {
         throw new Error('evidence_recall requires an audit boundary filter (agentId, source, dateFrom/dateTo, host, sessionId) or allowUnsafeDebug=true');
       }
 
@@ -1533,7 +883,7 @@ function createAquifer(config = {}) {
         runFts
           ? storage.searchSessions(pool, query, {
               schema, tenantId, agentIds: resolvedAgentIds, source, dateFrom, dateTo, limit: fetchLimit,
-              ftsConfig,
+              ftsConfig: migrationRuntime.getFtsConfig(),
             }).catch((err) => {
               recordSearchError('fts', err);
               return [];
@@ -1566,9 +916,9 @@ function createAquifer(config = {}) {
         ? (rows) => rows.filter(r => candidateSessionIds.has(r.session_id || String(r.id)))
         : (rows) => rows;
 
-      const filteredFts = filterFn(ftsRows);
-      const filteredEmb = filterFn(embRows);
-      const filteredTurn = filterFn(turnRows);
+      const filteredFts = filterPublicPlaceholderSessionRows(filterFn(ftsRows));
+      const filteredEmb = filterPublicPlaceholderSessionRows(filterFn(embRows));
+      const filteredTurn = filterPublicPlaceholderSessionRows(filterFn(turnRows));
 
       if (filteredFts.length === 0 && filteredEmb.length === 0 && filteredTurn.length === 0) {
         maybeThrowSearchErrors();
@@ -1613,10 +963,11 @@ function createAquifer(config = {}) {
       if (externalPromises.length > 0) await Promise.all(externalPromises);
 
       // 6. Hybrid rank
+      const filteredExternalRows = filterPublicPlaceholderSessionRows(filterFn(externalRows));
       const mergedWeights = { ...rankWeights, ...overrideWeights };
       const ranked = hybridRank(
         filteredFts,
-        [...filteredEmb, ...filterFn(externalRows)],
+        [...filteredEmb, ...filteredExternalRows],
         filteredTurn,
         {
           limit: rerankTopK,
@@ -1673,11 +1024,11 @@ function createAquifer(config = {}) {
             if (aR !== bR) return bR - aR;
             return (b._hybridScore || 0) - (a._hybridScore || 0);
           });
-          finalRanked = finalRanked.slice(0, limit);
+          finalRanked = filterPublicPlaceholderSessionRows(finalRanked).slice(0, limit);
         } catch (rerankErr) {
           // Fallback: use original hybrid-rank order, flag in debug
           if (process.env.AQUIFER_DEBUG) console.error('[aquifer] rerank error:', rerankErr.message);
-          finalRanked = ranked.slice(0, limit).map(r => ({
+          finalRanked = filterPublicPlaceholderSessionRows(ranked).slice(0, limit).map(r => ({
             ...r,
             _rerankFallback: true,
             _rerankReason: rerankDecision.reason,
@@ -1685,7 +1036,7 @@ function createAquifer(config = {}) {
           }));
         }
       } else {
-        finalRanked = ranked.slice(0, limit).map(r => ({ ...r, _rerankReason: rerankDecision.reason }));
+        finalRanked = filterPublicPlaceholderSessionRows(ranked).slice(0, limit).map(r => ({ ...r, _rerankReason: rerankDecision.reason }));
       }
 
       // 7. Record access
@@ -1838,7 +1189,20 @@ function createAquifer(config = {}) {
     // --- public config accessor ---
 
     getConfig() {
-      return { schema, tenantId, memoryServingMode };
+      return {
+        schema,
+        tenantId,
+        memoryServingMode: memoryServing.servingMode,
+        memoryActiveScopeKey: memoryServing.defaultActiveScopeKey,
+        memoryActiveScopePath: memoryServing.defaultActiveScopePath,
+        backendKind,
+        backendProfile: backendInfo.profile,
+        capabilities: backendInfo.capabilities,
+      };
+    },
+
+    getCapabilities() {
+      return backendCapabilities(backendKind);
     },
 
     // v1.2.0: expose the internal pool so host persona layers can reuse it
@@ -1894,12 +1258,92 @@ function createAquifer(config = {}) {
         entityCount = entResult.rows[0]?.count || 0;
       } catch { /* entities table may not exist */ }
 
+      let memoryRecords = {
+        available: false,
+        total: 0,
+        active: 0,
+        visibleInBootstrap: 0,
+        visibleInRecall: 0,
+        earliest: null,
+        latest: null,
+      };
+      try {
+        const memoryResult = await pool.query(
+          `SELECT
+             COUNT(*)::int AS total,
+             COUNT(*) FILTER (WHERE status = 'active')::int AS active,
+             COUNT(*) FILTER (WHERE status = 'active' AND visible_in_bootstrap = true)::int AS visible_in_bootstrap,
+             COUNT(*) FILTER (WHERE status = 'active' AND visible_in_recall = true)::int AS visible_in_recall,
+             MIN(accepted_at) AS earliest,
+             MAX(accepted_at) AS latest
+           FROM ${qi(schema)}.memory_records
+           WHERE tenant_id = $1`,
+          [tenantId]
+        );
+        const row = memoryResult.rows[0] || {};
+        memoryRecords = {
+          available: true,
+          total: row.total || 0,
+          active: row.active || 0,
+          visibleInBootstrap: row.visible_in_bootstrap || 0,
+          visibleInRecall: row.visible_in_recall || 0,
+          earliest: row.earliest || null,
+          latest: row.latest || null,
+        };
+      } catch { /* memory_records table may not exist on older installs */ }
+
+      let sessionFinalizations = {
+        available: false,
+        total: 0,
+        statuses: {},
+        latestFinalizedAt: null,
+        latestUpdatedAt: null,
+      };
+      try {
+        const finalizationResult = await pool.query(
+          `SELECT
+             status,
+             COUNT(*)::int AS count,
+             MAX(finalized_at) AS latest_finalized_at,
+             MAX(updated_at) AS latest_updated_at
+           FROM ${qi(schema)}.session_finalizations
+           WHERE tenant_id = $1
+           GROUP BY status`,
+          [tenantId]
+        );
+        const statuses = Object.fromEntries(finalizationResult.rows.map(row => [row.status, row.count]));
+        sessionFinalizations = {
+          available: true,
+          total: finalizationResult.rows.reduce((sum, row) => sum + row.count, 0),
+          statuses,
+          latestFinalizedAt: finalizationResult.rows
+            .map(row => row.latest_finalized_at)
+            .filter(Boolean)
+            .sort()
+            .pop() || null,
+          latestUpdatedAt: finalizationResult.rows
+            .map(row => row.latest_updated_at)
+            .filter(Boolean)
+            .sort()
+            .pop() || null,
+        };
+      } catch { /* session_finalizations table may not exist on older installs */ }
+
       return {
+        backendKind,
+        backendProfile: backendInfo.profile,
+        serving: {
+          mode: memoryServing.servingMode,
+          activeScopeKey: memoryServing.defaultActiveScopeKey,
+          activeScopePath: memoryServing.defaultActiveScopePath,
+        },
         sessions: Object.fromEntries(sessions.rows.map(r => [r.processing_status, r.count])),
         sessionTotal: sessions.rows.reduce((s, r) => s + r.count, 0),
         summaries: summaries.rows[0]?.count || 0,
         turnEmbeddings: turns.rows[0]?.count || 0,
         entities: entityCount,
+        memoryRecords,
+        sessionFinalizations,
         earliest: timeRange.rows[0]?.earliest || null,
         latest: timeRange.rows[0]?.latest || null,
       };
@@ -1941,113 +1385,23 @@ function createAquifer(config = {}) {
       return result.rows;
     },
 
-    async bootstrap(opts = {}) {
+    async memoryBootstrap(opts = {}) {
       await ensureMigrated();
-      if (resolveMemoryServingMode(opts) === 'curated') {
-        assertCuratedBootstrapOpts(opts);
-        return aquifer.memory.bootstrap(withDefaultMemoryScope(opts));
+      memoryServing.assertCuratedBootstrapOpts(opts);
+      return aquifer.memory.bootstrap(memoryServing.withDefaultScope(opts));
+    },
+
+    async historicalBootstrap(opts = {}) {
+      await ensureMigrated();
+      return legacyBootstrap(opts);
+    },
+
+    async bootstrap(opts = {}) {
+      if (memoryServing.resolveMode(opts) === 'curated') {
+        return aquifer.memoryBootstrap(opts);
       }
 
-      const agentId = opts.agentId || null;
-      const source = opts.source || null;
-      const limit = Math.max(1, Math.min(20, opts.limit || 5));
-      const lookbackDays = opts.lookbackDays || 14;
-      const maxChars = opts.maxChars || 4000;
-      const format = opts.format || 'structured';
-
-      // 'partial' sessions have a summary but recorded warnings during enrich;
-      // they are user-visible content, not in-progress — bootstrap must include
-      // them alongside 'succeeded'. 'pending' / 'processing' have no summary
-      // yet and are correctly excluded.
-      const where = [`s.tenant_id = $1`, `s.processing_status IN ('succeeded', 'partial')`];
-      const params = [tenantId];
-
-      if (agentId) {
-        params.push(agentId);
-        where.push(`s.agent_id = $${params.length}`);
-      }
-      if (source) {
-        params.push(source);
-        where.push(`s.source = $${params.length}`);
-      }
-
-      params.push(lookbackDays);
-      // upsertSession sets ended_at on every commit but started_at / last_message_at
-      // only when the caller supplies them — fall back through both so sessions
-      // committed without explicit timestamps remain reachable.
-      where.push(`COALESCE(s.last_message_at, s.ended_at, s.started_at) > now() - ($${params.length} || ' days')::interval`);
-
-      params.push(limit);
-
-      const result = await pool.query(
-        `SELECT s.session_id, s.agent_id, s.source, s.started_at, s.msg_count,
-                ss.summary_text, ss.structured_summary
-         FROM ${qi(schema)}.sessions s
-         JOIN ${qi(schema)}.session_summaries ss ON ss.session_row_id = s.id
-         WHERE ${where.join(' AND ')}
-         ORDER BY COALESCE(s.last_message_at, s.ended_at, s.started_at) DESC
-         LIMIT $${params.length}`,
-        params
-      );
-
-      const sessions = result.rows.map(r => {
-        const ss = r.structured_summary || {};
-        const hasSS = ss.title || ss.overview;
-        return {
-          sessionId: r.session_id,
-          agentId: r.agent_id,
-          source: r.source,
-          startedAt: r.started_at,
-          title: ss.title || (hasSS ? null : (r.summary_text || '').slice(0, 60).trim() || null),
-          overview: ss.overview || (hasSS ? null : (r.summary_text || '').slice(0, 200).trim() || null),
-          topics: Array.isArray(ss.topics) ? ss.topics : [],
-          decisions: Array.isArray(ss.decisions) ? ss.decisions : [],
-          openLoops: Array.isArray(ss.open_loops) ? ss.open_loops : [],
-          importantFacts: Array.isArray(ss.important_facts) ? ss.important_facts : [],
-        };
-      });
-
-      // Cross-session open loops merge + dedup + sentinel filter
-      const SENTINELS = new Set(['無', 'none', 'n/a', 'na', 'done', '']);
-      const seenLoops = new Set();
-      const openLoops = [];
-      for (const s of sessions) {
-        for (const loop of s.openLoops) {
-          const raw = typeof loop === 'string' ? loop : (loop.item || '');
-          const normalized = raw.trim().replace(/\s+/g, ' ').toLowerCase();
-          if (SENTINELS.has(normalized) || !normalized || seenLoops.has(normalized)) continue;
-          seenLoops.add(normalized);
-          openLoops.push({ item: raw.trim(), fromSession: s.sessionId, latestStartedAt: s.startedAt });
-        }
-      }
-
-      // Cross-session recent decisions dedup
-      const seenDecisions = new Set();
-      const recentDecisions = [];
-      for (const s of sessions) {
-        for (const d of s.decisions) {
-          const key = typeof d === 'string' ? d : (d.decision || '');
-          const normalized = key.trim().replace(/\s+/g, ' ').toLowerCase();
-          if (!normalized || seenDecisions.has(normalized)) continue;
-          seenDecisions.add(normalized);
-          recentDecisions.push({ decision: key.trim(), reason: d.reason || null, fromSession: s.sessionId });
-        }
-      }
-
-      const structured = {
-        sessions,
-        openLoops,
-        recentDecisions,
-        meta: { lookbackDays, count: sessions.length, maxChars, truncated: false },
-      };
-
-      if (format === 'text' || format === 'both') {
-        const textResult = formatBootstrapText(structured, maxChars);
-        structured.text = textResult.text;
-        structured.meta.truncated = textResult.truncated;
-      }
-
-      return structured;
+      return aquifer.historicalBootstrap(opts);
     },
   };
 
@@ -2066,11 +1420,12 @@ function createAquifer(config = {}) {
   const { createEntityState } = require('./entity-state');
   const { createInsights } = require('./insights');
   const { createMemoryRecords } = require('./memory-records');
-  const { createMemoryPromotion } = require('./memory-promotion');
+  const { createMemoryPromotion, buildMemoryEmbeddingText } = require('./memory-promotion');
   const { createMemoryBootstrap } = require('./memory-bootstrap');
   const { createMemoryRecall } = require('./memory-recall');
   const { createMemoryConsolidation } = require('./memory-consolidation');
   const { createSessionFinalization } = require('./session-finalization');
+  const { createSessionCheckpoints } = require('./session-checkpoints');
   const qSchema = qi(schema);
   aquifer.narratives = createNarratives({ pool, schema: qSchema, defaultTenantId: tenantId });
   aquifer.timeline = createTimeline({ pool, schema: qSchema, defaultTenantId: tenantId });
@@ -2100,7 +1455,7 @@ function createAquifer(config = {}) {
   });
 
   const memoryRecords = createMemoryRecords({ pool, schema: qSchema, defaultTenantId: tenantId });
-  const memoryPromotion = createMemoryPromotion({ records: memoryRecords });
+  const memoryPromotion = createMemoryPromotion({ records: memoryRecords, embedFn });
   const memoryBootstrap = createMemoryBootstrap({ records: memoryRecords });
   const memoryRecall = createMemoryRecall({ pool, schema: qSchema, defaultTenantId: tenantId });
   const memoryConsolidation = createMemoryConsolidation({
@@ -2114,7 +1469,21 @@ function createAquifer(config = {}) {
     schema,
     recordsSchema: qSchema,
     defaultTenantId: tenantId,
+    embedFn,
   });
+  const sessionCheckpoints = createSessionCheckpoints({
+    pool,
+    schema,
+    defaultTenantId: tenantId,
+  });
+
+  function currentMemoryScopeKeys(opts = {}) {
+    if (Array.isArray(opts.activeScopePath) && opts.activeScopePath.length > 0) {
+      return opts.activeScopePath.map(value => String(value)).filter(Boolean);
+    }
+    if (opts.activeScopeKey) return [String(opts.activeScopeKey)];
+    return null;
+  }
 
   // v1 curated-memory sidecar. Top-level recall/bootstrap can opt into this
   // plane through memory.servingMode while legacy/evidence mode remains
@@ -2131,6 +1500,10 @@ function createAquifer(config = {}) {
     upsertMemory: async (input = {}) => {
       await ensureMigrated();
       return memoryRecords.upsertMemory(input);
+    },
+    upsertEvidenceItem: async (input = {}) => {
+      await ensureMigrated();
+      return memoryRecords.upsertEvidenceItem(input);
     },
     linkEvidence: async (input = {}) => {
       await ensureMigrated();
@@ -2152,15 +1525,109 @@ function createAquifer(config = {}) {
     },
     current: async (opts = {}) => {
       await ensureMigrated();
-      return memoryRecords.currentProjection(withDefaultMemoryScope(opts));
+      return memoryRecords.currentProjection(memoryServing.withDefaultScope(opts));
     },
     listCurrentMemory: async (opts = {}) => {
       await ensureMigrated();
-      return memoryRecords.currentProjection(withDefaultMemoryScope(opts));
+      return memoryRecords.currentProjection(memoryServing.withDefaultScope(opts));
+    },
+    backfillEmbeddings: async (opts = {}) => {
+      await ensureMigrated();
+      requireEmbed('memory.backfillEmbeddings');
+      const scopedOpts = memoryServing.withDefaultScope(opts);
+      const listInput = {
+        tenantId: scopedOpts.tenantId || tenantId,
+        asOf: scopedOpts.asOf,
+        scopeId: scopedOpts.scopeId,
+        scopeKeys: currentMemoryScopeKeys(scopedOpts),
+        withoutEmbedding: true,
+        limit: Math.max(1, Math.min(200, scopedOpts.limit || 50)),
+      };
+      if (scopedOpts.visibleInRecall !== undefined) {
+        listInput.visibleInRecall = scopedOpts.visibleInRecall;
+      } else if (scopedOpts.visibleInBootstrap === undefined) {
+        listInput.visibleInRecall = true;
+      }
+      if (scopedOpts.visibleInBootstrap !== undefined) {
+        listInput.visibleInBootstrap = scopedOpts.visibleInBootstrap;
+      }
+      const sourceRows = await memoryRecords.listActive(listInput);
+      const rowsToEmbed = [];
+      const texts = [];
+      for (const row of sourceRows) {
+        const text = buildMemoryEmbeddingText(row);
+        if (!text) continue;
+        rowsToEmbed.push(row);
+        texts.push(text);
+      }
+      if (rowsToEmbed.length === 0) {
+        return {
+          scanned: sourceRows.length,
+          embedded: 0,
+          skipped: sourceRows.length,
+          memories: [],
+        };
+      }
+      const vectors = await embedFn(texts);
+      if (!Array.isArray(vectors) || vectors.length !== texts.length) {
+        throw new Error(`memory.backfillEmbeddings embedFn returned ${Array.isArray(vectors) ? vectors.length : 'invalid'} vectors for ${texts.length} memory rows`);
+      }
+      const updatedRows = [];
+      let skipped = sourceRows.length - rowsToEmbed.length;
+      const skippedMemories = [];
+      for (let i = 0; i < rowsToEmbed.length; i++) {
+        const vector = vectors[i];
+        if (!Array.isArray(vector) || vector.length === 0) {
+          skipped += 1;
+          skippedMemories.push({
+            memoryId: String(rowsToEmbed[i].id),
+            canonicalKey: rowsToEmbed[i].canonical_key || rowsToEmbed[i].canonicalKey || null,
+            reason: 'empty_vector',
+          });
+          continue;
+        }
+        const updateResult = await memoryRecords.updateMemoryEmbedding({
+          tenantId: scopedOpts.tenantId || tenantId,
+          memoryId: rowsToEmbed[i].id,
+          embedding: vector,
+        });
+        if (updateResult && updateResult.updated && updateResult.memory) {
+          updatedRows.push(updateResult.memory);
+          continue;
+        }
+        skipped += 1;
+        skippedMemories.push({
+          memoryId: String(rowsToEmbed[i].id),
+          canonicalKey: rowsToEmbed[i].canonical_key || rowsToEmbed[i].canonicalKey || null,
+          reason: updateResult && updateResult.status ? updateResult.status : 'not_updated',
+        });
+      }
+      return {
+        scanned: sourceRows.length,
+        embedded: updatedRows.length,
+        skipped,
+        memories: updatedRows.map(memoryRecords.normalizeCurrentMemoryRow),
+        skippedMemories,
+      };
     },
     recall: async (query, opts = {}) => {
       await ensureMigrated();
       return memoryRecall.recall(query, opts);
+    },
+    recallViaEvidenceItems: async (query, opts = {}) => {
+      await ensureMigrated();
+      return memoryRecall.recallViaEvidenceItems(query, opts);
+    },
+    recallViaMemoryEmbeddings: async (queryVec, opts = {}) => {
+      await ensureMigrated();
+      return memoryRecall.recallViaMemoryEmbeddings(queryVec, opts);
+    },
+    recallViaLinkedSummaryEmbeddings: async (queryVec, opts = {}) => {
+      await ensureMigrated();
+      return memoryRecall.recallViaLinkedSummaryEmbeddings(queryVec, opts);
+    },
+    rankHybridMemoryRows: (lexicalRows, embeddingRows, opts = {}) => {
+      return memoryRecall.rankHybridMemoryRows(lexicalRows, embeddingRows, opts);
     },
     consolidation: {
       plan: memoryConsolidation.plan,
@@ -2208,6 +1675,50 @@ function createAquifer(config = {}) {
     finalizeSession: async (input = {}) => {
       await ensureMigrated();
       return sessionFinalization.finalizeSession(input);
+    },
+  };
+
+  aquifer.checkpoints = {
+    upsertRun: async (input = {}) => {
+      await ensureMigrated();
+      return sessionCheckpoints.upsertRun(input);
+    },
+    updateRunStatus: async (input = {}) => {
+      await ensureMigrated();
+      return sessionCheckpoints.updateRunStatus(input);
+    },
+    listRuns: async (input = {}) => {
+      await ensureMigrated();
+      return sessionCheckpoints.listRuns(input);
+    },
+    upsertSources: async (rows = [], input = {}) => {
+      await ensureMigrated();
+      return sessionCheckpoints.upsertSources(rows, input);
+    },
+    listSources: async (input = {}) => {
+      await ensureMigrated();
+      return sessionCheckpoints.listSources(input);
+    },
+    buildSynthesisInput: (input = {}) => sessionCheckpoints.buildSynthesisInput(input),
+    buildSynthesisPrompt: (input = {}, opts = {}) => sessionCheckpoints.buildSynthesisPrompt(input, opts),
+    buildRunInputFromSynthesis: (input = {}, summary = {}, opts = {}) => (
+      sessionCheckpoints.buildRunInputFromSynthesis(input, summary, opts)
+    ),
+    planFromFinalizations: async (input = {}) => {
+      await ensureMigrated();
+      return sessionCheckpoints.planFromFinalizations(input);
+    },
+    runProducer: async (input = {}) => {
+      await ensureMigrated();
+      return sessionCheckpoints.runProducer(input);
+    },
+    listForHandoff: async (input = {}) => {
+      await ensureMigrated();
+      return sessionCheckpoints.listForHandoff(input);
+    },
+    listAcceptedForHandoff: async (input = {}) => {
+      await ensureMigrated();
+      return sessionCheckpoints.listAcceptedForHandoff(input);
     },
   };
 

@@ -10,12 +10,44 @@ describe('config.loadConfig', () => {
     assert.equal(config.schema, 'aquifer');
     assert.equal(config.tenantId, 'default');
     assert.equal(config.db.url, null);
+    assert.equal(config.storage.backend, 'postgres');
+    assert.equal(config.storage.postgres.url, null);
+    assert.equal(config.storage.local.path, '.aquifer/aquifer.local.json');
     assert.equal(config.entities.enabled, false);
+    assert.equal(config.codex.checkpoint.checkIntervalMinutes, 10);
+    assert.equal(config.codex.checkpoint.everyMessages, 20);
+    assert.equal(config.codex.checkpoint.quietMs, 3000);
   });
 
   it('reads DATABASE_URL from env', () => {
     const config = loadConfig({ env: { DATABASE_URL: 'postgresql://x' } });
     assert.equal(config.db.url, 'postgresql://x');
+    assert.equal(config.storage.postgres.url, 'postgresql://x');
+  });
+
+  it('reads AQUIFER_POSTGRES_URL into legacy db config', () => {
+    const config = loadConfig({ env: { AQUIFER_POSTGRES_URL: 'postgresql://new' } });
+    assert.equal(config.db.url, 'postgresql://new');
+    assert.equal(config.storage.postgres.url, 'postgresql://new');
+  });
+
+  it('reads local backend config from env', () => {
+    const config = loadConfig({
+      env: {
+        AQUIFER_BACKEND: 'local',
+        AQUIFER_LOCAL_PATH: '/tmp/aquifer-local.json',
+      },
+    });
+    assert.equal(config.storage.backend, 'local');
+    assert.equal(config.storage.local.path, '/tmp/aquifer-local.json');
+    assert.equal(config.db.url, null);
+  });
+
+  it('rejects unknown backend config', () => {
+    assert.throws(
+      () => loadConfig({ env: { AQUIFER_BACKEND: 'sqlite' } }),
+      /Invalid Aquifer backend/
+    );
   });
 
   it('AQUIFER_DB_URL overrides DATABASE_URL', () => {
@@ -172,5 +204,22 @@ describe('config.loadConfig', () => {
       overrides: { memory: { servingMode: 'curated' } },
     });
     assert.equal(config.memory.servingMode, 'curated');
+  });
+
+  it('reads Codex checkpoint heartbeat policy from env', () => {
+    const config = loadConfig({
+      env: {
+        AQUIFER_CODEX_CHECKPOINT_CHECK_INTERVAL_MINUTES: '15',
+        AQUIFER_CODEX_CHECKPOINT_EVERY_MESSAGES: '30',
+        AQUIFER_CODEX_CHECKPOINT_EVERY_USER_MESSAGES: '12',
+        AQUIFER_CODEX_CHECKPOINT_QUIET_MS: '5000',
+        AQUIFER_CODEX_CHECKPOINT_CLAIM_TTL_MS: '90000',
+      },
+    });
+    assert.equal(config.codex.checkpoint.checkIntervalMinutes, 15);
+    assert.equal(config.codex.checkpoint.everyMessages, 30);
+    assert.equal(config.codex.checkpoint.everyUserMessages, 12);
+    assert.equal(config.codex.checkpoint.quietMs, 5000);
+    assert.equal(config.codex.checkpoint.claimTtlMs, 90000);
   });
 });

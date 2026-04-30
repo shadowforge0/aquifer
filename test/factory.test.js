@@ -2,6 +2,8 @@
 
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
+const os = require('node:os');
+const path = require('node:path');
 const { createAquiferFromConfig } = require('../consumers/shared/factory');
 
 function cleanOverrides(overrides = {}) {
@@ -27,8 +29,33 @@ describe('factory.createAquiferFromConfig', () => {
   it('throws if no database URL', () => {
     assert.throws(
       () => createAquiferFromConfig(cleanOverrides({ db: { url: null } })),
-      /Database URL is required/
+      /Database URL is required for PostgreSQL backend/
     );
+  });
+
+  it('creates local starter backend without database URL', async () => {
+    const localPath = path.join(os.tmpdir(), `aquifer-factory-${process.pid}-${Date.now()}.json`);
+    const aq = createAquiferFromConfig(cleanOverrides({
+      db: { url: null },
+      storage: {
+        backend: 'local',
+        local: { path: localPath },
+      },
+    }));
+    const cfg = aq.getConfig();
+    assert.equal(cfg.backendKind, 'local');
+    assert.equal(cfg.backendProfile, 'starter');
+    assert.equal(cfg.backendPath, localPath);
+    assert.equal(cfg.capabilities.zeroConfig, 'full');
+    assert.equal(aq.getPool(), null);
+    const commit = await aq.commit('s1', [{ role: 'user', content: 'hello local starter' }]);
+    assert.equal(commit.sessionId, 's1');
+    const results = await aq.recall('local starter', { limit: 1 });
+    assert.equal(results.length, 1);
+    assert.equal(results[0].backendKind, 'local');
+    const stats = await aq.getStats();
+    assert.equal(stats.sessionTotal, 1);
+    await aq.close();
   });
 
   it('creates aquifer with DB only (no embed, no llm)', async () => {
@@ -82,6 +109,9 @@ describe('factory.createAquiferFromConfig', () => {
     assert.ok(cfg);
     assert.equal(cfg.schema, 'aquifer');
     assert.equal(cfg.tenantId, 'default');
+    assert.equal(cfg.backendKind, 'postgres');
+    assert.equal(cfg.backendProfile, 'full');
+    assert.equal(cfg.capabilities.persistence, 'full');
     await aq.close();
   });
 

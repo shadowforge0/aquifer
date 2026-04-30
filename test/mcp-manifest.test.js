@@ -12,16 +12,19 @@ const {
 } = require('../index');
 
 const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aq-mcp-'));
+function findTool(name) {
+  return MCP_TOOL_MANIFEST.find(tool => tool.name === name);
+}
 
 describe('MCP_TOOL_MANIFEST', () => {
-  it('declares all 8 canonical tools', () => {
+  it('declares explicit current, historical, compatibility, and audit recall tools plus the fixed surface', () => {
     const names = MCP_TOOL_MANIFEST.map(t => t.name);
-    for (const req of ['session_recall', 'session_feedback', 'memory_stats',
-                       'memory_pending', 'session_bootstrap', 'evidence_recall',
-                       'memory_feedback']) {
+    for (const req of ['memory_recall', 'historical_recall', 'session_recall', 'evidence_recall',
+                       'session_feedback', 'memory_stats', 'memory_pending',
+                       'session_bootstrap', 'memory_feedback', 'feedback_stats']) {
       assert.ok(names.includes(req), `missing tool ${req}`);
     }
-    assert.equal(names.length, 8);
+    assert.equal(names.length, 10);
   });
 
   it('every tool has name + description + inputSchema', () => {
@@ -33,15 +36,15 @@ describe('MCP_TOOL_MANIFEST', () => {
     }
   });
 
-  it('session_recall input schema declares query as required', () => {
-    const tool = MCP_TOOL_MANIFEST.find(t => t.name === 'session_recall');
+  it('current recall input schema declares query as required', () => {
+    const tool = findTool('memory_recall');
     assert.ok(tool.inputSchema.required.includes('query'));
     assert.ok(tool.inputSchema.properties.query);
     assert.equal(tool.inputSchema.properties.query.type, 'string');
   });
 
   it('declares curated serving scope and memory feedback inputs', () => {
-    const recall = MCP_TOOL_MANIFEST.find(t => t.name === 'session_recall');
+    const recall = findTool('memory_recall');
     assert.ok(recall.inputSchema.properties.activeScopeKey);
     assert.ok(recall.inputSchema.properties.activeScopePath);
 
@@ -58,18 +61,25 @@ describe('MCP_TOOL_MANIFEST', () => {
     assert.ok(memoryFeedback.inputSchema.properties.feedbackType);
   });
 
-  it('evidence_recall declares an explicit unsafe debug override', () => {
-    const tool = MCP_TOOL_MANIFEST.find(t => t.name === 'evidence_recall');
+  it('evidence_recall declares an explicit unsafe debug override while historical_recall does not', () => {
+    const tool = findTool('evidence_recall');
+    const historical = findTool('historical_recall');
     assert.ok(tool.inputSchema.properties.allowUnsafeDebug);
+    assert.ok(!historical.inputSchema.properties.allowUnsafeDebug);
   });
 
-  it('describes curated recall and evidence recall boundaries', () => {
-    const recall = MCP_TOOL_MANIFEST.find(t => t.name === 'session_recall');
-    const evidence = MCP_TOOL_MANIFEST.find(t => t.name === 'evidence_recall');
+  it('describes current, historical, compatibility, and evidence boundaries', () => {
+    const recall = findTool('memory_recall');
+    const historical = findTool('historical_recall');
+    const compat = findTool('session_recall');
+    const evidence = findTool('evidence_recall');
 
-    assert.match(recall.description, /curated/i);
-    assert.match(recall.description, /evidence_recall/);
-    assert.match(evidence.description, /legacy\/evidence/i);
+    assert.match(recall.description, /current-memory/i);
+    assert.match(recall.description, /historical_recall/);
+    assert.match(historical.description, /historical\/session/i);
+    assert.match(historical.description, /evidence_recall/);
+    assert.match(compat.description, /compatibility/i);
+    assert.match(compat.description, /memory_recall/);
     assert.match(evidence.description, /audit\/debug/i);
   });
 
@@ -85,7 +95,7 @@ describe('getMcpManifest', () => {
   it('returns envelope with serverName + tools + generatedAt', () => {
     const m = getMcpManifest();
     assert.equal(m.serverName, MCP_SERVER_NAME);
-    assert.equal(m.tools.length, 8);
+    assert.equal(m.tools.length, 10);
     assert.equal(m.manifestVersion, 1);
     assert.ok(m.generatedAt.match(/^\d{4}-\d{2}-\d{2}T/));
   });
@@ -111,7 +121,7 @@ describe('writeMcpManifestFile', () => {
     assert.ok(fs.existsSync(outFile));
     const parsed = JSON.parse(fs.readFileSync(outFile, 'utf8'));
     assert.equal(parsed.serverName, MCP_SERVER_NAME);
-    assert.equal(parsed.tools.length, 8);
+    assert.equal(parsed.tools.length, 10);
   });
 
   it('creates parent directory if missing', () => {

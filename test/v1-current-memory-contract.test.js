@@ -102,6 +102,39 @@ function makePool(rows, legacySummaryText = 'Legacy session summary must stay pr
   };
 }
 
+function makeBackfillPool(rows, opts = {}) {
+  const queries = [];
+  const existingRow = opts.existingRow || rows[0] || null;
+  return {
+    queries,
+    async query(sql, params = []) {
+      const text = String(sql);
+      queries.push({ sql: text, params });
+      if (text.includes('UPDATE "aq".memory_records')) {
+        if (opts.skipUpdate === true) return { rows: [], rowCount: 0 };
+        return { rows: [{ ...rows[0], embedding: params[2] }], rowCount: 1 };
+      }
+      if (text.includes('SELECT * FROM "aq".memory_records')) {
+        return { rows: existingRow ? [existingRow] : [], rowCount: existingRow ? 1 : 0 };
+      }
+      if (text.includes('FROM "aq".memory_records')) {
+        return { rows, rowCount: rows.length };
+      }
+      if (text.includes('session_summaries') || text.includes('evidence_items')) {
+        throw new Error(`Unexpected coarse/evidence query during backfill: ${text}`);
+      }
+      return { rows: [], rowCount: 0 };
+    },
+    async connect() {
+      return {
+        query: async () => ({ rows: [], rowCount: 0 }),
+        release() {},
+      };
+    },
+    async end() {},
+  };
+}
+
 describe('v1 current memory first slice contract', () => {
   it('projects only active, visible, time-valid, and scope-applicable memory_records', () => {
     const result = buildMemoryBootstrap([
@@ -289,6 +322,46 @@ describe('v1 current memory first slice contract', () => {
     assert.doesNotMatch(result.text, /Legacy session summary must stay process material only/);
   });
 
+  it('keeps the latest project backend decision in current memory without reading legacy summaries', async () => {
+    const pool = makePool([
+      memoryRow({
+        id: 1,
+        memory_type: 'state',
+        canonical_key: 'state:project:aquifer:old-backend',
+        summary: 'Older Aquifer backend state must not hide the latest backend decision.',
+        accepted_at: '2026-04-28T01:00:00Z',
+      }),
+      memoryRow({
+        id: 2,
+        memory_type: 'decision',
+        canonical_key: 'decision:project:aquifer:backend-local-starter',
+        title: 'Aquifer backend direction',
+        summary: 'SQLite is not implemented; local starter lowers onboarding friction; PostgreSQL remains the full feature and test backend.',
+        accepted_at: '2026-04-29T01:00:00Z',
+      }),
+    ], 'placeholder x session must stay legacy process material only');
+    const aq = createAquifer({
+      db: pool,
+      schema: 'aq',
+      migrations: { mode: 'off' },
+      memory: { servingMode: 'curated', activeScopeKey: 'project:aquifer' },
+    });
+
+    const result = await aq.memory.current({
+      activeScopePath: ['global', 'project:aquifer'],
+      activeScopeKey: 'project:aquifer',
+      asOf: '2026-04-30T00:00:00Z',
+      limit: 5,
+    });
+
+    assert.equal(result.meta.source, 'memory_records');
+    assert.equal(result.meta.servingContract, 'current_memory_v1');
+    assert.ok(result.memories.some(row => row.canonicalKey === 'decision:project:aquifer:backend-local-starter'));
+    assert.ok(result.memories.some(row => /PostgreSQL remains the full feature and test backend/.test(row.summary)));
+    assert.equal(result.memories.some(row => /placeholder x session/.test(row.summary || '')), false);
+    assert.equal(pool.queries.some(query => query.sql.includes('session_summaries')), false);
+  });
+
   it('exposes a direct current memory projection API with current_memory_v1 metadata', async () => {
     const pool = makePool([
       memoryRow({
@@ -371,7 +444,105 @@ describe('v1 current memory first slice contract', () => {
       result.memories.map(row => row.canonicalKey),
       ['state:project:aquifer:scope-id'],
     );
-    assert.equal(pool.queries.some(query => query.sql.includes('FROM "aq".scopes')), true);
+    const memoryQuery = pool.queries.find(query => query.sql.includes('FROM "aq".memory_records'));
+    assert.ok(memoryQuery, 'scopeId-only projection should still query memory_records');
+    assert.match(memoryQuery.sql, /m\.scope_id = \$\d+/);
+    assert.ok(memoryQuery.params.includes('scope-project'));
+  });
+
+  it('backfills missing memory embeddings from current-memory row text only', async () => {
+    const pool = makeBackfillPool([
+      memoryRow({
+        id: 2,
+        memory_type: 'decision',
+        canonical_key: 'decision:project:aquifer:embedding-backfill',
+        title: 'Current-memory query contract',
+        summary: 'Backfill should embed the current-memory row text, not session summaries.',
+        context_key: 'repo:/home/mingko/projects/aquifer',
+        topic_key: 'current-memory',
+      }),
+    ]);
+    const aq = createAquifer({
+      db: pool,
+      schema: 'aq',
+      migrations: { mode: 'off' },
+      embed: {
+        fn: async texts => {
+          assert.deepEqual(texts, [
+            'title: Current-memory query contract\n'
+            + 'summary: Backfill should embed the current-memory row text, not session summaries.\n'
+            + 'context: repo:/home/mingko/projects/aquifer\n'
+            + 'topic: current-memory',
+          ]);
+          return [[0.1, 0.2, 0.3]];
+        },
+      },
+      memory: { servingMode: 'curated', activeScopeKey: 'project:aquifer' },
+    });
+
+    const result = await aq.memory.backfillEmbeddings({
+      activeScopeKey: 'project:aquifer',
+      limit: 5,
+    });
+
+    assert.equal(result.scanned, 1);
+    assert.equal(result.embedded, 1);
+    assert.equal(result.skipped, 0);
+    assert.deepEqual(result.skippedMemories, []);
+    assert.deepEqual(
+      result.memories.map(row => row.canonicalKey),
+      ['decision:project:aquifer:embedding-backfill'],
+    );
+    assert.equal(pool.queries.some(query => query.sql.includes('session_summaries')), false);
+    assert.equal(pool.queries.some(query => query.sql.includes('evidence_items')), false);
+  });
+
+  it('backfill reports a skipped row when a concurrent writer filled embedding first', async () => {
+    const pool = makeBackfillPool([
+      memoryRow({
+        id: 2,
+        memory_type: 'decision',
+        canonical_key: 'decision:project:aquifer:embedding-race',
+        title: 'Concurrent embedding writer',
+        summary: 'A concurrent writer may fill embedding after the missing-row scan.',
+        context_key: 'repo:/home/mingko/projects/aquifer',
+        topic_key: 'current-memory',
+      }),
+    ], {
+      skipUpdate: true,
+      existingRow: memoryRow({
+        id: 2,
+        memory_type: 'decision',
+        canonical_key: 'decision:project:aquifer:embedding-race',
+        embedding: '[9,9,9]',
+      }),
+    });
+    const aq = createAquifer({
+      db: pool,
+      schema: 'aq',
+      migrations: { mode: 'off' },
+      embed: {
+        fn: async () => [[0.1, 0.2, 0.3]],
+      },
+      memory: { servingMode: 'curated', activeScopeKey: 'project:aquifer' },
+    });
+
+    const result = await aq.memory.backfillEmbeddings({
+      activeScopeKey: 'project:aquifer',
+      limit: 5,
+    });
+
+    assert.equal(result.scanned, 1);
+    assert.equal(result.embedded, 0);
+    assert.equal(result.skipped, 1);
+    assert.deepEqual(result.memories, []);
+    assert.deepEqual(result.skippedMemories, [{
+      memoryId: '2',
+      canonicalKey: 'decision:project:aquifer:embedding-race',
+      reason: 'skipped_existing_embedding',
+    }]);
+    const updateQuery = pool.queries.find(query => query.sql.includes('UPDATE "aq".memory_records'));
+    assert.match(updateQuery.sql, /AND embedding IS NULL/);
   });
 
   it('requires the intended current memory API instead of only bootstrap compatibility', () => {

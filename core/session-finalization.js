@@ -73,6 +73,7 @@ function createSessionFinalization({
   schema,
   recordsSchema,
   defaultTenantId = 'default',
+  embedFn = null,
 }) {
   const memorySchema = recordsSchema || qi(schema);
 
@@ -107,6 +108,8 @@ function createSessionFinalization({
       scopeKey: input.scopeKey || null,
       contextKey: input.contextKey || null,
       topicKey: input.topicKey || null,
+      scopeId: input.scopeId || input.scope_id || null,
+      scopeSnapshot: input.scopeSnapshot || input.scope_snapshot || {},
       memoryResult: input.memoryResult || {},
       error: input.error || null,
       metadata: input.metadata || {},
@@ -196,6 +199,8 @@ function createSessionFinalization({
         scopeKey: input.scopeKey || null,
         contextKey: input.contextKey || null,
         topicKey: input.topicKey || null,
+        scopeId: input.scopeId || input.scope_id || null,
+        scopeSnapshot: input.scopeSnapshot || input.scope_snapshot || {},
         metadata: input.metadata || {},
         claimedAt: input.claimedAt || new Date().toISOString(),
       }, { schema, tenantId: base.tenantId });
@@ -229,7 +234,7 @@ function createSessionFinalization({
         defaultTenantId: base.tenantId,
         inTransaction: true,
       });
-      const promotion = createMemoryPromotion({ records });
+      const promotion = createMemoryPromotion({ records, embedFn });
       const evidenceRefs = [{
         sourceKind: 'session_summary',
         sourceRef: base.sessionId,
@@ -297,6 +302,8 @@ function createSessionFinalization({
         scopeKey: input.scopeKey || null,
         contextKey: input.contextKey || null,
         topicKey: input.topicKey || null,
+        scopeId: input.scopeId || input.scope_id || null,
+        scopeSnapshot: input.scopeSnapshot || input.scope_snapshot || {},
         summaryRowId: summaryRow ? summaryRow.session_row_id : session.id,
         memoryResult,
         summaryText: safeSummaryText,
@@ -337,6 +344,8 @@ function createSessionFinalization({
             scopeKey: input.scopeKey || null,
             contextKey: input.contextKey || null,
             topicKey: input.topicKey || null,
+            scopeId: input.scopeId || input.scope_id || null,
+            scopeSnapshot: input.scopeSnapshot || input.scope_snapshot || {},
             metadata: input.metadata || {},
             error: error.message,
           }, { schema, tenantId: base.tenantId });

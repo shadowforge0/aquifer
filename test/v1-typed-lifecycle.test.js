@@ -186,6 +186,44 @@ describe('v1 typed memory lifecycle', () => {
     assert.equal(results[0].memory.backingFactId, 99);
   });
 
+  it('writes per-memory embeddings from row text when promotion has an embedFn', async () => {
+    const calls = [];
+    const promotion = createMemoryPromotion({
+      embedFn: async texts => {
+        calls.push(texts);
+        return [[0.11, 0.22, 0.33]];
+      },
+      records: {
+        findActiveByCanonicalKey: async () => [],
+        upsertScope: async () => ({ id: 11 }),
+        upsertMemory: async input => ({ id: 12, ...input }),
+        linkEvidence: async () => null,
+      },
+    });
+
+    const results = await promotion.promote([{
+      memoryType: 'decision',
+      canonicalKey: 'decision:project:aquifer:embedding-write',
+      scopeKind: 'project',
+      scopeKey: 'project:aquifer',
+      contextKey: 'repo:/home/mingko/projects/aquifer',
+      topicKey: 'current-memory',
+      title: 'Current-memory query contract',
+      summary: 'Direct memory embeddings should anchor curated recall.',
+      authority: 'verified_summary',
+      evidenceRefs: [{ sourceKind: 'session_summary', sourceRef: 's1' }],
+    }], { tenantId: 'tenant-a' });
+
+    assert.equal(results[0].action, 'promote');
+    assert.deepEqual(calls, [[
+      'title: Current-memory query contract\n'
+      + 'summary: Direct memory embeddings should anchor curated recall.\n'
+      + 'context: repo:/home/mingko/projects/aquifer\n'
+      + 'topic: current-memory',
+    ]]);
+    assert.deepEqual(results[0].memory.embedding, [0.11, 0.22, 0.33]);
+  });
+
   it('wraps promote lifecycle in one transaction and locks canonical identity', async () => {
     const calls = [];
     const txRecords = {

@@ -74,17 +74,30 @@ Keep `AQUIFER_MEMORY_SERVING_MODE=legacy` for first rollout. Switch to `curated`
 | Goal | Command |
 |---|---|
 | Verify setup | `npx aquifer quickstart` |
+| Inspect selected backend capabilities without DB connection | `AQUIFER_BACKEND=local npx aquifer backend-info --json` |
 | Start the MCP server | `npx aquifer mcp` |
 | Search memory manually | `npx aquifer recall "auth middleware"` |
 | Plan curated memory compaction | `npx aquifer compact --cadence daily --period-start 2026-04-27T00:00:00Z --period-end 2026-04-28T00:00:00Z` |
 | Generate a timer synthesis prompt | `npx aquifer operator compaction daily --include-synthesis-prompt --json` |
 | Apply reviewed timer synthesis candidates | `npx aquifer operator compaction daily --synthesis-summary-file /tmp/timer-summary.json --apply --promote-candidates --json` |
+| Generate a finalized-session checkpoint prompt | `npx aquifer operator checkpoint --scope-key project:aquifer --min-finalizations 10 --include-synthesis-prompt --json` |
+| Heartbeat-check an active Codex session for checkpoint work | `npx aquifer codex-recovery checkpoint-heartbeat --hook-stdin --scope-key project:aquifer` |
+| Preview a Codex UserPromptSubmit heartbeat hook install | `npx aquifer codex-recovery checkpoint-heartbeat-hook --scope-key project:aquifer --hooks-path "$CODEX_HOME/hooks.json" --json` |
 | Inspect storage health | `npx aquifer stats` |
 | Enrich pending sessions | `npx aquifer backfill` |
 
 Timer synthesis output is candidate material until an operator applies it with
 `--promote-candidates`; it does not become active curated memory from the
 prompt or summary file alone.
+
+Checkpoint output follows the same boundary. `operator checkpoint` plans from
+finalized session summaries and only writes `checkpoint_runs` when you pass an
+explicit reviewed synthesis summary with `--apply`. `codex-recovery
+checkpoint-heartbeat` is the active-session hook heartbeat for Codex JSONL
+files: it first checks a tiny local scheduler marker, reads the transcript only
+when the time window is due, then writes local spool process material only when
+the message threshold is also due. It does not print prompt text by default and
+does not write DB memory.
 
 Need LLM summarization, the knowledge graph, OpenAI embeddings, reranking, or operations details? See [docs/setup.md](docs/setup.md) and [Environment Variables](#environment-variables).
 
@@ -139,6 +152,8 @@ Sessions, summaries, turn-level embeddings, entity graph — all live in one dat
 | Variable | Required? | Purpose | Example |
 |----------|-----------|---------|---------|
 | `DATABASE_URL` | Yes | PostgreSQL connection string | `postgresql://user:pass@localhost:5432/mydb` |
+| `AQUIFER_BACKEND` | No | Backend profile selector: `postgres` full backend or explicit degraded `local` starter | `postgres` |
+| `AQUIFER_LOCAL_PATH` | No | Local starter JSON store path | `.aquifer/aquifer.local.json` |
 | `AQUIFER_SCHEMA` | No | PG schema name (default: `aquifer`) | `memory` |
 | `AQUIFER_TENANT_ID` | No | Multi-tenant key (default: `default`) | `my-app` |
 | `AQUIFER_EMBED_BASE_URL` | Yes (for recall) | Embedding API base URL | `http://localhost:11434/v1` |
@@ -157,6 +172,10 @@ Sessions, summaries, turn-level embeddings, entity graph — all live in one dat
 | `AQUIFER_MEMORY_SERVING_MODE` | No | Public serving mode: `legacy` default, or opt-in `curated` | `curated` |
 | `AQUIFER_MEMORY_ACTIVE_SCOPE_KEY` | No | Default active curated scope for recall/bootstrap | `project:aquifer` |
 | `AQUIFER_MEMORY_ACTIVE_SCOPE_PATH` | No | Ordered curated scope path for inheritance | `global,project:aquifer` |
+| `AQUIFER_CODEX_CHECKPOINT_CHECK_INTERVAL_MINUTES` | No | Active Codex checkpoint heartbeat time gate (default: `10`) | `10` |
+| `AQUIFER_CODEX_CHECKPOINT_EVERY_MESSAGES` | No | Active Codex checkpoint message delta gate (default: `20`) | `20` |
+| `AQUIFER_CODEX_CHECKPOINT_EVERY_USER_MESSAGES` | No | Optional user-message delta gate | `10` |
+| `AQUIFER_CODEX_CHECKPOINT_QUIET_MS` | No | Quiet period before reading due transcripts (default: `3000`) | `3000` |
 | `AQUIFER_MIGRATIONS_MODE` | No | Startup handshake mode: `apply` (default), `check`, `off` | `apply` |
 | `AQUIFER_MIGRATION_LOCK_TIMEOUT_MS` | No | Advisory-lock wait before `AQ_MIGRATION_LOCK_TIMEOUT` (default 30000) | `30000` |
 | `AQUIFER_INSIGHTS_DEDUP_MODE` | No | Insights semantic dedup mode: `off` (default), `shadow`, `enforce` — env wins over code for this field only, so operators can kill-switch without redeploy | `shadow` |
@@ -218,6 +237,53 @@ Add to your project's `.claude.json` or user-level MCP config:
 ```
 
 Tools appear as `mcp__aquifer__session_recall`, `mcp__aquifer__evidence_recall`, `mcp__aquifer__session_bootstrap`, `mcp__aquifer__session_feedback`, `mcp__aquifer__memory_feedback`, `mcp__aquifer__feedback_stats`, `mcp__aquifer__memory_stats`, `mcp__aquifer__memory_pending`.
+
+For Codex long sessions, Aquifer exposes a UserPromptSubmit-friendly heartbeat
+command instead of installing a daemon:
+
+```bash
+npx aquifer codex-recovery checkpoint-heartbeat \
+  --hook-stdin \
+  --scope-key project:aquifer
+```
+
+Run that from a host hook with Codex hook JSON on stdin. The heartbeat uses a
+time-first gate: if the local marker says the next check is not due, it exits
+without validating or reading the transcript. When due, it validates the
+`transcript_path` realpath under the Codex sessions directory, waits for the
+quiet period, checks the configured message delta, and writes a local spool file
+for later review. Scheduler, claim, and spool files live under the Codex state
+directory by default; they are process-control files, not DB memory.
+
+Heartbeat policy resolves as command flags first, then Aquifer env/config, then
+defaults. The default policy is 10 minutes, 20 safe messages, no user-message
+gate, 3000 ms quiet period, and 60000 ms claim TTL. In config files this lives at
+`codex.checkpoint`:
+
+```json
+{
+  "codex": {
+    "checkpoint": {
+      "checkIntervalMinutes": 10,
+      "everyMessages": 20,
+      "quietMs": 3000
+    }
+  }
+}
+```
+
+To prepare the Codex hook entry, generate or apply the merged `hooks.json`:
+
+```bash
+npx aquifer codex-recovery checkpoint-heartbeat-hook \
+  --scope-key project:aquifer \
+  --hooks-path "$CODEX_HOME/hooks.json" \
+  --json
+```
+
+The hook installer is dry-run by default. Add `--apply` only after reviewing the
+merged `UserPromptSubmit` command. `codex-recovery doctor --json` reports whether
+the heartbeat hook is present.
 
 ### OpenClaw
 

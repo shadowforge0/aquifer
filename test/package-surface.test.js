@@ -51,7 +51,17 @@ describe('package surface', () => {
 
     assert.ok(paths.has('consumers/shared/summary-parser.js'));
     assert.ok(paths.has('consumers/default/index.js'));
+    assert.ok(paths.has('consumers/codex-active-checkpoint.js'));
+    assert.ok(paths.has('consumers/codex-current-memory.js'));
     assert.ok(paths.has('consumers/codex-handoff.js'));
+    assert.ok(paths.has('core/backends/capabilities.js'));
+    assert.ok(paths.has('core/backends/local.js'));
+    assert.ok(paths.has('core/legacy-bootstrap.js'));
+    assert.ok(paths.has('core/memory-serving.js'));
+    assert.ok(paths.has('core/postgres-migrations.js'));
+    assert.ok(paths.has('core/recall-runtime.js'));
+    assert.ok(paths.has('scripts/codex-checkpoint-commands.js'));
+    assert.ok(paths.has('scripts/codex-checkpoint-runtime.js'));
     assert.ok(paths.has('scripts/codex-recovery.js'));
     assert.ok(paths.has('.env.example'));
     assert.ok(paths.has('README_TW.md'));

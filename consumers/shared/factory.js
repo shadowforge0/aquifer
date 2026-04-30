@@ -1,7 +1,6 @@
 'use strict';
 
-const { Pool } = require('pg');
-const { createAquifer, createEmbedder } = require('../../index');
+const { createLocalAquifer } = require('../../core/backends/local');
 const { loadConfig } = require('./config');
 const { createLlmFn } = require('./llm');
 
@@ -11,12 +10,18 @@ const { createLlmFn } = require('./llm');
 
 function createAquiferFromConfig(overrides) {
   const config = loadConfig({ overrides });
+  const backendKind = config.storage?.backend || 'postgres';
+
+  if (backendKind === 'local') {
+    return createLocalAquifer(config);
+  }
 
   if (!config.db.url) {
-    throw new Error('Database URL is required (set DATABASE_URL or AQUIFER_DB_URL)');
+    throw new Error('Database URL is required for PostgreSQL backend (set DATABASE_URL, AQUIFER_DB_URL, or AQUIFER_POSTGRES_URL)');
   }
 
   // Pool
+  const { Pool } = require('pg');
   const pool = new Pool({
     connectionString: config.db.url,
     max: config.db.max || 10,
@@ -26,6 +31,7 @@ function createAquiferFromConfig(overrides) {
   // Embed function (optional — lazy validation in core)
   let embedFn = null;
   if (config.embed && config.embed.baseUrl && config.embed.model) {
+    const { createEmbedder } = require('../../index');
     // Detect provider from baseUrl
     const isOllama = config.embed.baseUrl.includes('11434') || config.embed.baseUrl.includes('ollama');
     const embedder = isOllama
@@ -80,6 +86,7 @@ function createAquiferFromConfig(overrides) {
     rerankOpts = rerankConfig;
   }
 
+  const { createAquifer } = require('../../index');
   const aquifer = createAquifer({
     db: pool,
     ownsPool: true,

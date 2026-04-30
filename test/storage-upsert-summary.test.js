@@ -56,6 +56,22 @@ describe('storage.upsertSummary model handling', () => {
   });
 });
 
+describe('storage.searchSessions quality filter', () => {
+  it('excludes obvious placeholder summaries from public legacy recall SQL', async () => {
+    const captured = [];
+    await storage.searchSessions(makePool(captured, []), 'Aquifer', {
+      schema: 'aquifer',
+      tenantId: 'default',
+      limit: 5,
+      ftsConfig: 'simple',
+    });
+
+    assert.match(captured[0].sql, /summary_text/);
+    assert.match(captured[0].sql, /空測試會話/);
+    assert.match(captured[0].sql, /placeholder/);
+  });
+});
+
 describe('base schema summary model contract', () => {
   it('keeps session_summaries.model nullable for older and new installs', () => {
     const sql = fs.readFileSync(path.join(__dirname, '..', 'schema', '001-base.sql'), 'utf8');

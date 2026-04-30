@@ -2,11 +2,14 @@
 
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
+const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const {
   parseArgs,
+  selectedBackendInfo,
+  cmdLocalQuickstart,
   cmdOperator,
   readSynthesisSummaryFromFlags,
 } = require('../consumers/cli');
@@ -57,6 +60,64 @@ describe('parseArgs', () => {
     const args = parseArgs([]);
     assert.deepEqual(args._, []);
     assert.deepEqual(args.flags, {});
+  });
+
+  it('reports local backend info without database config', () => {
+    const info = selectedBackendInfo({
+      env: {
+        AQUIFER_BACKEND: 'local',
+        AQUIFER_LOCAL_PATH: '/tmp/aquifer-local.json',
+      },
+      cwd: '/nonexistent',
+    });
+    assert.equal(info.backendKind, 'local');
+    assert.equal(info.backendProfile, 'starter');
+    assert.equal(info.storage.postgresUrlConfigured, false);
+    assert.equal(info.storage.localPath, '/tmp/aquifer-local.json');
+    assert.equal(info.capabilities.zeroConfig, 'full');
+  });
+
+  it('runs backend-info --json without requiring PostgreSQL env', () => {
+    const result = spawnSync(process.execPath, ['consumers/cli.js', 'backend-info', '--json'], {
+      cwd: path.join(__dirname, '..'),
+      env: {
+        PATH: process.env.PATH,
+        AQUIFER_BACKEND: 'local',
+        AQUIFER_LOCAL_PATH: '/tmp/aquifer-local.json',
+      },
+      encoding: 'utf8',
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const info = JSON.parse(result.stdout);
+    assert.equal(info.backendKind, 'local');
+    assert.equal(info.backendProfile, 'starter');
+    assert.equal(info.storage.postgresUrlConfigured, false);
+  });
+
+  it('runs local quickstart without PostgreSQL and cleans up the test session', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aquifer-local-quickstart-'));
+    const filePath = path.join(dir, 'aquifer.local.json');
+    const { createAquiferFromConfig } = require('../consumers/shared/factory');
+    const aquifer = createAquiferFromConfig({
+      db: { url: null },
+      storage: {
+        backend: 'local',
+        local: { path: filePath },
+      },
+    });
+    const logs = [];
+    const originalLog = console.log;
+    console.log = (...items) => logs.push(items.join(' '));
+    try {
+      await cmdLocalQuickstart(aquifer);
+    } finally {
+      console.log = originalLog;
+      await aquifer.close();
+    }
+
+    const raw = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    assert.equal(raw.sessions.length, 0);
+    assert.match(logs.join('\n'), /local starter is working/);
   });
 
   it('unknown flags are boolean', () => {
@@ -145,6 +206,32 @@ describe('parseArgs', () => {
     assert.equal(args.flags['promote-candidates'], true);
   });
 
+  it('parses checkpoint producer operator flags', () => {
+    const args = parseArgs([
+      'operator',
+      'checkpoint',
+      '--scope-id',
+      '7',
+      '--scope-key',
+      'project:aquifer',
+      '--min-finalizations',
+      '10',
+      '--checkpoint-key',
+      'manual-checkpoint',
+      '--synthesis-summary-file',
+      '/tmp/checkpoint-summary.json',
+      '--apply',
+      '--finalize',
+    ]);
+    assert.equal(args.flags['scope-id'], '7');
+    assert.equal(args.flags['scope-key'], 'project:aquifer');
+    assert.equal(args.flags['min-finalizations'], '10');
+    assert.equal(args.flags['checkpoint-key'], 'manual-checkpoint');
+    assert.equal(args.flags['synthesis-summary-file'], '/tmp/checkpoint-summary.json');
+    assert.equal(args.flags.apply, true);
+    assert.equal(args.flags.finalize, true);
+  });
+
   it('reads synthesis summary JSON from a flag file', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aquifer-cli-'));
     const filePath = path.join(dir, 'summary.json');
@@ -217,5 +304,59 @@ describe('parseArgs', () => {
     assert.equal(receivedInput.synthesisSummary.structuredSummary.states[0].state, 'CLI end-to-end timer producer state.');
     assert.match(logs.join('\n'), /Synthesis prompt/);
     assert.match(logs.join('\n'), /Promotion review/);
+  });
+
+  it('passes checkpoint producer controls into operator runProducer', async () => {
+    const args = parseArgs([
+      'operator',
+      'checkpoint',
+      '--scope-id',
+      '7',
+      '--min-finalizations',
+      '3',
+      '--synthesis-summary',
+      '{"summaryText":"Checkpoint","structuredSummary":{"states":[{"state":"CLI checkpoint producer state."}]}}',
+      '--include-synthesis-prompt',
+      '--apply',
+      '--finalize',
+    ]);
+    let receivedInput = null;
+    const fakeAquifer = {
+      checkpoints: {
+        async runProducer(input) {
+          receivedInput = input;
+          return {
+            due: true,
+            scope: { scopeKey: 'project:aquifer' },
+            sourceFinalizationCount: 3,
+            minFinalizations: 3,
+            range: {
+              fromFinalizationIdExclusive: 10,
+              toFinalizationIdInclusive: 13,
+            },
+            synthesisPrompt: 'checkpoint prompt',
+            run: { id: 9, status: 'finalized' },
+          };
+        },
+      },
+    };
+    const logs = [];
+    const originalLog = console.log;
+    console.log = (...items) => logs.push(items.join(' '));
+    try {
+      await cmdOperator(fakeAquifer, args);
+    } finally {
+      console.log = originalLog;
+    }
+
+    assert.equal(receivedInput.scopeId, '7');
+    assert.equal(receivedInput.minFinalizations, 3);
+    assert.equal(receivedInput.includeSynthesisPrompt, true);
+    assert.equal(receivedInput.apply, true);
+    assert.equal(receivedInput.finalize, true);
+    assert.equal(receivedInput.synthesisSummary.summaryText, 'Checkpoint');
+    assert.match(logs.join('\n'), /Checkpoint due/);
+    assert.match(logs.join('\n'), /Checkpoint synthesis prompt/);
+    assert.match(logs.join('\n'), /Run: #9 status=finalized/);
   });
 });

@@ -148,23 +148,350 @@ function formatHandoffContextBlock(metadata = {}) {
   return lines.join('\n');
 }
 
+function normalizeCheckpointItem(item) {
+  if (typeof item === 'string') return normalizeText(item);
+  return normalizeText(item && (
+    item.item
+    || item.decision
+    || item.state
+    || item.constraint
+    || item.conclusion
+    || item.summary
+    || item.text
+  ));
+}
+
+function optionalNonNegativeInteger(...values) {
+  for (const value of values) {
+    if (value === undefined || value === null || value === '') continue;
+    const n = Number(value);
+    if (Number.isInteger(n) && n >= 0) return n;
+  }
+  return null;
+}
+
+function compactCheckpointRow(row = {}) {
+  const structured = row.structuredSummary || row.structured_summary || row.payload?.structuredSummary || {};
+  const payload = row.payload && typeof row.payload === 'object' ? row.payload : {};
+  const coverage = row.coverage || row.coverageMetadata || row.coverage_metadata || row.metadata?.coverage || payload.coverage || {};
+  const transcriptCoverage = coverage.transcript && typeof coverage.transcript === 'object'
+    ? coverage.transcript
+    : {};
+  const summary = normalizeText(row.summaryText || row.summary_text || row.summary || row.payload?.summaryText);
+  const scopeKey = normalizeText(row.scopeKey || row.scope_key || row.targetScopeKey || row.target_scope_key);
+  const topicKey = normalizeText(row.topicKey || row.topic_key || row.topic || row.payload?.topicKey);
+  const status = normalizeText(row.status || row.lifecycle || 'accepted_process_material');
+  const trigger = normalizeText(row.trigger || row.triggerKind || row.trigger_kind || row.payload?.triggerKind);
+  const bucket = {
+    scopeKey,
+    topicKey,
+    status,
+    trigger,
+    summary,
+    decisions: [],
+    openLoops: [],
+    states: [],
+    constraints: [],
+    conclusions: [],
+    coverage: {
+      coveredUntilMessageIndex: optionalNonNegativeInteger(
+        coverage.coveredUntilMessageIndex,
+        coverage.covered_until_message_index,
+        coverage.messageIndex,
+        coverage.message_index,
+        row.coveredUntilMessageIndex,
+        row.covered_until_message_index
+      ),
+      coveredUntilChar: optionalNonNegativeInteger(
+        coverage.coveredUntilChar,
+        coverage.coveredUntilCharIndex,
+        coverage.covered_until_char,
+        coverage.covered_until_char_index,
+        row.coveredUntilChar,
+        row.covered_until_char
+      ),
+      coveredUntilLine: optionalNonNegativeInteger(
+        coverage.coveredUntilLine,
+        coverage.coveredUntilLineIndex,
+        coverage.covered_until_line,
+        coverage.covered_until_line_index,
+        coverage.line,
+        coverage.lineIndex,
+        coverage.line_index,
+        transcriptCoverage.coveredUntilLine,
+        transcriptCoverage.covered_until_line,
+        transcriptCoverage.line,
+        transcriptCoverage.lineIndex,
+        transcriptCoverage.line_index,
+        row.coveredUntilLine,
+        row.covered_until_line
+      ),
+      coveredUntilLineChar: optionalNonNegativeInteger(
+        coverage.coveredUntilLineChar,
+        coverage.coveredUntilLineCharIndex,
+        coverage.covered_until_line_char,
+        coverage.covered_until_line_char_index,
+        coverage.char,
+        coverage.charIndex,
+        coverage.char_index,
+        transcriptCoverage.coveredUntilLineChar,
+        transcriptCoverage.covered_until_line_char,
+        transcriptCoverage.char,
+        transcriptCoverage.charIndex,
+        transcriptCoverage.char_index,
+        row.coveredUntilLineChar,
+        row.covered_until_line_char
+      ),
+    },
+  };
+  for (const item of normalizeList(structured.decisions || row.decisions)) {
+    const text = normalizeCheckpointItem(item);
+    if (text) addUniqueByText(bucket.decisions, { item: text }, text);
+  }
+  for (const item of normalizeList(structured.open_loops || structured.openLoops || row.openLoops || row.open_loops)) {
+    const text = normalizeCheckpointItem(item);
+    if (text) addUniqueByText(bucket.openLoops, { item: text }, text);
+  }
+  for (const item of normalizeList(structured.states || row.states)) {
+    const text = normalizeCheckpointItem(item);
+    if (text) addUniqueByText(bucket.states, { item: text }, text);
+  }
+  for (const item of normalizeList(structured.constraints || row.constraints)) {
+    const text = normalizeCheckpointItem(item);
+    if (text) addUniqueByText(bucket.constraints, { item: text }, text);
+  }
+  for (const item of normalizeList(structured.conclusions || row.conclusions)) {
+    const text = normalizeCheckpointItem(item);
+    if (text) addUniqueByText(bucket.conclusions, { item: text }, text);
+  }
+  return bucket;
+}
+
+function messageText(message = {}) {
+  if (typeof message.content === 'string') return message.content;
+  if (Array.isArray(message.content)) {
+    return message.content
+      .map(part => typeof part === 'string' ? part : (part && (part.text || part.content) ? String(part.text || part.content) : ''))
+      .filter(Boolean)
+      .join('\n');
+  }
+  if (typeof message.text === 'string') return message.text;
+  return '';
+}
+
+function renderMessages(messages = []) {
+  return messages.map((message) => {
+    const role = normalizeText(message.role) || 'message';
+    return `[${role}]\n${messageText(message)}`;
+  }).join('\n\n');
+}
+
+function approxPromptTokens(text) {
+  return Math.ceil(String(text || '').length / 3);
+}
+
+function offsetFromLineChar(text, lineIndex, charIndex) {
+  if (typeof text !== 'string') return null;
+  if (!Number.isInteger(lineIndex) || lineIndex < 0) return null;
+  if (!Number.isInteger(charIndex) || charIndex < 0) return null;
+  let offset = 0;
+  let currentLine = 0;
+  while (currentLine < lineIndex) {
+    const lineBreak = text.indexOf('\n', offset);
+    if (lineBreak === -1) return null;
+    offset = lineBreak + 1;
+    currentLine += 1;
+  }
+  const lineBreak = text.indexOf('\n', offset);
+  const lineEnd = lineBreak === -1 ? text.length : lineBreak;
+  if (charIndex > (lineEnd - offset)) return null;
+  return offset + charIndex;
+}
+
+function compactCheckpointSnapshot(checkpoints = [], opts = {}) {
+  const maxCheckpoints = Math.max(0, Math.min(12, opts.maxCheckpoints || opts.checkpointLimit || 6));
+  const rows = Array.isArray(checkpoints?.checkpoints)
+    ? checkpoints.checkpoints
+    : (Array.isArray(checkpoints?.items) ? checkpoints.items : checkpoints);
+  const compactRows = (Array.isArray(rows) ? rows : [])
+    .map(compactCheckpointRow)
+    .filter(row => row.summary || row.decisions.length || row.openLoops.length || row.states.length || row.constraints.length || row.conclusions.length)
+    .slice(0, maxCheckpoints);
+  return {
+    checkpoints: compactRows,
+    meta: {
+      source: checkpoints?.meta?.source || 'checkpoint_runs',
+      role: 'handoff_process_material',
+      count: compactRows.length,
+      truncated: Boolean(checkpoints?.meta?.truncated || (Array.isArray(rows) && rows.length > compactRows.length)),
+    },
+  };
+}
+
+function buildUncoveredTailView(view = {}, checkpoints = null) {
+  const snapshot = compactCheckpointSnapshot(checkpoints || []);
+  let coveredUntilMessageIndex = null;
+  let coveredUntilChar = null;
+  let coveredUntilLine = null;
+  let coveredUntilLineChar = null;
+  for (const row of snapshot.checkpoints) {
+    const messageIndex = row.coverage.coveredUntilMessageIndex;
+    if (Number.isInteger(messageIndex) && messageIndex >= 0) {
+      coveredUntilMessageIndex = Math.max(coveredUntilMessageIndex ?? -1, messageIndex);
+    }
+    const charIndex = row.coverage.coveredUntilChar;
+    if (Number.isInteger(charIndex) && charIndex >= 0) {
+      coveredUntilChar = Math.max(coveredUntilChar ?? -1, charIndex);
+    }
+    const lineIndex = row.coverage.coveredUntilLine;
+    const lineChar = row.coverage.coveredUntilLineChar;
+    if (Number.isInteger(lineIndex) && lineIndex >= 0 && Number.isInteger(lineChar) && lineChar >= 0) {
+      const shouldReplace = coveredUntilLine === null
+        || lineIndex > coveredUntilLine
+        || (lineIndex === coveredUntilLine && lineChar > coveredUntilLineChar);
+      if (shouldReplace) {
+        coveredUntilLine = lineIndex;
+        coveredUntilLineChar = lineChar;
+      }
+    }
+  }
+  let bestTail = null;
+  if (Number.isInteger(coveredUntilMessageIndex) && Array.isArray(view.messages)) {
+    if (coveredUntilMessageIndex < view.messages.length) {
+      const tailMessages = view.messages.slice(coveredUntilMessageIndex + 1);
+      const text = renderMessages(tailMessages);
+      bestTail = {
+        ...view,
+        messages: tailMessages,
+        text,
+        charCount: text.length,
+        approxPromptTokens: approxPromptTokens(text),
+        checkpointTail: {
+          sourceMessageCount: view.messages.length,
+          coveredUntilMessageIndex,
+          tailMessageCount: tailMessages.length,
+        },
+      };
+    }
+  }
+  if (Number.isInteger(coveredUntilChar) && typeof view.text === 'string') {
+    if (coveredUntilChar <= view.text.length) {
+      const text = view.text.slice(coveredUntilChar);
+      const candidate = {
+        ...view,
+        text,
+        charCount: text.length,
+        approxPromptTokens: approxPromptTokens(text),
+        checkpointTail: {
+          sourceCharCount: view.text.length,
+          coveredUntilChar,
+          tailCharCount: text.length,
+        },
+      };
+      if (!bestTail || candidate.text.length < bestTail.text.length) bestTail = candidate;
+    }
+  }
+  if (Number.isInteger(coveredUntilLine) && Number.isInteger(coveredUntilLineChar) && typeof view.text === 'string') {
+    const start = offsetFromLineChar(view.text, coveredUntilLine, coveredUntilLineChar);
+    if (start !== null) {
+      const text = view.text.slice(start);
+      const candidate = {
+        ...view,
+        text,
+        charCount: text.length,
+        approxPromptTokens: approxPromptTokens(text),
+        checkpointTail: {
+          sourceCharCount: view.text.length,
+          coveredUntilLine,
+          coveredUntilLineChar,
+          tailCharCount: text.length,
+        },
+      };
+      if (!bestTail || candidate.text.length < bestTail.text.length) bestTail = candidate;
+    }
+  }
+  return bestTail || view;
+}
+
+function formatCheckpointContextBlock(checkpoints = null, opts = {}) {
+  const snapshot = compactCheckpointSnapshot(checkpoints || [], opts);
+  if (snapshot.checkpoints.length === 0) return '';
+  const lines = [
+    `<checkpoint_context source="${snapshot.meta.source}" role="${snapshot.meta.role}" count="${snapshot.meta.count}" truncated="${snapshot.meta.truncated}">`,
+    'Checkpoint context is producer process material, not current truth. Use it only to reduce transcript replay and reconcile against current_memory and the uncovered transcript tail.',
+  ];
+  for (const row of snapshot.checkpoints) {
+    const attrs = [
+      row.scopeKey ? `scope=${row.scopeKey}` : null,
+      row.topicKey ? `topic=${row.topicKey}` : null,
+      row.status ? `status=${row.status}` : null,
+      row.trigger ? `trigger=${row.trigger}` : null,
+    ].filter(Boolean).join(' ');
+    lines.push(`checkpoint${attrs ? ` ${attrs}` : ''}: ${row.summary || 'process material'}`);
+    for (const decision of row.decisions) lines.push(`  decision: ${decision.item}`);
+    for (const state of row.states) lines.push(`  state: ${state.item}`);
+    for (const constraint of row.constraints) lines.push(`  constraint: ${constraint.item}`);
+    for (const conclusion of row.conclusions) lines.push(`  conclusion: ${conclusion.item}`);
+    for (const loop of row.openLoops) lines.push(`  open_loop: ${loop.item}`);
+  }
+  lines.push('</checkpoint_context>');
+  return lines.join('\n');
+}
+
+async function resolveCheckpointsForHandoff(aquifer, payload = {}, opts = {}) {
+  if (opts.includeCheckpoints === false) return null;
+  const provided = opts.checkpoints !== undefined ? opts.checkpoints : payload.checkpoints;
+  if (provided !== undefined) return compactCheckpointSnapshot(provided, opts);
+  const listFn = aquifer?.checkpoints?.listForHandoff || aquifer?.checkpoints?.listAcceptedForHandoff;
+  if (typeof listFn !== 'function') return null;
+  try {
+    const rows = await listFn.call(aquifer.checkpoints, {
+      tenantId: opts.tenantId,
+      sessionId: payload.sessionId || opts.sessionId,
+      activeScopeKey: opts.activeScopeKey || opts.scopeKey,
+      activeScopePath: opts.activeScopePath,
+      limit: opts.checkpointLimit || opts.maxCheckpoints || 6,
+    });
+    return compactCheckpointSnapshot(rows, opts);
+  } catch (err) {
+    return {
+      checkpoints: [],
+      meta: {
+        source: 'checkpoint_runs',
+        role: 'handoff_process_material',
+        count: 0,
+        truncated: false,
+        degraded: true,
+        error: err.message,
+      },
+    };
+  }
+}
+
 function buildHandoffSynthesisPrompt(payload = {}, view = {}, opts = {}) {
   if (!view || view.status !== 'ok') {
     throw new Error(`Codex handoff synthesis requires an ok normalized transcript view; got ${view && view.status ? view.status : 'missing'}`);
   }
   const metadata = buildHandoffMetadata(payload);
-  const basePrompt = buildFinalizationPrompt(view, opts);
+  const checkpoints = opts.checkpoints || payload.checkpoints;
+  const promptView = buildUncoveredTailView(view, checkpoints);
+  const basePrompt = buildFinalizationPrompt(promptView, opts);
+  const checkpointBlock = formatCheckpointContextBlock(checkpoints, opts);
   const handoffBlock = [
+    checkpointBlock,
+    checkpointBlock ? '' : null,
     formatHandoffContextBlock(metadata),
     '',
     '<handoff_synthesis_rules>',
     'Treat handoff_context as producer process material, not current truth by itself.',
+    'Treat checkpoint_context as producer process material, not current truth by itself.',
     'Use the sanitized transcript and current_memory to decide what should become current memory candidates.',
+    'When checkpoint_context is present, use it to avoid replaying already-covered session ranges, but reconcile it against the transcript tail instead of promoting it directly.',
     'Do not copy old current_memory unchanged unless this session confirms it should carry forward.',
     'Represent resolved, superseded, revoked, or uncertain items explicitly in structuredSummary payload fields when applicable.',
     'Do not include raw transcript, tool output, debug ids, DB ids, hashes, secrets, or injected context in memory candidates.',
     '</handoff_synthesis_rules>',
-  ].join('\n');
+  ].filter(line => line !== null && line !== undefined).join('\n');
   return basePrompt.replace('<sanitized_transcript>', `${handoffBlock}\n\n<sanitized_transcript>`);
 }
 
@@ -174,12 +501,14 @@ async function prepareHandoffSynthesis(aquifer, payload = {}, opts = {}) {
     throw new Error(`Codex handoff synthesis requires an ok normalized transcript view; got ${view && view.status ? view.status : 'missing'}`);
   }
   const currentMemory = await resolveCurrentMemoryForFinalization(aquifer, opts);
+  const checkpoints = await resolveCheckpointsForHandoff(aquifer, payload, opts);
   return {
     status: 'needs_agent_summary',
     outputSchemaVersion: 'handoff_current_memory_synthesis_v1',
     view,
     currentMemory,
-    prompt: buildHandoffSynthesisPrompt(payload, view, { ...opts, currentMemory }),
+    checkpoints,
+    prompt: buildHandoffSynthesisPrompt(payload, view, { ...opts, currentMemory, checkpoints }),
   };
 }
 
@@ -201,7 +530,9 @@ async function finalizeHandoff(aquifer, payload = {}, opts = {}) {
     };
   }
   const currentMemory = await resolveCurrentMemoryForFinalization(aquifer, opts);
+  const checkpoints = await resolveCheckpointsForHandoff(aquifer, payload, opts);
   if (currentMemory) metadata.currentMemory = compactCurrentMemorySnapshot(currentMemory, opts);
+  if (checkpoints) metadata.checkpoints = checkpoints;
   const result = await finalizeTranscriptView(aquifer, view, summary, {
     ...opts,
     mode: 'handoff',
@@ -252,6 +583,9 @@ async function finalizeHandoff(aquifer, payload = {}, opts = {}) {
 module.exports = {
   buildHandoffMetadata,
   buildHandoffSynthesisPrompt,
+  compactCheckpointSnapshot,
+  buildUncoveredTailView,
+  formatCheckpointContextBlock,
   prepareHandoffSynthesis,
   resolveHandoffSummary,
   finalizeHandoff,

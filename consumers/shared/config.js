@@ -8,6 +8,17 @@ const path = require('path');
 // ---------------------------------------------------------------------------
 
 const DEFAULTS = {
+  storage: {
+    backend: 'postgres',
+    postgres: {
+      url: null,
+      max: null,
+      idleTimeoutMs: null,
+    },
+    local: {
+      path: '.aquifer/aquifer.local.json',
+    },
+  },
   db: { url: null, max: 10, idleTimeoutMs: 30000 },
   schema: 'aquifer',
   tenantId: 'default',
@@ -45,6 +56,16 @@ const DEFAULTS = {
     activeScopeKey: null,
     activeScopePath: null,
   },
+  codex: {
+    checkpoint: {
+      checkIntervalMs: null,
+      checkIntervalMinutes: 10,
+      everyMessages: 20,
+      everyUserMessages: null,
+      quietMs: 3000,
+      claimTtlMs: 60000,
+    },
+  },
   rerank: {
     enabled: false,
     provider: null,    // 'tei' | 'jina' | 'openrouter' | 'custom'
@@ -69,6 +90,10 @@ const DEFAULTS = {
 // ---------------------------------------------------------------------------
 
 const ENV_MAP = [
+  ['AQUIFER_BACKEND',             'storage.backend'],
+  ['AQUIFER_STORAGE_BACKEND',     'storage.backend'],
+  ['AQUIFER_POSTGRES_URL',        'storage.postgres.url'],
+  ['AQUIFER_LOCAL_PATH',          'storage.local.path'],
   ['DATABASE_URL',              'db.url'],
   ['AQUIFER_DB_URL',            'db.url'],
   ['AQUIFER_DB_MAX',            'db.max',            Number],
@@ -95,6 +120,12 @@ const ENV_MAP = [
   ['AQUIFER_MEMORY_SERVING_MODE', 'memory.servingMode'],
   ['AQUIFER_MEMORY_ACTIVE_SCOPE_KEY', 'memory.activeScopeKey'],
   ['AQUIFER_MEMORY_ACTIVE_SCOPE_PATH', 'memory.activeScopePath'],
+  ['AQUIFER_CODEX_CHECKPOINT_CHECK_INTERVAL_MS', 'codex.checkpoint.checkIntervalMs', Number],
+  ['AQUIFER_CODEX_CHECKPOINT_CHECK_INTERVAL_MINUTES', 'codex.checkpoint.checkIntervalMinutes', Number],
+  ['AQUIFER_CODEX_CHECKPOINT_EVERY_MESSAGES', 'codex.checkpoint.everyMessages', Number],
+  ['AQUIFER_CODEX_CHECKPOINT_EVERY_USER_MESSAGES', 'codex.checkpoint.everyUserMessages', Number],
+  ['AQUIFER_CODEX_CHECKPOINT_QUIET_MS', 'codex.checkpoint.quietMs', Number],
+  ['AQUIFER_CODEX_CHECKPOINT_CLAIM_TTL_MS', 'codex.checkpoint.claimTtlMs', Number],
   ['AQUIFER_RERANK_ENABLED',   'rerank.enabled',    Boolean],
   ['AQUIFER_RERANK_PROVIDER',  'rerank.provider'],
   ['AQUIFER_RERANK_BASE_URL',  'rerank.baseUrl'],
@@ -139,6 +170,34 @@ function coerceEnvValue(raw, type) {
   if (type === Number) return Number(raw);
   if (type === Boolean) return raw === 'true' || raw === '1' || raw === 'yes';
   return raw;
+}
+
+function normalizeStorageConfig(config) {
+  const storage = config.storage && typeof config.storage === 'object' ? config.storage : {};
+  const backend = String(storage.backend || 'postgres').trim().toLowerCase();
+  if (backend !== 'postgres' && backend !== 'local') {
+    throw new Error(`Invalid Aquifer backend: "${storage.backend}". Must be one of: postgres, local`);
+  }
+  const postgres = {
+    ...DEFAULTS.storage.postgres,
+    ...(storage.postgres || {}),
+  };
+  const local = {
+    ...DEFAULTS.storage.local,
+    ...(storage.local || {}),
+  };
+
+  if (postgres.url) config.db.url = postgres.url;
+  if (config.db.url && !postgres.url) postgres.url = config.db.url;
+  if (postgres.max !== null && postgres.max !== undefined) config.db.max = postgres.max;
+  if (postgres.idleTimeoutMs !== null && postgres.idleTimeoutMs !== undefined) {
+    config.db.idleTimeoutMs = postgres.idleTimeoutMs;
+  }
+  postgres.max = config.db.max;
+  postgres.idleTimeoutMs = config.db.idleTimeoutMs;
+
+  config.storage = { backend, postgres, local };
+  return config;
 }
 
 // ---------------------------------------------------------------------------
@@ -193,7 +252,7 @@ function loadConfig(opts = {}) {
     };
   }
 
-  return config;
+  return normalizeStorageConfig(config);
 }
 
 module.exports = { loadConfig, DEFAULTS };

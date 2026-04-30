@@ -22,6 +22,16 @@ const crypto = require('crypto');
 const DEFAULT_CODEX_HOME = path.join(os.homedir(), '.codex');
 const { normalizeMessages } = require('./shared/normalize');
 const { applyEnrichSafetyGate } = require('../core/memory-safety-gate');
+const {
+    buildActiveSessionCheckpointInput,
+    buildActiveSessionCheckpointPrompt,
+    prepareActiveSessionCheckpoint: prepareActiveSessionCheckpointImpl,
+} = require('./codex-active-checkpoint');
+const {
+    formatCurrentMemoryPromptBlock,
+    compactCurrentMemorySnapshot,
+    resolveCurrentMemoryForFinalization,
+} = require('./codex-current-memory');
 const DEFAULT_IDLE_MS = 5 * 60 * 1000;
 const DEFAULT_CLAIM_TTL_MS = 5 * 60 * 1000;
 const DEFAULT_MIN_BYTES = 1000;
@@ -1102,6 +1112,92 @@ function approxPromptTokens(text) {
     return Math.ceil(String(text || '').length / 3);
 }
 
+function recoveryPromptBudgetExceeded(text, opts = {}) {
+    const promptTokens = approxPromptTokens(text);
+    const maxChars = opts.maxChars;
+    const maxPromptTokens = opts.maxPromptTokens;
+    return {
+        promptTokens,
+        exceeded: Boolean(
+            (Number.isFinite(maxChars) && maxChars > 0 && text.length > maxChars)
+            || (Number.isFinite(maxPromptTokens) && maxPromptTokens > 0 && promptTokens > maxPromptTokens)
+        ),
+    };
+}
+
+function buildBoundedRecoveryTranscript(safeMessages = [], opts = {}) {
+    const allowTail = opts.allowTail === true;
+    const maxMessages = opts.maxMessages;
+    const maxChars = opts.maxChars;
+    const maxPromptTokens = opts.maxPromptTokens;
+    const fullText = formatRecoveryTranscript(safeMessages);
+    const fullPromptTokens = approxPromptTokens(fullText);
+    let messages = safeMessages;
+    let omittedMessageCount = 0;
+    let truncatedByMessages = false;
+
+    if (Number.isFinite(maxMessages) && maxMessages > 0 && messages.length > maxMessages) {
+        if (!allowTail) {
+            return {
+                status: 'deferred',
+                reason: 'max_messages',
+                messageCount: messages.length,
+            };
+        }
+        omittedMessageCount = messages.length - maxMessages;
+        messages = messages.slice(-maxMessages);
+        truncatedByMessages = true;
+    }
+
+    let text = formatRecoveryTranscript(messages);
+    let budget = recoveryPromptBudgetExceeded(text, { maxChars, maxPromptTokens });
+    let truncatedByBudget = false;
+    while (allowTail && budget.exceeded && messages.length > 1) {
+        messages = messages.slice(1);
+        omittedMessageCount += 1;
+        truncatedByBudget = true;
+        text = formatRecoveryTranscript(messages);
+        budget = recoveryPromptBudgetExceeded(text, { maxChars, maxPromptTokens });
+    }
+
+    if (budget.exceeded) {
+        return {
+            status: 'deferred',
+            reason: 'prompt_budget',
+            charCount: text.length,
+            approxPromptTokens: budget.promptTokens,
+        };
+    }
+
+    return {
+        status: 'ok',
+        messages,
+        text,
+        charCount: text.length,
+        approxPromptTokens: budget.promptTokens,
+        fullCharCount: fullText.length,
+        fullApproxPromptTokens: fullPromptTokens,
+        truncated: truncatedByMessages || truncatedByBudget,
+        transcriptWindow: {
+            mode: allowTail ? 'tail' : 'full',
+            truncated: truncatedByMessages || truncatedByBudget,
+            omittedMessageCount,
+            includedMessageCount: messages.length,
+            totalMessageCount: safeMessages.length,
+            truncatedByMessages,
+            truncatedByBudget,
+        },
+        coverage: {
+            coordinateSystem: 'codex_sanitized_view_v1',
+            messageIndexBase: 0,
+            charIndexBase: 0,
+            semantics: 'coveredUntilChar is the first uncovered zero-based char offset; messages up to coveredUntilMessageIndex are covered.',
+            coveredUntilMessageIndex: safeMessages.length > 0 ? safeMessages.length - 1 : 0,
+            coveredUntilChar: fullText.length,
+        },
+    };
+}
+
 function materializeRecoveryTranscriptView(candidate = {}, opts = {}) {
     const filePath = candidate.filePath || candidate.metadata?.filePath;
     if (!filePath) {
@@ -1115,6 +1211,7 @@ function materializeRecoveryTranscriptView(candidate = {}, opts = {}) {
     const maxMessages = opts.maxRecoveryMessages ?? DEFAULT_RECOVERY_MAX_MESSAGES;
     const maxChars = opts.maxRecoveryChars ?? DEFAULT_RECOVERY_MAX_CHARS;
     const maxPromptTokens = opts.maxRecoveryPromptTokens ?? DEFAULT_RECOVERY_MAX_PROMPT_TOKENS;
+    const allowTail = opts.tailOnMaxBudget === true || opts.tailOnBudget === true || opts.tail === true;
 
     let stat;
     try {
@@ -1122,7 +1219,7 @@ function materializeRecoveryTranscriptView(candidate = {}, opts = {}) {
     } catch {
         return { status: 'not_found', sessionId: candidate.sessionId || null, filePath };
     }
-    if (Number.isFinite(maxBytes) && maxBytes > 0 && stat.size > maxBytes) {
+    if (!allowTail && Number.isFinite(maxBytes) && maxBytes > 0 && stat.size > maxBytes) {
         return { status: 'deferred', reason: 'max_bytes', sessionId: candidate.sessionId || null, filePath, size: stat.size };
     }
 
@@ -1154,7 +1251,13 @@ function materializeRecoveryTranscriptView(candidate = {}, opts = {}) {
             safetyGate: safety.meta,
         };
     }
-    if (Number.isFinite(maxMessages) && maxMessages > 0 && safeMessages.length > maxMessages) {
+    const bounded = buildBoundedRecoveryTranscript(safeMessages, {
+        allowTail,
+        maxMessages,
+        maxChars,
+        maxPromptTokens,
+    });
+    if (bounded.status === 'deferred' && bounded.reason === 'max_messages') {
         return {
             status: 'deferred',
             reason: 'max_messages',
@@ -1166,20 +1269,16 @@ function materializeRecoveryTranscriptView(candidate = {}, opts = {}) {
             safetyGate: safety.meta,
         };
     }
-
-    const text = formatRecoveryTranscript(safeMessages);
-    const promptTokens = approxPromptTokens(text);
-    if ((Number.isFinite(maxChars) && maxChars > 0 && text.length > maxChars)
-        || (Number.isFinite(maxPromptTokens) && maxPromptTokens > 0 && promptTokens > maxPromptTokens)) {
+    if (bounded.status === 'deferred') {
         return {
             status: 'deferred',
-            reason: 'prompt_budget',
+            reason: bounded.reason,
             sessionId: parsed.sessionId,
             fileSessionId: parsed.fileSessionId,
             filePath,
             transcriptHash,
-            charCount: text.length,
-            approxPromptTokens: promptTokens,
+            charCount: bounded.charCount,
+            approxPromptTokens: bounded.approxPromptTokens,
             safetyGate: safety.meta,
         };
     }
@@ -1190,16 +1289,23 @@ function materializeRecoveryTranscriptView(candidate = {}, opts = {}) {
         fileSessionId: parsed.fileSessionId,
         filePath,
         transcriptHash,
-        messages: safeMessages,
-        text,
-        charCount: text.length,
-        approxPromptTokens: promptTokens,
+        messages: bounded.messages,
+        text: bounded.text,
+        charCount: bounded.charCount,
+        approxPromptTokens: bounded.approxPromptTokens,
+        fullCharCount: bounded.fullCharCount,
+        fullApproxPromptTokens: bounded.fullApproxPromptTokens,
+        truncated: bounded.truncated,
+        transcriptWindow: bounded.transcriptWindow,
+        coverage: bounded.coverage,
         safetyGate: safety.meta,
         counts: {
             messageCount: parsed.normalized.messages.length,
             safeMessageCount: safeMessages.length,
             userCount: parsed.normalized.userCount,
             assistantCount: parsed.normalized.assistantCount,
+            fullCharCount: bounded.fullCharCount,
+            fullApproxPromptTokens: bounded.fullApproxPromptTokens,
         },
         metadata: {
             model: parsed.normalized.model,
@@ -1212,96 +1318,11 @@ function materializeRecoveryTranscriptView(candidate = {}, opts = {}) {
     };
 }
 
-function compactCurrentMemoryRow(row = {}) {
-    const payload = row.payload && typeof row.payload === 'object' ? row.payload : {};
-    const confidence = payload.confidence || payload.currentMemoryConfidence || null;
-    return {
-        memoryType: row.memoryType || row.memory_type || 'memory',
-        canonicalKey: row.canonicalKey || row.canonical_key || null,
-        scopeKey: row.scopeKey || row.scope_key || null,
-        summary: String(row.summary || row.title || '').replace(/\s+/g, ' ').trim(),
-        authority: row.authority || null,
-        confidence,
-    };
-}
-
-function formatCurrentMemoryPromptBlock(currentMemory = null, opts = {}) {
-    const maxItems = Math.max(0, Math.min(20, opts.maxCurrentMemoryItems || opts.currentMemoryLimit || 12));
-    const meta = currentMemory && currentMemory.meta ? currentMemory.meta : {};
-    const rows = Array.isArray(currentMemory?.memories)
-        ? currentMemory.memories
-        : (Array.isArray(currentMemory?.items) ? currentMemory.items : []);
-    const compactRows = rows.map(compactCurrentMemoryRow).filter(row => row.summary).slice(0, maxItems);
-    const attrs = [
-        `source="${meta.source || 'memory_records'}"`,
-        `serving_contract="${meta.servingContract || meta.serving_contract || 'current_memory_v1'}"`,
-        `count="${compactRows.length}"`,
-        `truncated="${Boolean(meta.truncated || rows.length > compactRows.length)}"`,
-        `degraded="${Boolean(meta.degraded || currentMemory?.error)}"`,
-    ];
-    const lines = compactRows.map(row => {
-        const scope = row.scopeKey ? ` scope=${row.scopeKey}` : '';
-        const authority = row.authority ? ` authority=${row.authority}` : '';
-        const confidence = row.confidence ? ` confidence=${row.confidence}` : '';
-        return `- ${row.memoryType}${scope}${authority}${confidence}: ${row.summary}`;
+async function prepareActiveSessionCheckpoint(aquifer, opts = {}) {
+    return prepareActiveSessionCheckpointImpl(aquifer, opts, {
+        materializeRecoveryTranscriptView,
+        resolveCurrentMemoryForFinalization,
     });
-    if (currentMemory && currentMemory.error && lines.length === 0) {
-        lines.push(`- degraded: ${String(currentMemory.error).replace(/\s+/g, ' ').trim()}`);
-    }
-    if (lines.length === 0) lines.push('- none');
-    return [
-        `<current_memory ${attrs.join(' ')}>`,
-        ...lines,
-        '</current_memory>',
-    ].join('\n');
-}
-
-function compactCurrentMemorySnapshot(currentMemory = null, opts = {}) {
-    const maxItems = Math.max(0, Math.min(20, opts.maxCurrentMemoryItems || opts.currentMemoryLimit || 12));
-    const meta = currentMemory && currentMemory.meta ? currentMemory.meta : {};
-    const rows = Array.isArray(currentMemory?.memories)
-        ? currentMemory.memories
-        : (Array.isArray(currentMemory?.items) ? currentMemory.items : []);
-    return {
-        memories: rows.map(compactCurrentMemoryRow).filter(row => row.summary).slice(0, maxItems),
-        meta: {
-            source: meta.source || 'memory_records',
-            servingContract: meta.servingContract || meta.serving_contract || 'current_memory_v1',
-            count: Math.min(rows.length, maxItems),
-            truncated: Boolean(meta.truncated || rows.length > maxItems),
-            degraded: Boolean(meta.degraded || currentMemory?.error),
-        },
-    };
-}
-
-async function resolveCurrentMemoryForFinalization(aquifer, opts = {}) {
-    if (opts.includeCurrentMemory === false) return null;
-    if (opts.currentMemory !== undefined) return opts.currentMemory;
-    const currentFn = aquifer?.memory?.current || aquifer?.memory?.listCurrentMemory;
-    if (typeof currentFn !== 'function') return null;
-    const limit = Math.max(1, Math.min(20, opts.currentMemoryLimit || opts.maxCurrentMemoryItems || 12));
-    try {
-        return await currentFn.call(aquifer.memory, {
-            tenantId: opts.tenantId,
-            activeScopeKey: opts.activeScopeKey || opts.scopeKey,
-            activeScopePath: opts.activeScopePath,
-            scopeId: opts.scopeId,
-            asOf: opts.asOf,
-            limit,
-        });
-    } catch (err) {
-        return {
-            memories: [],
-            meta: {
-                source: 'memory_records',
-                servingContract: 'current_memory_v1',
-                count: 0,
-                truncated: false,
-                degraded: true,
-            },
-            error: err.message,
-        };
-    }
 }
 
 function buildFinalizationPrompt(view = {}, opts = {}) {
@@ -1344,6 +1365,30 @@ function normalizeFinalizationSummary(summary = {}) {
         throw new Error('summaryText or structuredSummary is required for finalization');
     }
     return { summaryText, structuredSummary };
+}
+
+function inferScopeKindFromKey(scopeKey) {
+    const key = String(scopeKey || '').trim();
+    if (!key) return null;
+    if (key === 'global') return 'global';
+    const prefix = key.split(':')[0];
+    return ['user', 'workspace', 'project', 'repo', 'task', 'session', 'host_runtime'].includes(prefix)
+        ? prefix
+        : null;
+}
+
+function resolveFinalizationScope(opts = {}) {
+    const meta = opts.currentMemory && opts.currentMemory.meta ? opts.currentMemory.meta : {};
+    const metaPath = Array.isArray(meta.activeScopePath) ? meta.activeScopePath : null;
+    const scopeKey = opts.scopeKey
+        || opts.activeScopeKey
+        || meta.activeScopeKey
+        || (metaPath && metaPath.length > 0 ? metaPath[metaPath.length - 1] : null)
+        || null;
+    return {
+        scopeKey,
+        scopeKind: opts.scopeKind || inferScopeKindFromKey(scopeKey),
+    };
 }
 
 async function ensureCommittedForFinalization(aquifer, view = {}, opts = {}) {
@@ -1415,10 +1460,15 @@ async function finalizeTranscriptView(aquifer, view = {}, summary = {}, opts = {
         trigger: mode,
         ...(opts.metadata || {}),
     };
+    let resolvedCurrentMemory = opts.currentMemory;
     if (!metadata.currentMemory) {
-        const currentMemory = await resolveCurrentMemoryForFinalization(aquifer, opts);
-        if (currentMemory) metadata.currentMemory = compactCurrentMemorySnapshot(currentMemory, opts);
+        resolvedCurrentMemory = await resolveCurrentMemoryForFinalization(aquifer, opts);
+        if (resolvedCurrentMemory) metadata.currentMemory = compactCurrentMemorySnapshot(resolvedCurrentMemory, opts);
     }
+    const finalizationScope = resolveFinalizationScope({
+        ...opts,
+        currentMemory: resolvedCurrentMemory,
+    });
     const result = await finalizeSession({
         sessionId: view.sessionId,
         agentId,
@@ -1435,8 +1485,8 @@ async function finalizeTranscriptView(aquifer, view = {}, summary = {}, opts = {
         startedAt: view.metadata?.startedAt || null,
         endedAt: view.metadata?.lastMessageAt || null,
         embedding: opts.embedding || null,
-        scopeKind: opts.scopeKind || null,
-        scopeKey: opts.scopeKey || null,
+        scopeKind: finalizationScope.scopeKind,
+        scopeKey: finalizationScope.scopeKey,
         contextKey: opts.contextKey || null,
         topicKey: opts.topicKey || null,
         authority: opts.authority || 'verified_summary',
@@ -1654,6 +1704,9 @@ module.exports = {
     findDbEligibleRecoveryCandidates,
     materializeRecoveryTranscriptView,
     buildFinalizationPrompt,
+    buildActiveSessionCheckpointInput,
+    buildActiveSessionCheckpointPrompt,
+    prepareActiveSessionCheckpoint,
     prepareSessionStartRecovery,
     recordRecoveryDecision,
     finalizeTranscriptView,

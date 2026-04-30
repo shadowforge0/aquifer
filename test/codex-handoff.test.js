@@ -110,6 +110,80 @@ describe('Codex handoff finalization helper', () => {
     assert.doesNotMatch(prompt, /evidenceRefs/);
   });
 
+  it('adds checkpoint context as process material without leaking lineage internals', () => {
+    const prompt = handoff.buildHandoffSynthesisPrompt(samplePayload(), sampleView(), {
+      checkpoints: [{
+        id: 42,
+        inputHash: 'secret-hash',
+        transcriptHash: 'private-transcript-hash',
+        scopeKey: 'project:aquifer',
+        topicKey: 'rolling-checkpoint',
+        triggerKind: 'boundary',
+        summaryText: 'Aquifer checkpoint captured scoped release state.',
+        structuredSummary: {
+          decisions: [{ decision: 'Checkpoints stay process material until finalization.' }],
+          open_loops: [{ item: 'Wire checkpoint ledger into handoff combiner.' }],
+        },
+      }],
+    });
+
+    assert.match(prompt, /checkpoint_context/);
+    assert.match(prompt, /scope=project:aquifer/);
+    assert.match(prompt, /Aquifer checkpoint captured scoped release state/);
+    assert.match(prompt, /Checkpoints stay process material until finalization/);
+    assert.match(prompt, /Treat checkpoint_context as producer process material/);
+    assert.doesNotMatch(prompt, /secret-hash/);
+    assert.doesNotMatch(prompt, /private-transcript-hash/);
+    assert.doesNotMatch(prompt, /id: 42/);
+  });
+
+  it('uses only uncovered transcript tail when checkpoint coverage is explicit', () => {
+    const view = sampleView({
+      messages: [
+        { role: 'user', content: 'covered user request' },
+        { role: 'assistant', content: 'covered assistant work' },
+        { role: 'user', content: 'tail user correction' },
+        { role: 'assistant', content: 'tail assistant result' },
+      ],
+      text: '[user]\ncovered user request\n\n[assistant]\ncovered assistant work\n\n[user]\ntail user correction\n\n[assistant]\ntail assistant result',
+    });
+    const prompt = handoff.buildHandoffSynthesisPrompt(samplePayload(), view, {
+      checkpoints: [{
+        scopeKey: 'project:aquifer',
+        summaryText: 'Prior range was checkpointed.',
+        coverage: { messageIndex: 1 },
+      }],
+    });
+
+    assert.match(prompt, /sessionId: codex-session-1/);
+    assert.match(prompt, new RegExp(`transcriptHash: ${view.transcriptHash}`));
+    assert.match(prompt, /checkpoint_context/);
+    assert.match(prompt, /tail user correction/);
+    assert.match(prompt, /tail assistant result/);
+    assert.doesNotMatch(prompt, /\[user\]\ncovered user request/);
+    assert.doesNotMatch(prompt, /\[assistant\]\ncovered assistant work/);
+  });
+
+  it('falls back to the full transcript when checkpoint coverage is invalid', () => {
+    const view = sampleView({
+      messages: [
+        { role: 'user', content: 'first full transcript message' },
+        { role: 'assistant', content: 'second full transcript message' },
+      ],
+      text: '[user]\nfirst full transcript message\n\n[assistant]\nsecond full transcript message',
+    });
+    const prompt = handoff.buildHandoffSynthesisPrompt(samplePayload(), view, {
+      checkpoints: [{
+        scopeKey: 'project:aquifer',
+        summaryText: 'Invalid checkpoint coverage should not trim the prompt.',
+        coverage: { messageIndex: 9 },
+      }],
+    });
+
+    assert.match(prompt, /first full transcript message/);
+    assert.match(prompt, /second full transcript message/);
+  });
+
   it('prepares handoff synthesis with compact current memory snapshot', async () => {
     const view = sampleView();
     const currentCalls = [];
@@ -156,6 +230,81 @@ describe('Codex handoff finalization helper', () => {
     assert.match(prepared.prompt, /Current memory enters prompt only as compact text/);
     assert.doesNotMatch(prepared.prompt, /Other project memory would be a scope leak/);
     assert.doesNotMatch(prepared.prompt, /memoryId/);
+  });
+
+  it('prepares handoff synthesis with DB-backed checkpoint context and uncovered line tail when available', async () => {
+    const view = sampleView({
+      messages: [
+        { role: 'user', content: 'covered planning note' },
+        { role: 'assistant', content: 'covered implementation detail' },
+        { role: 'user', content: 'remaining release question' },
+        { role: 'assistant', content: 'remaining release answer' },
+      ],
+      text: [
+        '[user]',
+        'covered planning note',
+        '',
+        '[assistant]',
+        'covered implementation detail',
+        '',
+        '[user]',
+        'remaining release question',
+        '',
+        '[assistant]',
+        'remaining release answer',
+      ].join('\n'),
+    });
+    const checkpointCalls = [];
+    const aquifer = {
+      memory: {
+        async current() {
+          return { memories: [], meta: { servingContract: 'current_memory_v1' } };
+        },
+      },
+      checkpoints: {
+        async listForHandoff(input) {
+          checkpointCalls.push(input);
+          return [{
+            scopeKey: 'project:aquifer',
+            triggerKind: 'boundary',
+            summaryText: 'DB checkpoint enters handoff prompt as process material.',
+            coverage: {
+              transcript: {
+                line: 6,
+                char: 0,
+              },
+            },
+            structuredSummary: {
+              decisions: [{ decision: 'Checkpoint rows do not bypass finalization.' }],
+            },
+          }];
+        },
+      },
+    };
+
+    const prepared = await handoff.prepareHandoffSynthesis(aquifer, samplePayload({ sessionId: 'payload-session' }), {
+      view,
+      activeScopeKey: 'project:aquifer',
+      activeScopePath: ['global', 'project:aquifer'],
+      checkpointLimit: 3,
+    });
+
+    assert.equal(checkpointCalls.length, 1);
+    assert.deepEqual(checkpointCalls[0].activeScopePath, ['global', 'project:aquifer']);
+    assert.equal(checkpointCalls[0].activeScopeKey, 'project:aquifer');
+    assert.equal(checkpointCalls[0].sessionId, 'payload-session');
+    assert.equal(checkpointCalls[0].limit, 3);
+    assert.equal(prepared.checkpoints.meta.source, 'checkpoint_runs');
+    assert.equal(prepared.view, view);
+    assert.match(prepared.prompt, /checkpoint_context/);
+    assert.match(prepared.prompt, /sessionId: codex-session-1/);
+    assert.match(prepared.prompt, new RegExp(`transcriptHash: ${view.transcriptHash}`));
+    assert.match(prepared.prompt, /DB checkpoint enters handoff prompt as process material/);
+    assert.match(prepared.prompt, /Checkpoint rows do not bypass finalization/);
+    assert.match(prepared.prompt, /\[user\]\nremaining release question/);
+    assert.match(prepared.prompt, /\[assistant\]\nremaining release answer/);
+    assert.doesNotMatch(prepared.prompt, /\[user\]\ncovered planning note/);
+    assert.doesNotMatch(prepared.prompt, /\[assistant\]\ncovered implementation detail/);
   });
 
   it('marks the handoff synthesis output schema for operator promotion', async () => {

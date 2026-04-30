@@ -15,6 +15,8 @@
     "consumers/mcp.js",
     "consumers/claude-code.js",
     "consumers/codex.js",
+    "consumers/codex-active-checkpoint.js",
+    "consumers/codex-current-memory.js",
     "consumers/codex-handoff.js",
     "consumers/openclaw-plugin.js",
     "consumers/opencode.js",
@@ -26,6 +28,8 @@
     "docs/setup.md",
     ".env.example",
     "scripts/backfill-canonical-key.js",
+    "scripts/codex-checkpoint-commands.js",
+    "scripts/codex-checkpoint-runtime.js",
     "scripts/diagnose-fts-zh.js",
     "scripts/diagnose-vector.js",
     "scripts/codex-recovery.js",
@@ -67,9 +71,9 @@
   "scripts": {
     "test": "node --test test/*.test.js",
     "test:integration": "node --test test/integration.test.js",
-    "test:release:package": "node --test test/package-surface.test.js test/mcp-manifest.test.js test/v1-serving-cutover.test.js test/v1-current-memory-contract.test.js test/consumer-codex.test.js test/codex-handoff.test.js",
-    "test:release:db": "node -e \"if (!process.env.AQUIFER_TEST_DB_URL) { console.error('AQUIFER_TEST_DB_URL is required for test:release:db'); process.exit(1); }\" && node --test test/consumer-mcp.integration.test.js test/consumer-cli.integration.test.js test/codex-finalization-serving.integration.test.js",
-    "lint": "eslint index.js core/*.js consumers/cli.js consumers/mcp.js consumers/claude-code.js consumers/codex.js consumers/codex-handoff.js consumers/openclaw-plugin.js consumers/opencode.js consumers/shared/*.js consumers/default/*.js consumers/default/prompts/*.js consumers/openclaw-ext/*.js pipeline/*.js pipeline/consolidation/*.js scripts/*.js test/*.js",
+    "test:release:package": "node --test test/package-surface.test.js test/mcp-manifest.test.js test/local-backend.test.js test/scope-attribution.test.js test/v1-checkpoint-ledger-schema.test.js test/v1-evidence-items.test.js test/v1-curated-semantic-recall.test.js test/session-checkpoints.test.js test/session-checkpoint-producer.test.js test/session-checkpoint-planner.test.js test/storage-checkpoint-ranges.test.js test/v1-serving-cutover.test.js test/v1-current-memory-contract.test.js test/v1-scope-inheritance.golden.test.js test/v1-bootstrap-determinism.test.js test/consumer-codex.test.js test/codex-recovery-script.test.js test/codex-handoff.test.js",
+    "test:release:db": "node -e \"if (!process.env.AQUIFER_TEST_DB_URL) { console.error('AQUIFER_TEST_DB_URL is required for test:release:db'); process.exit(1); }\" && node --test test/v1-evidence-items.test.js test/consumer-mcp.integration.test.js test/consumer-cli.integration.test.js test/codex-finalization-serving.integration.test.js",
+    "lint": "eslint index.js core/*.js core/backends/*.js consumers/cli.js consumers/mcp.js consumers/claude-code.js consumers/codex.js consumers/codex-active-checkpoint.js consumers/codex-current-memory.js consumers/codex-handoff.js consumers/openclaw-plugin.js consumers/opencode.js consumers/shared/*.js consumers/default/*.js consumers/default/prompts/*.js consumers/openclaw-ext/*.js pipeline/*.js pipeline/consolidation/*.js scripts/*.js test/*.js",
     "hooks:install": "git config core.hooksPath .githooks"
   },
   "dependencies": {

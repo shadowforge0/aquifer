@@ -1,4 +1,14 @@
 {
+  "storage": {
+    "backend": "postgres",
+    "postgres": {
+      "url": "postgresql://user:password@localhost:5432/mydb",
+      "max": 10
+    },
+    "local": {
+      "path": ".aquifer/aquifer.local.json"
+    }
+  },
   "db": {
     "url": "postgresql://user:password@localhost:5432/mydb",
     "max": 10
@@ -13,6 +23,15 @@
     "servingMode": "legacy",
     "activeScopeKey": null,
     "activeScopePath": null
+  },
+  "codex": {
+    "checkpoint": {
+      "checkIntervalMinutes": 10,
+      "everyMessages": 20,
+      "everyUserMessages": null,
+      "quietMs": 3000,
+      "claimTtlMs": 60000
+    }
   },
   "embed": {
     "baseUrl": "http://localhost:11434/v1",

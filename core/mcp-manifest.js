@@ -19,8 +19,72 @@ const MCP_SERVER_NAME = 'aquifer-memory';
 
 const MCP_TOOL_MANIFEST = Object.freeze([
   {
+    name: 'memory_recall',
+    description: 'Explicit current-memory recall on the active curated memory corpus. Use this for current state and next-step lookup; use historical_recall for older session detail.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        query: { type: 'string', minLength: 1, description: 'Search query (keyword or natural language)' },
+        limit: { type: 'integer', minimum: 1, maximum: 20, description: 'Max results (default 5)' },
+        mode: {
+          type: 'string',
+          enum: ['fts', 'hybrid', 'vector'],
+          description: 'Recall mode: "fts" (keyword only), "hybrid" (default, FTS + vector), "vector" (vector only)',
+        },
+        explain: {
+          type: 'boolean',
+          description: 'Include per-result score breakdown (diagnostic use only).',
+        },
+        activeScopeKey: { type: 'string', description: 'Active curated memory scope key, e.g. project:aquifer' },
+        activeScopePath: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Ordered curated scope path from global to active scope',
+        },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'historical_recall',
+    description: 'Explicit historical/session recall over stored sessions and summaries. Use this for timeline, detail, and session context lookup; use evidence_recall only for audit/debug/provenance.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        query: { type: 'string', minLength: 1, description: 'Search query (keyword or natural language)' },
+        limit: { type: 'integer', minimum: 1, maximum: 20, description: 'Max results (default 5)' },
+        agentId: { type: 'string', description: 'Filter by agent ID' },
+        source: { type: 'string', description: 'Filter by source (e.g., gateway, cc)' },
+        dateFrom: { type: 'string', description: 'Start date YYYY-MM-DD' },
+        dateTo: { type: 'string', description: 'End date YYYY-MM-DD' },
+        entities: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Entity names to match',
+        },
+        entityMode: {
+          type: 'string',
+          enum: ['any', 'all'],
+          description: '"any" (default, boost) or "all" (only sessions with every entity)',
+        },
+        mode: {
+          type: 'string',
+          enum: ['fts', 'hybrid', 'vector'],
+          description: 'Recall mode: "fts" (keyword only, no embed needed), "hybrid" (default, FTS + vector), "vector" (vector only)',
+        },
+        explain: {
+          type: 'boolean',
+          description: 'Include per-result score breakdown (rrf, timeDecay, entity, trust, rerank). Diagnostic use only.',
+        },
+      },
+      required: ['query'],
+    },
+  },
+  {
     name: 'session_recall',
-    description: 'Search Aquifer memory. When memory serving mode is curated, this searches active curated memory only; use evidence_recall for legacy session/evidence lookup. Use entities/date filters where supported by the active serving mode.',
+    description: 'Compatibility recall surface. In curated serving mode this routes to current memory; in legacy serving mode it routes to historical/session recall. Prefer memory_recall for current state and historical_recall for timeline/detail lookup.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -115,7 +179,7 @@ const MCP_TOOL_MANIFEST = Object.freeze([
   },
   {
     name: 'memory_stats',
-    description: 'Return storage statistics for the Aquifer memory store (session counts by status, summaries, turn embeddings, entities, date range).',
+    description: 'Return storage statistics for the Aquifer memory store, serving mode, current-memory record coverage, and session date range.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,

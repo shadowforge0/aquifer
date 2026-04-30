@@ -123,6 +123,61 @@ function normalizeEvidenceRefs(candidate = {}) {
   return candidate.evidenceRefs || candidate.evidence_refs || [];
 }
 
+function normalizeEvidenceTexts(candidate = {}) {
+  const raw = candidate.evidenceItems || candidate.evidence_items || candidate.evidenceTexts || candidate.evidence_texts;
+  const values = Array.isArray(raw) ? raw : [];
+  const direct = [
+    candidate.evidenceText,
+    candidate.evidence_text,
+    candidate.evidenceExcerpt,
+    candidate.evidence_excerpt,
+    candidate.sourceText,
+    candidate.source_text,
+    candidate.quote,
+  ];
+  for (const value of direct) {
+    if (value) values.push(value);
+  }
+  return values
+    .map(value => {
+      if (typeof value === 'string') return { excerptText: normalizeText(value), metadata: {} };
+      if (!value || typeof value !== 'object') return null;
+      const excerptText = normalizeText(value.excerptText || value.excerpt_text || value.text || value.quote || value.summary);
+      if (!excerptText) return null;
+      return {
+        ...value,
+        excerptText,
+        metadata: value.metadata || {},
+      };
+    })
+    .filter(value => value && value.excerptText);
+}
+
+function buildMemoryEmbeddingText(candidate = {}) {
+  const fields = [
+    ['title', candidate.title],
+    ['summary', candidate.summary],
+    ['context', candidate.contextKey || candidate.context_key],
+    ['topic', candidate.topicKey || candidate.topic_key],
+  ]
+    .map(([label, value]) => {
+      const text = normalizeText(value);
+      return text ? `${label}: ${text}` : '';
+    })
+    .filter(Boolean);
+  return fields.join('\n');
+}
+
+function assignEmbeddedVectors(items, vectors, errorPrefix) {
+  if (!Array.isArray(vectors) || vectors.length !== items.length) {
+    throw new Error(`${errorPrefix} returned ${Array.isArray(vectors) ? vectors.length : 'invalid'} vectors for ${items.length} texts`);
+  }
+  for (let i = 0; i < items.length; i++) {
+    const vector = vectors[i];
+    if (Array.isArray(vector) && vector.length > 0) items[i].embedding = vector;
+  }
+}
+
 function buildFactAssertion(candidate = {}, opts = {}) {
   const memoryType = normalizeType(candidate.memoryType || candidate.memory_type);
   if (memoryType !== 'fact') return null;
@@ -217,6 +272,15 @@ function pushStructuredCandidates(candidates, items, spec) {
     const text = textFromItem(item, spec.keys);
     if (!text) continue;
     const itemObj = item && typeof item === 'object' ? item : null;
+    const evidenceText = normalizeText(itemObj && (
+      itemObj.evidenceText
+      || itemObj.evidence_text
+      || itemObj.evidenceExcerpt
+      || itemObj.evidence_excerpt
+      || itemObj.sourceText
+      || itemObj.source_text
+      || itemObj.quote
+    ));
     const explicitSubject = normalizeText(itemObj && (itemObj.subject || itemObj.entity || itemObj.name));
     const explicitAspect = normalizeText(itemObj && (itemObj.aspect || itemObj.predicate || itemObj.attribute));
     const subject = explicitSubject || normalizeText(spec.subject);
@@ -242,6 +306,7 @@ function pushStructuredCandidates(candidates, items, spec) {
       payload: typeof item === 'string' ? { [spec.payloadKey]: text } : { ...item, [spec.payloadKey]: text },
       authority: spec.authority,
       evidenceRefs: spec.evidenceRefs,
+      evidenceText: evidenceText || undefined,
       visibleInBootstrap: true,
       visibleInRecall: true,
     });
@@ -355,7 +420,45 @@ function assessCandidate(candidate = {}, opts = {}) {
   return { action: 'promote', reason: 'v1_foundation_allowed' };
 }
 
-function createMemoryPromotion({ records }) {
+function createMemoryPromotion({ records, embedFn = null }) {
+  async function prepareCandidates(candidates = []) {
+    const prepared = candidates.map(candidate => ({ ...candidate }));
+    if (typeof embedFn !== 'function' || prepared.length === 0) return prepared;
+
+    const pendingMemoryRows = [];
+    const memoryTexts = [];
+    for (const candidate of prepared) {
+      if (Array.isArray(candidate.embedding) && candidate.embedding.length > 0) continue;
+      const text = buildMemoryEmbeddingText(candidate);
+      if (!text) continue;
+      pendingMemoryRows.push(candidate);
+      memoryTexts.push(text);
+    }
+    if (memoryTexts.length > 0) {
+      const vectors = await embedFn(memoryTexts);
+      assignEmbeddedVectors(pendingMemoryRows, vectors, 'memory promotion embedFn');
+    }
+
+    const pendingEvidenceItems = [];
+    const evidenceTexts = [];
+    for (const candidate of prepared) {
+      const normalizedEvidenceTexts = normalizeEvidenceTexts(candidate);
+      candidate._preparedEvidenceTexts = normalizedEvidenceTexts;
+      for (const item of normalizedEvidenceTexts) {
+        if (Array.isArray(item.embedding) && item.embedding.length > 0) continue;
+        if (!item.excerptText) continue;
+        pendingEvidenceItems.push(item);
+        evidenceTexts.push(item.excerptText);
+      }
+    }
+    if (evidenceTexts.length > 0) {
+      const vectors = await embedFn(evidenceTexts);
+      assignEmbeddedVectors(pendingEvidenceItems, vectors, 'memory evidence embedFn');
+    }
+
+    return prepared;
+  }
+
   async function promoteOne(candidate, opts = {}, candidateRecords = records, tx = {}) {
     if (tx.inTransaction && candidateRecords.lockCanonicalKey && candidate.canonicalKey) {
       await candidateRecords.lockCanonicalKey({
@@ -386,6 +489,7 @@ function createMemoryPromotion({ records }) {
 
     const memoryType = normalizeType(candidate.memoryType || candidate.memory_type);
     const acceptedAt = candidate.acceptedAt || opts.acceptedAt || new Date().toISOString();
+    const evidenceTexts = candidate._preparedEvidenceTexts || normalizeEvidenceTexts(candidate);
     let scopeId = candidate.scopeId || candidate.scope_id || null;
     if (!scopeId) {
       const scope = await candidateRecords.upsertScope({
@@ -397,6 +501,52 @@ function createMemoryPromotion({ records }) {
         topicKey: candidate.topicKey || candidate.topic_key || null,
       });
       scopeId = scope.id;
+    }
+
+    async function linkCandidateEvidence(ownerKind, ownerId, ref) {
+      const base = {
+        tenantId: opts.tenantId,
+        ownerKind,
+        ownerId,
+        sourceKind: ref.sourceKind || ref.source_kind,
+        sourceRef: ref.sourceRef || ref.source_ref,
+        relationKind: ref.relationKind || ref.relation_kind || 'supporting',
+        weight: ref.weight ?? 1.0,
+        metadata: ref.metadata || {},
+        createdByFinalizationId: opts.createdByFinalizationId || opts.created_by_finalization_id || null,
+        createdByCompactionRunId: opts.createdByCompactionRunId || opts.created_by_compaction_run_id || null,
+      };
+
+      if (!candidateRecords.upsertEvidenceItem || evidenceTexts.length === 0) {
+        await candidateRecords.linkEvidence(base);
+        return;
+      }
+
+      for (const item of evidenceTexts) {
+        const evidenceItem = await candidateRecords.upsertEvidenceItem({
+          tenantId: opts.tenantId,
+          sourceKind: item.sourceKind || item.source_kind || base.sourceKind,
+          sourceRef: item.sourceRef || item.source_ref || base.sourceRef,
+          sessionRowId: item.sessionRowId || item.session_row_id || null,
+          turnEmbeddingId: item.turnEmbeddingId || item.turn_embedding_id || null,
+          summaryRowId: item.summaryRowId || item.summary_row_id || null,
+          createdByFinalizationId: base.createdByFinalizationId,
+          excerptText: item.excerptText,
+          excerptHash: item.excerptHash || item.excerpt_hash || null,
+          embedding: item.embedding || null,
+          metadata: {
+            ...(item.metadata || {}),
+            memoryType,
+            canonicalKey: candidate.canonicalKey,
+          },
+        });
+        await candidateRecords.linkEvidence({
+          ...base,
+          sourceKind: item.sourceKind || item.source_kind || base.sourceKind,
+          sourceRef: item.sourceRef || item.source_ref || base.sourceRef,
+          evidenceItemId: evidenceItem ? evidenceItem.id : null,
+        });
+      }
     }
 
     let backingFact = null;
@@ -444,18 +594,7 @@ function createMemoryPromotion({ records }) {
       }
 
       for (const ref of normalizeEvidenceRefs(candidate)) {
-        await candidateRecords.linkEvidence({
-          tenantId: opts.tenantId,
-          ownerKind: 'fact',
-          ownerId: backingFact.id,
-          sourceKind: ref.sourceKind || ref.source_kind,
-          sourceRef: ref.sourceRef || ref.source_ref,
-          relationKind: ref.relationKind || ref.relation_kind || 'supporting',
-          weight: ref.weight ?? 1.0,
-          metadata: ref.metadata || {},
-          createdByFinalizationId: opts.createdByFinalizationId || opts.created_by_finalization_id || null,
-          createdByCompactionRunId: opts.createdByCompactionRunId || opts.created_by_compaction_run_id || null,
-        });
+        await linkCandidateEvidence('fact', backingFact.id, ref);
       }
     }
 
@@ -482,6 +621,7 @@ function createMemoryPromotion({ records }) {
       visibleInBootstrap: candidate.visibleInBootstrap !== false,
       visibleInRecall: candidate.visibleInRecall !== false,
       rankFeatures: candidate.rankFeatures || {},
+      embedding: candidate.embedding || null,
     });
 
     if (assessment.supersedeId && candidateRecords.updateMemoryStatus) {
@@ -495,26 +635,16 @@ function createMemoryPromotion({ records }) {
     }
 
     for (const ref of normalizeEvidenceRefs(candidate)) {
-      await candidateRecords.linkEvidence({
-        tenantId: opts.tenantId,
-        ownerKind: 'memory_record',
-        ownerId: memory.id,
-        sourceKind: ref.sourceKind || ref.source_kind,
-        sourceRef: ref.sourceRef || ref.source_ref,
-        relationKind: ref.relationKind || ref.relation_kind || 'supporting',
-        weight: ref.weight ?? 1.0,
-        metadata: ref.metadata || {},
-        createdByFinalizationId: opts.createdByFinalizationId || opts.created_by_finalization_id || null,
-        createdByCompactionRunId: opts.createdByCompactionRunId || opts.created_by_compaction_run_id || null,
-      });
+      await linkCandidateEvidence('memory_record', memory.id, ref);
     }
 
     return { candidate, action: 'promote', reason: assessment.reason, memory, backingFact };
   }
 
   async function promote(candidates = [], opts = {}) {
+    const preparedCandidates = await prepareCandidates(candidates);
     const results = [];
-    for (const candidate of candidates) {
+    for (const candidate of preparedCandidates) {
       const result = records.withTransaction
         ? await records.withTransaction((txRecords, meta = {}) => promoteOne(candidate, opts, txRecords, {
             inTransaction: meta.transactional !== false,
@@ -538,6 +668,7 @@ module.exports = {
   AUTHORITY_RANK,
   defaultInheritanceForType,
   buildCanonicalKey,
+  buildMemoryEmbeddingText,
   extractCandidatesFromStructuredSummary,
   assessCandidate,
   createMemoryPromotion,

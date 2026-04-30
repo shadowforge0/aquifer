@@ -28,17 +28,26 @@ function randomSchema() {
   return `aquifer_test_${crypto.randomBytes(4).toString('hex')}`;
 }
 
+function buildIsolatedCliEnv(extraEnv = {}) {
+  const baseEnv = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (key.startsWith('AQUIFER_MEMORY_')) continue;
+    baseEnv[key] = value;
+  }
+  return {
+    ...baseEnv,
+    AQUIFER_DB_URL: DB_URL,
+    AQUIFER_SCHEMA: extraEnv.AQUIFER_SCHEMA,
+    AQUIFER_TENANT_ID: 'test',
+    // Avoid picking up user's ~/.aquifer/config.json if any
+    AQUIFER_CONFIG: '/dev/null',
+    ...extraEnv,
+  };
+}
+
 function runCli(args, env = {}) {
   const result = spawnSync('node', [CLI_PATH, ...args], {
-    env: {
-      ...process.env,
-      AQUIFER_DB_URL: DB_URL,
-      AQUIFER_SCHEMA: env.AQUIFER_SCHEMA,
-      AQUIFER_TENANT_ID: 'test',
-      // Avoid picking up user's ~/.aquifer/config.json if any
-      AQUIFER_CONFIG: '/dev/null',
-      ...env,
-    },
+    env: buildIsolatedCliEnv(env),
     encoding: 'utf8',
     timeout: 30000,
   });

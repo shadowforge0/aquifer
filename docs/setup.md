@@ -51,10 +51,25 @@ Aquifer reads configuration from three sources (in priority order):
 
 Default public serving mode is `legacy`. Opt into `curated` only when you want `session_recall` and `session_bootstrap` to read active curated memory. `evidence_recall` remains the explicit audit/debug lane in both modes, and rollback is just setting env or config back to `legacy`.
 
+Backend profiles are explicit. `postgres` is the full backend and remains required for semantic recall, migrations, curated memory, and operator workflows. `local` is a zero-config starter profile with JSON-file persistence, raw session writes, lexical recall, bootstrap, stats, and export. It is intentionally degraded and does not create embeddings or run operator workflows:
+
+```bash
+AQUIFER_BACKEND=local npx aquifer backend-info --json
+```
+
 ### Example config file
 
 ```json
 {
+  "storage": {
+    "backend": "postgres",
+    "postgres": {
+      "url": "postgresql://aquifer:aquifer@localhost:5432/aquifer"
+    },
+    "local": {
+      "path": ".aquifer/aquifer.local.json"
+    }
+  },
   "db": {
     "url": "postgresql://aquifer:aquifer@localhost:5432/aquifer"
   },
@@ -74,6 +89,7 @@ Default public serving mode is `legacy`. Opt into `curated` only when you want `
 
 ```bash
 export DATABASE_URL="postgresql://aquifer:aquifer@localhost:5432/aquifer"
+export AQUIFER_BACKEND="postgres"
 export AQUIFER_EMBED_BASE_URL="http://localhost:11434/v1"
 export AQUIFER_EMBED_MODEL="bge-m3"
 export AQUIFER_MEMORY_SERVING_MODE="legacy"
@@ -97,6 +113,12 @@ export AQUIFER_MEMORY_SERVING_MODE="legacy"
 # export AQUIFER_MEMORY_SERVING_MODE="curated"
 # export AQUIFER_MEMORY_ACTIVE_SCOPE_KEY="project:aquifer"
 # export AQUIFER_MEMORY_ACTIVE_SCOPE_PATH="global,project:aquifer"
+
+# Optional Codex active-session checkpoint heartbeat policy.
+# Command flags still take precedence over these env vars.
+# export AQUIFER_CODEX_CHECKPOINT_CHECK_INTERVAL_MINUTES="10"
+# export AQUIFER_CODEX_CHECKPOINT_EVERY_MESSAGES="20"
+# export AQUIFER_CODEX_CHECKPOINT_QUIET_MS="3000"
 ```
 
 Copy `.env.example` from the repo root for a full annotated list.
